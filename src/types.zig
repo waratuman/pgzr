@@ -6,6 +6,11 @@ pub const ConnConfig = struct {
     user: []const u8,
     password: []const u8 = "",
     database: []const u8,
+    /// Connect via Unix domain socket instead of TCP.
+    /// When set, `host` and `port` are ignored for the connection itself,
+    /// but `port` is still used to construct the socket filename if the
+    /// path is a directory (e.g. "/tmp" -> "/tmp/.s.PGSQL.5432").
+    socket_path: ?[]const u8 = null,
 };
 
 pub const ReplicatorConfig = struct {

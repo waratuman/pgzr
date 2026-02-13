@@ -12,12 +12,28 @@ pub const Connection = struct {
     recv_buf: []u8,
 
     pub const TcpConnectError = @typeInfo(@typeInfo(@TypeOf(std.net.tcpConnectToHost)).@"fn".return_type.?).error_union.error_set;
-    pub const ConnectError = auth_mod.AuthError || std.mem.Allocator.Error || TcpConnectError || std.net.Stream.WriteError || error{
+    pub const UnixConnectError = @typeInfo(@typeInfo(@TypeOf(std.net.connectUnixSocket)).@"fn".return_type.?).error_union.error_set;
+    pub const ConnectError = auth_mod.AuthError || std.mem.Allocator.Error || TcpConnectError || UnixConnectError || std.net.Stream.WriteError || error{
         ServerError,
     };
 
     pub fn connect(allocator: std.mem.Allocator, config: types.ConnConfig) ConnectError!Connection {
-        const stream = try std.net.tcpConnectToHost(allocator, config.host, config.port);
+        const stream = if (config.socket_path) |path| blk: {
+            // Build socket path: if it doesn't end with a port suffix,
+            // append "/.s.PGSQL.<port>"
+            if (std.mem.endsWith(u8, path, ".s.PGSQL.5432") or
+                std.mem.indexOf(u8, path, ".s.PGSQL.") != null)
+            {
+                break :blk try std.net.connectUnixSocket(path);
+            } else {
+                var path_buf: [256]u8 = undefined;
+                const full_path = std.fmt.bufPrint(&path_buf, "{s}/.s.PGSQL.{d}", .{
+                    path,
+                    config.port,
+                }) catch return error.OutOfMemory;
+                break :blk try std.net.connectUnixSocket(full_path);
+            }
+        } else try std.net.tcpConnectToHost(allocator, config.host, config.port);
         errdefer stream.close();
 
         var send_buf: [4096]u8 = undefined;
