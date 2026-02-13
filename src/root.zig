@@ -8,6 +8,7 @@ test {
     _ = @import("lsn.zig");
     _ = @import("protocol.zig");
     _ = @import("auth.zig");
+    _ = @import("scram.zig");
     _ = @import("connection.zig");
     _ = @import("replicator.zig");
     _ = @import("types.zig");

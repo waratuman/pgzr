@@ -24,6 +24,9 @@ pub const MSG_COPY_DONE: u8 = 'c';
 pub const AUTH_OK: u32 = 0;
 pub const AUTH_CLEARTEXT: u32 = 3;
 pub const AUTH_MD5: u32 = 5;
+pub const AUTH_SASL: u32 = 10;
+pub const AUTH_SASL_CONTINUE: u32 = 11;
+pub const AUTH_SASL_FINAL: u32 = 12;
 
 // Replication streaming subtypes (inside CopyData payload)
 pub const XLOG_DATA: u8 = 'w';
@@ -201,6 +204,30 @@ pub fn encodeStandbyStatus(
     w.writeInt64(@bitCast(timestamp));
     w.writeByte(if (reply_requested) 1 else 0);
 
+    w.patchLength(len_offset);
+    return w.getWritten();
+}
+
+/// Build a SASLInitialResponse message ('p' + length + mechanism\0 + Int32(data.len) + data).
+pub fn encodeSASLInitialResponse(buf: []u8, mechanism: []const u8, data: []const u8) []const u8 {
+    var w = MsgWriter{ .buf = buf };
+    w.writeByte('p');
+    const len_offset = w.pos;
+    w.writeInt32(0); // placeholder
+    w.writeString(mechanism); // mechanism name + \0
+    w.writeInt32(@intCast(data.len));
+    w.writeBytes(data);
+    w.patchLength(len_offset);
+    return w.getWritten();
+}
+
+/// Build a SASLResponse message ('p' + length + data).
+pub fn encodeSASLResponse(buf: []u8, data: []const u8) []const u8 {
+    var w = MsgWriter{ .buf = buf };
+    w.writeByte('p');
+    const len_offset = w.pos;
+    w.writeInt32(0); // placeholder
+    w.writeBytes(data);
     w.patchLength(len_offset);
     return w.getWritten();
 }

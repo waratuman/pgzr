@@ -1,5 +1,6 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const scram = @import("scram.zig");
 
 /// Compute the MD5 password hash as PostgreSQL expects:
 ///   "md5" + hex(md5(hex(md5(password + user)) + salt))
@@ -37,6 +38,7 @@ pub fn md5Password(
 pub const AuthError = protocol.ReadError || protocol.ReadBodyError || std.net.Stream.WriteError || error{
     UnsupportedAuthMethod,
     AuthenticationFailed,
+    InvalidServerResponse,
 };
 
 /// Handle the authentication exchange.
@@ -64,6 +66,11 @@ pub fn authenticate(
             const hashed = md5Password(user, password, salt);
             const msg = protocol.encodePassword(&buf, &hashed);
             try stream.writeAll(msg);
+        },
+        protocol.AUTH_SASL => {
+            // SCRAM-SHA-256 handles its own multi-step exchange including AuthenticationOk
+            try scram.performScramAuth(stream, user, password, body);
+            return;
         },
         else => return error.UnsupportedAuthMethod,
     }
