@@ -865,9 +865,12 @@ pub fn main() !void {
     };
     resetSlot(allocator);
 
-    testReplicateAsync(allocator) catch {
-        failures += 1;
-    };
+    // TODO: testReplicateAsync doesn't actually test async — it inserts before
+    // spawning the thread, so it's equivalent to testStop. Needs rewriting to
+    // insert rows from the main thread while replication runs in another thread.
+    // testReplicateAsync(allocator) catch {
+    //     failures += 1;
+    // };
 
     // Teardown
     std.debug.print("Cleaning up...\n", .{});
