@@ -39,6 +39,28 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
 
+    // Benchmark
+    const bench = b.addExecutable(.{
+        .name = "benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmark/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "pgzr", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(bench);
+
+    const run_bench = b.addRunArtifact(bench);
+    run_bench.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_bench.addArgs(args);
+    }
+    const bench_step = b.step("benchmark", "Run the benchmark");
+    bench_step.dependOn(&run_bench.step);
+
     // Integration tests (requires a running PostgreSQL instance)
     const integration_tests = b.addExecutable(.{
         .name = "integration-tests",
