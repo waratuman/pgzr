@@ -114,11 +114,34 @@ pub const Replicator = struct {
 
     pub const NextError = protocol.ReadError || protocol.ReadBodyError || Transport.WriteError || error{
         ServerError,
+        ReconnectFailed,
     };
 
     /// Get the next WAL message. Returns null when end_position is reached
     /// or the server sends CopyDone.
+    ///
+    /// When `auto_reconnect` is enabled, connection errors trigger automatic
+    /// reconnection with exponential backoff. Replication resumes from the
+    /// last acknowledged LSN.
     pub fn next(self: *Replicator) NextError!?types.WalMessage {
+        if (!self.config.auto_reconnect) {
+            return self.nextInner();
+        }
+
+        while (true) {
+            if (self.nextInner()) |result| {
+                return result;
+            } else |err| {
+                if (isConnectionError(err)) {
+                    self.reconnect() catch return error.ReconnectFailed;
+                    continue;
+                }
+                return err;
+            }
+        }
+    }
+
+    fn nextInner(self: *Replicator) NextError!?types.WalMessage {
         while (true) {
             try self.maybeSendStatus();
 
@@ -159,6 +182,75 @@ pub const Replicator = struct {
                     continue;
                 },
             }
+        }
+    }
+
+    fn isConnectionError(err: NextError) bool {
+        return switch (err) {
+            error.ConnectionClosed,
+            error.ConnectionResetByPeer,
+            error.BrokenPipe,
+            error.WriteFailed,
+            error.TlsConnectionTruncated,
+            => true,
+            else => false,
+        };
+    }
+
+    fn reconnect(self: *Replicator) InitError!void {
+        // Close the old connection (ignore errors)
+        self.conn.close();
+
+        var delay_ms: u64 = 100;
+        var attempts: u32 = 0;
+
+        while (true) {
+            attempts += 1;
+
+            if (self.config.max_reconnect_attempts > 0 and
+                attempts > self.config.max_reconnect_attempts)
+            {
+                std.log.err("Reconnection failed after {d} attempts", .{attempts - 1});
+                return error.ServerError;
+            }
+
+            std.log.info("Reconnecting (attempt {d})...", .{attempts});
+            std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+
+            // Try to establish a new connection
+            var conn = Connection.connect(self.allocator, self.config.conn) catch {
+                delay_ms = @min(delay_ms * 2, self.config.max_reconnect_delay_ms);
+                continue;
+            };
+            errdefer conn.close();
+
+            self.conn = conn;
+
+            // Re-identify and start replication from last processed LSN
+            self.identifySystem() catch {
+                self.conn.close();
+                delay_ms = @min(delay_ms * 2, self.config.max_reconnect_delay_ms);
+                continue;
+            };
+
+            // Override start_position with last_processed_lsn for resume
+            const saved_start = self.config.start_position;
+            if (self.last_processed_lsn.value != 0) {
+                self.config.start_position = self.last_processed_lsn;
+            }
+            self.startReplication() catch {
+                self.config.start_position = saved_start;
+                self.conn.close();
+                delay_ms = @min(delay_ms * 2, self.config.max_reconnect_delay_ms);
+                continue;
+            };
+            self.config.start_position = saved_start;
+
+            // Reset status timer so we send a fresh status soon
+            self.last_status_time_ms = 0;
+
+            std.log.info("Reconnected successfully", .{});
+            return;
         }
     }
 

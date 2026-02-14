@@ -93,7 +93,6 @@ examples/
 
 ## Future Work
 
-- Automatic reconnection
 - `start_position` / `end_position` integration tests
 
 ## License

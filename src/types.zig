@@ -37,6 +37,13 @@ pub const ReplicatorConfig = struct {
     /// Interval in milliseconds between automatic status updates.
     /// Default 10 seconds.
     status_interval_ms: u64 = 10_000,
+    /// Automatically reconnect on connection loss.
+    auto_reconnect: bool = false,
+    /// Maximum delay between reconnection attempts (milliseconds).
+    /// Uses exponential backoff starting at 100ms up to this value.
+    max_reconnect_delay_ms: u64 = 30_000,
+    /// Maximum number of reconnection attempts. 0 = unlimited.
+    max_reconnect_attempts: u32 = 0,
 };
 
 pub const WalMessage = struct {
