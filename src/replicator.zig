@@ -77,10 +77,6 @@ pub const Replicator = struct {
             if (self.timeline) |server_timeline| {
                 const server_val = std.fmt.parseUnsigned(u32, server_timeline, 10) catch 0;
                 if (server_val != expected) {
-                    std.log.err("Timeline mismatch: expected {d}, server reports {s}", .{
-                        expected,
-                        server_timeline,
-                    });
                     return error.TimelineMismatch;
                 }
             }
@@ -90,10 +86,6 @@ pub const Replicator = struct {
         if (self.config.expected_systemid) |expected| {
             if (self.system_id) |server_id| {
                 if (!std.mem.eql(u8, server_id, expected)) {
-                    std.log.err("SystemId mismatch: expected '{s}', server reports '{s}'", .{
-                        expected,
-                        server_id,
-                    });
                     return error.SystemIdMismatch;
                 }
             }
