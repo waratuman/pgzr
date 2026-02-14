@@ -44,12 +44,13 @@ pub fn main() !void {
 ## Building
 
 ```bash
-zig build          # build library + example
-zig build test     # run unit tests
-zig build example  # build and run examples/basic.zig
+zig build                  # build library + example
+zig build test             # run unit tests
+zig build example          # build and run examples/basic.zig
+zig build integration-test # run integration tests (requires PostgreSQL)
 ```
 
-## Integration Test
+## Manual Example
 
 ```bash
 createdb pgzr_test
@@ -89,11 +90,9 @@ src/
   types.zig       -- ConnConfig, ReplicatorConfig, WalMessage, TlsMode
 examples/
   basic.zig       -- minimal working example
+tests/
+  integration.zig -- integration tests (basic replication, start_position, end_position)
 ```
-
-## Future Work
-
-- `start_position` / `end_position` integration tests
 
 ## License
 

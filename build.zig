@@ -38,4 +38,23 @@ pub fn build(b: *std.Build) void {
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
+
+    // Integration tests (requires a running PostgreSQL instance)
+    const integration_tests = b.addExecutable(.{
+        .name = "integration-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pgzr", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(integration_tests);
+
+    const run_integration = b.addRunArtifact(integration_tests);
+    run_integration.step.dependOn(b.getInstallStep());
+    const integration_step = b.step("integration-test", "Run integration tests (requires PostgreSQL)");
+    integration_step.dependOn(&run_integration.step);
 }
