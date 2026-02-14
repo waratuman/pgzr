@@ -84,6 +84,7 @@ src/
   protocol.zig    -- wire protocol encoding/decoding
   auth.zig        -- cleartext, MD5, and SCRAM-SHA-256 authentication
   scram.zig       -- SCRAM-SHA-256 (RFC 5802) implementation
+  pgoutput.zig    -- pgoutput binary protocol decoder (Begin, Commit, Relation, Insert, Update, Delete, etc.)
   lsn.zig         -- LSN type (parse, format, binary I/O)
   types.zig       -- ConnConfig, ReplicatorConfig, WalMessage, TlsMode
 examples/
@@ -93,7 +94,6 @@ examples/
 ## Future Work
 
 - Automatic reconnection
-- `pgoutput` protocol decoding (for native logical replication)
 - `start_position` / `end_position` integration tests
 
 ## License

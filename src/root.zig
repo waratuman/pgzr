@@ -4,6 +4,7 @@ pub const ConnConfig = @import("types.zig").ConnConfig;
 pub const ReplicatorConfig = @import("types.zig").ReplicatorConfig;
 pub const WalMessage = @import("types.zig").WalMessage;
 pub const TlsMode = @import("types.zig").TlsMode;
+pub const pgoutput = @import("pgoutput.zig");
 
 test {
     _ = @import("lsn.zig");
@@ -13,5 +14,6 @@ test {
     _ = @import("transport.zig");
     _ = @import("connection.zig");
     _ = @import("replicator.zig");
+    _ = @import("pgoutput.zig");
     _ = @import("types.zig");
 }
