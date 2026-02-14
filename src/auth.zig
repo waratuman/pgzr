@@ -1,6 +1,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const scram = @import("scram.zig");
+const Transport = @import("transport.zig").Transport;
 
 /// Compute the MD5 password hash as PostgreSQL expects:
 ///   "md5" + hex(md5(hex(md5(password + user)) + salt))
@@ -35,7 +36,7 @@ pub fn md5Password(
     return result;
 }
 
-pub const AuthError = protocol.ReadError || protocol.ReadBodyError || std.net.Stream.WriteError || error{
+pub const AuthError = protocol.ReadError || protocol.ReadBodyError || Transport.WriteError || error{
     UnsupportedAuthMethod,
     AuthenticationFailed,
     InvalidServerResponse,
@@ -44,42 +45,41 @@ pub const AuthError = protocol.ReadError || protocol.ReadBodyError || std.net.St
 /// Handle the authentication exchange.
 /// Reads the AuthenticationRequest, responds if needed, reads until AuthenticationOk.
 pub fn authenticate(
-    stream: std.net.Stream,
+    transport: Transport,
     user: []const u8,
     password: []const u8,
 ) AuthError!void {
     var buf: [4096]u8 = undefined;
 
-    const header = try protocol.readHeader(stream);
+    const header = try protocol.readHeader(transport);
     if (header.msg_type != protocol.MSG_AUTH) return error.ProtocolError;
-    const body = try protocol.readBody(stream, header, &buf);
+    const body = try protocol.readBody(transport, header, &buf);
     const auth_type = std.mem.readInt(u32, body[0..4], .big);
 
     switch (auth_type) {
         protocol.AUTH_OK => return,
         protocol.AUTH_CLEARTEXT => {
             const msg = protocol.encodePassword(&buf, password);
-            try stream.writeAll(msg);
+            try transport.writeAll(msg);
         },
         protocol.AUTH_MD5 => {
             const salt: *const [4]u8 = body[4..8];
             const hashed = md5Password(user, password, salt);
             const msg = protocol.encodePassword(&buf, &hashed);
-            try stream.writeAll(msg);
+            try transport.writeAll(msg);
         },
         protocol.AUTH_SASL => {
-            // SCRAM-SHA-256 handles its own multi-step exchange including AuthenticationOk
-            try scram.performScramAuth(stream, user, password, body);
+            try scram.performScramAuth(transport, user, password, body);
             return;
         },
         else => return error.UnsupportedAuthMethod,
     }
 
     // After sending credentials, expect AuthenticationOk
-    const ok_header = try protocol.readHeader(stream);
+    const ok_header = try protocol.readHeader(transport);
     if (ok_header.msg_type != protocol.MSG_AUTH) return error.ProtocolError;
     var ok_buf: [16]u8 = undefined;
-    const ok_body = try protocol.readBody(stream, ok_header, &ok_buf);
+    const ok_body = try protocol.readBody(transport, ok_header, &ok_buf);
     const ok_type = std.mem.readInt(u32, ok_body[0..4], .big);
     if (ok_type != protocol.AUTH_OK) return error.AuthenticationFailed;
 }

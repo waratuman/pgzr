@@ -1,5 +1,6 @@
 const std = @import("std");
 const Lsn = @import("lsn.zig").Lsn;
+const Transport = @import("transport.zig").Transport;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -51,22 +52,22 @@ pub const MessageHeader = struct {
 // Reading
 // ---------------------------------------------------------------------------
 
-pub const ReadError = std.net.Stream.ReadError || error{ConnectionClosed};
+pub const ReadError = Transport.ReadError;
 
-/// Read exactly `buf.len` bytes from the stream.
-pub fn readExact(stream: std.net.Stream, buf: []u8) ReadError!void {
+/// Read exactly `buf.len` bytes from the transport.
+pub fn readExact(transport: Transport, buf: []u8) ReadError!void {
     var total: usize = 0;
     while (total < buf.len) {
-        const n = try stream.read(buf[total..]);
+        const n = try transport.read(buf[total..]);
         if (n == 0) return error.ConnectionClosed;
         total += n;
     }
 }
 
 /// Read a message header (1 byte type + 4 byte length).
-pub fn readHeader(stream: std.net.Stream) ReadError!MessageHeader {
+pub fn readHeader(transport: Transport) ReadError!MessageHeader {
     var buf: [5]u8 = undefined;
-    try readExact(stream, &buf);
+    try readExact(transport, &buf);
     return .{
         .msg_type = buf[0],
         .length = std.mem.readInt(u32, buf[1..5], .big),
@@ -77,10 +78,10 @@ pub const ReadBodyError = ReadError || error{ProtocolError};
 
 /// Read the body of a message given its header into `buf`.
 /// Returns the slice of body bytes.
-pub fn readBody(stream: std.net.Stream, header: MessageHeader, buf: []u8) ReadBodyError![]u8 {
+pub fn readBody(transport: Transport, header: MessageHeader, buf: []u8) ReadBodyError![]u8 {
     const body_len = header.bodyLen();
     if (body_len > buf.len) return error.ProtocolError;
-    try readExact(stream, buf[0..body_len]);
+    try readExact(transport, buf[0..body_len]);
     return buf[0..body_len];
 }
 

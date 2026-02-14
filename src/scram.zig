@@ -1,10 +1,11 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const Transport = @import("transport.zig").Transport;
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-pub const ScramError = protocol.ReadError || protocol.ReadBodyError || std.net.Stream.WriteError || error{
+pub const ScramError = protocol.ReadError || protocol.ReadBodyError || Transport.WriteError || error{
     AuthenticationFailed,
     InvalidServerResponse,
 };
@@ -14,7 +15,7 @@ pub const ScramError = protocol.ReadError || protocol.ReadBodyError || std.net.S
 /// `auth_body` is the body of the initial AUTH_SASL message which contains
 /// the list of mechanism names (null-terminated strings followed by a final \0).
 pub fn performScramAuth(
-    stream: std.net.Stream,
+    transport: Transport,
     user: []const u8,
     password: []const u8,
     auth_body: []const u8,
@@ -44,13 +45,13 @@ pub fn performScramAuth(
     // Send SASLInitialResponse
     var send_buf: [4096]u8 = undefined;
     const sasl_init = protocol.encodeSASLInitialResponse(&send_buf, "SCRAM-SHA-256", client_first);
-    try stream.writeAll(sasl_init);
+    try transport.writeAll(sasl_init);
 
     // Step 2: Receive AuthenticationSASLContinue
     var recv_buf: [4096]u8 = undefined;
-    const cont_header = try protocol.readHeader(stream);
+    const cont_header = try protocol.readHeader(transport);
     if (cont_header.msg_type != protocol.MSG_AUTH) return error.InvalidServerResponse;
-    const cont_body = try protocol.readBody(stream, cont_header, &recv_buf);
+    const cont_body = try protocol.readBody(transport, cont_header, &recv_buf);
     const cont_auth_type = std.mem.readInt(u32, cont_body[0..4], .big);
     if (cont_auth_type != protocol.AUTH_SASL_CONTINUE) return error.InvalidServerResponse;
     const server_first = cont_body[4..];
@@ -130,12 +131,12 @@ pub fn performScramAuth(
 
     // Send SASLResponse
     const sasl_resp = protocol.encodeSASLResponse(&send_buf, client_final);
-    try stream.writeAll(sasl_resp);
+    try transport.writeAll(sasl_resp);
 
     // Step 4: Receive AuthenticationSASLFinal, verify server signature
-    const final_header = try protocol.readHeader(stream);
+    const final_header = try protocol.readHeader(transport);
     if (final_header.msg_type != protocol.MSG_AUTH) return error.InvalidServerResponse;
-    const final_body = try protocol.readBody(stream, final_header, &recv_buf);
+    const final_body = try protocol.readBody(transport, final_header, &recv_buf);
     const final_auth_type = std.mem.readInt(u32, final_body[0..4], .big);
     if (final_auth_type != protocol.AUTH_SASL_FINAL) return error.InvalidServerResponse;
     const server_final = final_body[4..];
@@ -156,10 +157,10 @@ pub fn performScramAuth(
         return error.AuthenticationFailed;
 
     // Step 5: Receive AuthenticationOk
-    const ok_header = try protocol.readHeader(stream);
+    const ok_header = try protocol.readHeader(transport);
     if (ok_header.msg_type != protocol.MSG_AUTH) return error.InvalidServerResponse;
     var ok_buf: [16]u8 = undefined;
-    const ok_body = try protocol.readBody(stream, ok_header, &ok_buf);
+    const ok_body = try protocol.readBody(transport, ok_header, &ok_buf);
     const ok_type = std.mem.readInt(u32, ok_body[0..4], .big);
     if (ok_type != protocol.AUTH_OK) return error.AuthenticationFailed;
 }

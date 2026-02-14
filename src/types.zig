@@ -1,5 +1,14 @@
 const Lsn = @import("lsn.zig").Lsn;
 
+pub const TlsMode = enum {
+    /// Do not use TLS.
+    disable,
+    /// Try TLS, fall back to plaintext if server doesn't support it.
+    prefer,
+    /// Require TLS; fail if server doesn't support it.
+    require,
+};
+
 pub const ConnConfig = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 5432,
@@ -11,6 +20,8 @@ pub const ConnConfig = struct {
     /// but `port` is still used to construct the socket filename if the
     /// path is a directory (e.g. "/tmp" -> "/tmp/.s.PGSQL.5432").
     socket_path: ?[]const u8 = null,
+    /// TLS connection mode.
+    tls: TlsMode = .disable,
 };
 
 pub const ReplicatorConfig = struct {

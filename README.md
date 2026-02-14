@@ -79,19 +79,19 @@ dropdb pgzr_test
 src/
   root.zig        -- public API re-exports
   replicator.zig  -- high-level replication loop (IDENTIFY_SYSTEM, START_REPLICATION, streaming, feedback)
-  connection.zig  -- TCP/Unix socket connection, startup handshake, simple query execution
+  connection.zig  -- TCP/Unix socket connection, TLS upgrade, startup handshake, simple query execution
+  transport.zig   -- Transport abstraction (plain TCP/Unix and TLS)
   protocol.zig    -- wire protocol encoding/decoding
   auth.zig        -- cleartext, MD5, and SCRAM-SHA-256 authentication
   scram.zig       -- SCRAM-SHA-256 (RFC 5802) implementation
   lsn.zig         -- LSN type (parse, format, binary I/O)
-  types.zig       -- ConnConfig, ReplicatorConfig, WalMessage
+  types.zig       -- ConnConfig, ReplicatorConfig, WalMessage, TlsMode
 examples/
   basic.zig       -- minimal working example
 ```
 
 ## Future Work
 
-- TLS support
 - Automatic reconnection
 - `pgoutput` protocol decoding (for native logical replication)
 - `start_position` / `end_position` integration tests

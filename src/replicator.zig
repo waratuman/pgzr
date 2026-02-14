@@ -3,6 +3,7 @@ const Connection = @import("connection.zig").Connection;
 const protocol = @import("protocol.zig");
 const Lsn = @import("lsn.zig").Lsn;
 const types = @import("types.zig");
+const Transport = @import("transport.zig").Transport;
 
 /// Microseconds between Unix epoch (1970-01-01) and PG epoch (2000-01-01).
 const PG_EPOCH_OFFSET_US: i64 = 946_684_800 * 1_000_000;
@@ -111,7 +112,7 @@ pub const Replicator = struct {
         if (!result.in_copy_mode) return error.ProtocolError;
     }
 
-    pub const NextError = protocol.ReadError || protocol.ReadBodyError || std.net.Stream.WriteError || error{
+    pub const NextError = protocol.ReadError || protocol.ReadBodyError || Transport.WriteError || error{
         ServerError,
     };
 
@@ -121,7 +122,7 @@ pub const Replicator = struct {
         while (true) {
             try self.maybeSendStatus();
 
-            const header = try protocol.readHeader(self.conn.stream);
+            const header = try protocol.readHeader(self.conn.transport);
 
             switch (header.msg_type) {
                 protocol.MSG_COPY_DATA => {
@@ -140,21 +141,21 @@ pub const Replicator = struct {
                     }
                 },
                 protocol.MSG_COPY_DONE => {
-                    _ = try protocol.readBody(self.conn.stream, header, self.conn.recv_buf);
+                    _ = try protocol.readBody(self.conn.transport, header, self.conn.recv_buf);
                     return null;
                 },
                 protocol.MSG_ERROR => {
-                    const body = try protocol.readBody(self.conn.stream, header, self.conn.recv_buf);
+                    const body = try protocol.readBody(self.conn.transport, header, self.conn.recv_buf);
                     const err = protocol.parseError(body);
                     std.log.err("Replication error: {s}: {s}", .{ err.code, err.message });
                     return error.ServerError;
                 },
                 protocol.MSG_NOTICE => {
-                    _ = try protocol.readBody(self.conn.stream, header, self.conn.recv_buf);
+                    _ = try protocol.readBody(self.conn.transport, header, self.conn.recv_buf);
                     continue;
                 },
                 else => {
-                    _ = try protocol.readBody(self.conn.stream, header, self.conn.recv_buf);
+                    _ = try protocol.readBody(self.conn.transport, header, self.conn.recv_buf);
                     continue;
                 },
             }
@@ -172,7 +173,7 @@ pub const Replicator = struct {
             self.conn.recv_buf = new_buf;
         }
 
-        try protocol.readExact(self.conn.stream, self.conn.recv_buf[0..body_len]);
+        try protocol.readExact(self.conn.transport, self.conn.recv_buf[0..body_len]);
         return self.conn.recv_buf[0..body_len];
     }
 
@@ -249,7 +250,7 @@ pub const Replicator = struct {
             pg_timestamp,
             false,
         );
-        try self.conn.stream.writeAll(msg);
+        try self.conn.transport.writeAll(msg);
     }
 
     pub fn deinit(self: *Replicator) void {

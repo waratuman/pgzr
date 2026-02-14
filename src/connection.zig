@@ -3,18 +3,26 @@ const protocol = @import("protocol.zig");
 const auth_mod = @import("auth.zig");
 const Lsn = @import("lsn.zig").Lsn;
 const types = @import("types.zig");
+const transport_mod = @import("transport.zig");
+const Transport = transport_mod.Transport;
+const PlainState = transport_mod.PlainState;
+const TlsState = transport_mod.TlsState;
 
 pub const Connection = struct {
-    stream: std.net.Stream,
+    transport: Transport,
     allocator: std.mem.Allocator,
     backend_pid: u32 = 0,
     backend_key: u32 = 0,
     recv_buf: []u8,
+    /// Heap-allocated transport state (PlainState or TlsState).
+    plain_state: ?*PlainState = null,
+    tls_state: ?*TlsState = null,
 
     pub const TcpConnectError = @typeInfo(@typeInfo(@TypeOf(std.net.tcpConnectToHost)).@"fn".return_type.?).error_union.error_set;
     pub const UnixConnectError = @typeInfo(@typeInfo(@TypeOf(std.net.connectUnixSocket)).@"fn".return_type.?).error_union.error_set;
-    pub const ConnectError = auth_mod.AuthError || std.mem.Allocator.Error || TcpConnectError || UnixConnectError || std.net.Stream.WriteError || error{
+    pub const ConnectError = auth_mod.AuthError || std.mem.Allocator.Error || TcpConnectError || UnixConnectError || Transport.WriteError || TlsState.UpgradeError || error{
         ServerError,
+        TlsNotSupported,
     };
 
     pub fn connect(allocator: std.mem.Allocator, config: types.ConnConfig) ConnectError!Connection {
@@ -36,23 +44,59 @@ pub const Connection = struct {
         } else try std.net.tcpConnectToHost(allocator, config.host, config.port);
         errdefer stream.close();
 
+        // Set up transport (plain initially, may upgrade to TLS)
+        var plain_state = try allocator.create(PlainState);
+        errdefer allocator.destroy(plain_state);
+        plain_state.* = .{ .stream = stream };
+        var transport = Transport.plain(plain_state);
+
+        var tls_state: ?*TlsState = null;
+
+        // TLS negotiation (only for TCP connections, not Unix sockets)
+        if (config.tls != .disable and config.socket_path == null) {
+            // Send SSLRequest
+            var ssl_buf: [8]u8 = undefined;
+            std.mem.writeInt(u32, ssl_buf[0..4], 8, .big);
+            std.mem.writeInt(u32, ssl_buf[4..8], 80877103, .big);
+            stream.writeAll(&ssl_buf) catch return error.WriteFailed;
+
+            // Read 1-byte response
+            var resp: [1]u8 = undefined;
+            _ = stream.read(&resp) catch return error.ConnectionClosed;
+
+            if (resp[0] == 'S') {
+                // Server accepts TLS — perform handshake
+                const ts = try TlsState.upgrade(allocator, stream, config.host);
+                tls_state = ts;
+                transport = Transport.tlsClient(ts);
+                // Free the plain state since we're now using TLS
+                allocator.destroy(plain_state);
+                plain_state = undefined;
+            } else if (config.tls == .require) {
+                return error.TlsNotSupported;
+            }
+            // else: .prefer mode, server said 'N', continue with plain
+        }
+
         var send_buf: [4096]u8 = undefined;
 
         // Send StartupMessage
         const startup = protocol.encodeStartup(&send_buf, config.user, config.database);
-        try stream.writeAll(startup);
+        try transport.writeAll(startup);
 
         // Authenticate
-        try auth_mod.authenticate(stream, config.user, config.password);
+        try auth_mod.authenticate(transport, config.user, config.password);
 
         // Allocate receive buffer (1 MiB)
         const recv_buf = try allocator.alloc(u8, 1024 * 1024);
         errdefer allocator.free(recv_buf);
 
         var conn = Connection{
-            .stream = stream,
+            .transport = transport,
             .allocator = allocator,
             .recv_buf = recv_buf,
+            .plain_state = if (tls_state == null) plain_state else null,
+            .tls_state = tls_state,
         };
 
         // Process post-auth messages until ReadyForQuery
@@ -63,32 +107,32 @@ pub const Connection = struct {
 
     fn processPostAuth(self: *Connection) ConnectError!void {
         while (true) {
-            const header = try protocol.readHeader(self.stream);
+            const header = try protocol.readHeader(self.transport);
             switch (header.msg_type) {
                 protocol.MSG_PARAM_STATUS => {
-                    _ = try protocol.readBody(self.stream, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
                 },
                 protocol.MSG_BACKEND_KEY => {
                     var buf: [8]u8 = undefined;
-                    const body = try protocol.readBody(self.stream, header, &buf);
+                    const body = try protocol.readBody(self.transport, header, &buf);
                     self.backend_pid = std.mem.readInt(u32, body[0..4], .big);
                     self.backend_key = std.mem.readInt(u32, body[4..8], .big);
                 },
                 protocol.MSG_READY => {
-                    _ = try protocol.readBody(self.stream, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
                     return;
                 },
                 protocol.MSG_ERROR => {
-                    const body = try protocol.readBody(self.stream, header, self.recv_buf);
+                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
                     const err = protocol.parseError(body);
                     std.log.err("Server error: {s}: {s}", .{ err.code, err.message });
                     return error.ServerError;
                 },
                 protocol.MSG_NOTICE => {
-                    _ = try protocol.readBody(self.stream, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
                 },
                 else => {
-                    _ = try protocol.readBody(self.stream, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
                 },
             }
         }
@@ -106,7 +150,7 @@ pub const Connection = struct {
         in_copy_mode: bool,
     };
 
-    pub const QueryError = protocol.ReadError || protocol.ReadBodyError || std.net.Stream.WriteError || error{
+    pub const QueryError = protocol.ReadError || protocol.ReadBodyError || Transport.WriteError || error{
         ServerError,
     };
 
@@ -115,7 +159,7 @@ pub const Connection = struct {
     pub fn simpleQuery(self: *Connection, query: []const u8) QueryError!QueryResult {
         var send_buf: [4096]u8 = undefined;
         const msg = protocol.encodeQuery(&send_buf, query);
-        try self.stream.writeAll(msg);
+        try self.transport.writeAll(msg);
 
         var result = QueryResult{
             .columns = undefined,
@@ -124,14 +168,14 @@ pub const Connection = struct {
         };
 
         while (true) {
-            const header = try protocol.readHeader(self.stream);
+            const header = try protocol.readHeader(self.transport);
 
             switch (header.msg_type) {
                 protocol.MSG_ROW_DESC => {
-                    _ = try protocol.readBody(self.stream, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
                 },
                 protocol.MSG_DATA_ROW => {
-                    const body = try protocol.readBody(self.stream, header, self.recv_buf);
+                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
                     const col_count = std.mem.readInt(u16, body[0..2], .big);
                     var pos: usize = 2;
                     for (0..col_count) |i| {
@@ -148,35 +192,37 @@ pub const Connection = struct {
                     result.column_count = col_count;
                 },
                 protocol.MSG_CMD_COMPLETE => {
-                    _ = try protocol.readBody(self.stream, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
                 },
                 protocol.MSG_READY => {
-                    _ = try protocol.readBody(self.stream, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
                     return result;
                 },
                 protocol.MSG_ERROR => {
-                    const body = try protocol.readBody(self.stream, header, self.recv_buf);
+                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
                     return error.ServerError;
                 },
                 protocol.MSG_COPY_BOTH => {
-                    _ = try protocol.readBody(self.stream, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
                     result.in_copy_mode = true;
                     return result;
                 },
                 protocol.MSG_NOTICE => {
-                    _ = try protocol.readBody(self.stream, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
                 },
                 else => {
-                    _ = try protocol.readBody(self.stream, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
                 },
             }
         }
     }
 
     pub fn close(self: *Connection) void {
-        self.stream.close();
+        self.transport.close();
         self.allocator.free(self.recv_buf);
+        if (self.tls_state) |ts| self.allocator.destroy(ts);
+        if (self.plain_state) |ps| self.allocator.destroy(ps);
     }
 };
