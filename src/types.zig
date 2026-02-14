@@ -44,6 +44,12 @@ pub const ReplicatorConfig = struct {
     max_reconnect_delay_ms: u64 = 30_000,
     /// Maximum number of reconnection attempts. 0 = unlimited.
     max_reconnect_attempts: u32 = 0,
+    /// Expected timeline ID. If set and the server reports a different
+    /// timeline, `Replicator.init` returns `error.TimelineMismatch`.
+    expected_timeline: ?u32 = null,
+    /// Expected system identifier. If set and the server reports a different
+    /// system ID, `Replicator.init` returns `error.SystemIdMismatch`.
+    expected_systemid: ?[]const u8 = null,
 };
 
 pub const WalMessage = struct {

@@ -20,6 +20,9 @@ pub const Replicator = struct {
     /// Timestamp (ms) of last status update sent.
     last_status_time_ms: i64 = 0,
 
+    /// Atomic flag for cross-thread stop requests.
+    stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     system_id: ?[]const u8 = null,
     timeline: ?[]const u8 = null,
     xlogpos: ?[]const u8 = null,
@@ -27,6 +30,8 @@ pub const Replicator = struct {
 
     pub const InitError = Connection.ConnectError || Connection.QueryError || error{
         DatabaseMismatch,
+        TimelineMismatch,
+        SystemIdMismatch,
     };
 
     pub fn init(allocator: std.mem.Allocator, config: types.ReplicatorConfig) InitError!Replicator {
@@ -64,6 +69,33 @@ pub const Replicator = struct {
                     server_db,
                 });
                 return error.DatabaseMismatch;
+            }
+        }
+
+        // Verify timeline if caller specified an expected value
+        if (self.config.expected_timeline) |expected| {
+            if (self.timeline) |server_timeline| {
+                const server_val = std.fmt.parseUnsigned(u32, server_timeline, 10) catch 0;
+                if (server_val != expected) {
+                    std.log.err("Timeline mismatch: expected {d}, server reports {s}", .{
+                        expected,
+                        server_timeline,
+                    });
+                    return error.TimelineMismatch;
+                }
+            }
+        }
+
+        // Verify system identifier if caller specified an expected value
+        if (self.config.expected_systemid) |expected| {
+            if (self.system_id) |server_id| {
+                if (!std.mem.eql(u8, server_id, expected)) {
+                    std.log.err("SystemId mismatch: expected '{s}', server reports '{s}'", .{
+                        expected,
+                        server_id,
+                    });
+                    return error.SystemIdMismatch;
+                }
             }
         }
     }
@@ -143,6 +175,9 @@ pub const Replicator = struct {
 
     fn nextInner(self: *Replicator) NextError!?types.WalMessage {
         while (true) {
+            if (self.stop_flag.load(.acquire)) return null;
+            if (self.endPositionReached()) return null;
+
             try self.maybeSendStatus();
 
             const header = try protocol.readHeader(self.conn.transport);
@@ -307,9 +342,33 @@ pub const Replicator = struct {
         }
     }
 
+    /// Check if the end_position has been reached based on received LSN.
+    fn endPositionReached(self: *Replicator) bool {
+        if (self.config.end_position) |end_pos| {
+            if (self.last_received_lsn.value != 0 and self.last_received_lsn.value >= end_pos.value) {
+                return true;
+            }
+            if (self.last_server_lsn.value != 0 and self.last_server_lsn.value >= end_pos.value) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Advance the processed LSN. Call this after successfully handling a message.
     pub fn ack(self: *Replicator, lsn: Lsn) void {
         self.last_processed_lsn = lsn;
+    }
+
+    /// Request the replicator to stop. Safe to call from another thread.
+    /// The next call to `next()` will return `null`.
+    pub fn stop(self: *Replicator) void {
+        self.stop_flag.store(true, .release);
+    }
+
+    /// Check whether a stop has been requested. Safe to call from any thread.
+    pub fn isStopRequested(self: *Replicator) bool {
+        return self.stop_flag.load(.acquire);
     }
 
     fn maybeSendStatus(self: *Replicator) NextError!void {

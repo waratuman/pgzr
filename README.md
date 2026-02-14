@@ -91,7 +91,8 @@ src/
 examples/
   basic.zig       -- minimal working example
 tests/
-  integration.zig -- integration tests (basic replication, start_position, end_position)
+  integration.zig -- integration tests (replication, start/end position, LSN tracking,
+                     timeline/systemid validation, feedback, stop, async)
 ```
 
 ## License
