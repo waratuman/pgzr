@@ -1,0 +1,319 @@
+const std = @import("std");
+const Replicator = @import("replicator.zig").Replicator;
+const Connection = @import("connection.zig").Connection;
+const pgoutput = @import("pgoutput.zig");
+const types = @import("types.zig");
+const Lsn = @import("lsn.zig").Lsn;
+const query = @import("query.zig");
+const schema_mod = @import("schema.zig");
+
+pub const Ingestor = struct {
+    replicator: Replicator,
+    dest: Connection,
+    allocator: std.mem.Allocator,
+    config: types.IngestConfig,
+
+    // Batch accumulation
+    batch_buf: std.ArrayList(u8),
+    batch_start_lsn: Lsn,
+    batch_end_lsn: Lsn,
+    batch_msg_count: usize,
+
+    // Relation cache (owned copies)
+    relations: std.AutoHashMap(u32, OwnedRelation),
+
+    // pgoutput decode scratch buffers
+    col_buf: [256]pgoutput.Column,
+    tuple_buf: [256]pgoutput.ColumnData,
+    tuple_buf2: [256]pgoutput.ColumnData,
+
+    const OwnedRelation = struct {
+        oid: u32,
+        namespace: []u8,
+        name: []u8,
+        replica_identity: u8,
+        columns: []OwnedColumn,
+
+        fn deinit(self: *OwnedRelation, allocator: std.mem.Allocator) void {
+            allocator.free(self.namespace);
+            allocator.free(self.name);
+            for (self.columns) |col| {
+                allocator.free(col.name);
+            }
+            allocator.free(self.columns);
+        }
+    };
+
+    const OwnedColumn = struct {
+        flags: u8,
+        name: []u8,
+        type_oid: u32,
+        type_modifier: i32,
+    };
+
+    pub const InitError = Replicator.InitError || Connection.ConnectError || Connection.QueryError || std.mem.Allocator.Error;
+
+    pub fn init(allocator: std.mem.Allocator, config: types.IngestConfig) InitError!Ingestor {
+        var dest_config = config.dest;
+        dest_config.replication = false;
+        var dest = try Connection.connect(allocator, dest_config);
+        errdefer dest.close();
+
+        try schema_mod.ensureSchema(&dest);
+
+        var replicator = try Replicator.init(allocator, config.source);
+        errdefer replicator.deinit();
+
+        return Ingestor{
+            .replicator = replicator,
+            .dest = dest,
+            .allocator = allocator,
+            .config = config,
+            .batch_buf = std.ArrayList(u8).init(allocator),
+            .batch_start_lsn = Lsn.zero,
+            .batch_end_lsn = Lsn.zero,
+            .batch_msg_count = 0,
+            .relations = std.AutoHashMap(u32, OwnedRelation).init(allocator),
+            .col_buf = undefined,
+            .tuple_buf = undefined,
+            .tuple_buf2 = undefined,
+        };
+    }
+
+    pub const RunError = Replicator.NextError || Connection.QueryError || std.mem.Allocator.Error;
+
+    /// Main ingest loop. Streams WAL from source and stores packed batches
+    /// in the destination database. Blocks until the replicator is stopped
+    /// or end_position is reached.
+    pub fn run(self: *Ingestor) RunError!void {
+        while (try self.replicator.next()) |wal_msg| {
+            const data = wal_msg.data;
+            if (data.len == 0) continue;
+
+            // Track batch LSN boundaries
+            if (self.batch_msg_count == 0) {
+                self.batch_start_lsn = wal_msg.wal_start;
+            }
+            self.batch_end_lsn = wal_msg.wal_start;
+
+            // Parse relation messages to maintain the cache
+            if (data[0] == 'R') {
+                try self.updateRelationCache(data);
+            }
+
+            // Append message to batch: [4-byte big-endian length][message bytes]
+            const len: u32 = @intCast(data.len);
+            try self.batch_buf.appendSlice(&std.mem.toBytes(std.mem.nativeTo(u32, len, .big)));
+            try self.batch_buf.appendSlice(data);
+            self.batch_msg_count += 1;
+
+            // Flush on COMMIT boundaries
+            if (data[0] == 'C') {
+                try self.flushBatch();
+                self.replicator.ack(wal_msg.wal_start);
+            }
+
+            // Also flush if batch exceeds size cap (but only on transaction boundaries)
+            if (self.batch_buf.items.len >= self.config.max_batch_size and data[0] == 'C') {
+                // Already flushed above on commit, this is a no-op safety check
+            }
+        }
+
+        // Flush any remaining batch data
+        if (self.batch_msg_count > 0) {
+            try self.flushBatch();
+        }
+    }
+
+    fn updateRelationCache(self: *Ingestor, data: []const u8) !void {
+        const msg = pgoutput.decode(data, &self.col_buf, &self.tuple_buf, &self.tuple_buf2) catch return;
+        const rel = switch (msg) {
+            .relation => |r| r,
+            else => return,
+        };
+
+        // Remove old entry if it exists
+        if (self.relations.fetchRemove(rel.oid)) |entry| {
+            var old = entry.value;
+            old.deinit(self.allocator);
+        }
+
+        // Copy all borrowed strings into owned memory
+        const namespace = try self.allocator.alloc(u8, rel.namespace.len);
+        @memcpy(namespace, rel.namespace);
+
+        const name = try self.allocator.alloc(u8, rel.name.len);
+        @memcpy(name, rel.name);
+
+        const columns = try self.allocator.alloc(OwnedColumn, rel.columns.len);
+        for (rel.columns, 0..) |col, i| {
+            const col_name = try self.allocator.alloc(u8, col.name.len);
+            @memcpy(col_name, col.name);
+            columns[i] = .{
+                .flags = col.flags,
+                .name = col_name,
+                .type_oid = col.type_oid,
+                .type_modifier = col.type_modifier,
+            };
+        }
+
+        try self.relations.put(rel.oid, .{
+            .oid = rel.oid,
+            .namespace = namespace,
+            .name = name,
+            .replica_identity = rel.replica_identity,
+            .columns = columns,
+        });
+    }
+
+    fn flushBatch(self: *Ingestor) !void {
+        if (self.batch_msg_count == 0) return;
+
+        const data_hex = try query.escapeBytea(self.allocator, self.batch_buf.items);
+        defer self.allocator.free(data_hex);
+
+        const relations_json = try self.serializeRelations();
+        defer self.allocator.free(relations_json);
+
+        const source_id = try query.escapeUuid(self.allocator, self.config.source_id);
+        defer self.allocator.free(source_id);
+
+        // Build INSERT query
+        var sql = std.ArrayList(u8).init(self.allocator);
+        defer sql.deinit();
+
+        try sql.appendSlice("INSERT INTO wal_batches (source_id, start_lsn, end_lsn, data, relations) VALUES (");
+        try sql.appendSlice(source_id);
+        try sql.appendSlice(", ");
+
+        var lsn_buf: [20]u8 = undefined;
+        const start_str = std.fmt.bufPrint(&lsn_buf, "{d}", .{self.batch_start_lsn.value}) catch unreachable;
+        try sql.appendSlice(start_str);
+        try sql.appendSlice(", ");
+
+        const end_str = std.fmt.bufPrint(&lsn_buf, "{d}", .{self.batch_end_lsn.value}) catch unreachable;
+        try sql.appendSlice(end_str);
+        try sql.appendSlice(", ");
+
+        try sql.appendSlice(data_hex);
+        try sql.appendSlice(", ");
+
+        try sql.appendSlice(relations_json);
+        try sql.append(')');
+
+        try self.dest.execLarge(self.allocator, sql.items);
+
+        // Reset batch
+        self.batch_buf.clearRetainingCapacity();
+        self.batch_msg_count = 0;
+    }
+
+    fn serializeRelations(self: *Ingestor) ![]u8 {
+        var json = std.ArrayList(u8).init(self.allocator);
+        errdefer json.deinit();
+
+        try json.append('\'');
+        try json.append('{');
+
+        var first_rel = true;
+        var it = self.relations.iterator();
+        while (it.next()) |entry| {
+            const rel = entry.value_ptr;
+            if (!first_rel) try json.append(',');
+            first_rel = false;
+
+            // Key: OID as string
+            try json.append('"');
+            var oid_buf: [10]u8 = undefined;
+            const oid_str = std.fmt.bufPrint(&oid_buf, "{d}", .{rel.oid}) catch unreachable;
+            try json.appendSlice(oid_str);
+            try json.appendSlice("\":{");
+
+            // schema
+            try json.appendSlice("\"schema\":\"");
+            try appendJsonEscaped(&json, rel.namespace);
+            try json.appendSlice("\",");
+
+            // table
+            try json.appendSlice("\"table\":\"");
+            try appendJsonEscaped(&json, rel.name);
+            try json.appendSlice("\",");
+
+            // relreplident
+            try json.appendSlice("\"relreplident\":");
+            var ri_buf: [3]u8 = undefined;
+            const ri_str = std.fmt.bufPrint(&ri_buf, "{d}", .{rel.replica_identity}) catch unreachable;
+            try json.appendSlice(ri_str);
+            try json.append(',');
+
+            // columns
+            try json.appendSlice("\"columns\":[");
+            for (rel.columns, 0..) |col, i| {
+                if (i > 0) try json.append(',');
+                try json.append('{');
+
+                try json.appendSlice("\"flags\":");
+                var flags_buf: [3]u8 = undefined;
+                const flags_str = std.fmt.bufPrint(&flags_buf, "{d}", .{col.flags}) catch unreachable;
+                try json.appendSlice(flags_str);
+                try json.append(',');
+
+                try json.appendSlice("\"name\":\"");
+                try appendJsonEscaped(&json, col.name);
+                try json.appendSlice("\",");
+
+                try json.appendSlice("\"oid\":");
+                var col_oid_buf: [10]u8 = undefined;
+                const col_oid_str = std.fmt.bufPrint(&col_oid_buf, "{d}", .{col.type_oid}) catch unreachable;
+                try json.appendSlice(col_oid_str);
+                try json.append(',');
+
+                try json.appendSlice("\"typmod\":");
+                var typmod_buf: [11]u8 = undefined;
+                const typmod_str = std.fmt.bufPrint(&typmod_buf, "{d}", .{col.type_modifier}) catch unreachable;
+                try json.appendSlice(typmod_str);
+
+                try json.append('}');
+            }
+            try json.appendSlice("]}");
+        }
+
+        try json.appendSlice("}'::jsonb");
+
+        return json.toOwnedSlice();
+    }
+
+    fn appendJsonEscaped(list: *std.ArrayList(u8), s: []const u8) !void {
+        for (s) |c| {
+            switch (c) {
+                '"' => try list.appendSlice("\\\""),
+                '\\' => try list.appendSlice("\\\\"),
+                '\n' => try list.appendSlice("\\n"),
+                '\r' => try list.appendSlice("\\r"),
+                '\t' => try list.appendSlice("\\t"),
+                else => try list.append(c),
+            }
+        }
+    }
+
+    pub fn stop(self: *Ingestor) void {
+        self.replicator.stop();
+    }
+
+    pub fn isStopRequested(self: *Ingestor) bool {
+        return self.replicator.isStopRequested();
+    }
+
+    pub fn deinit(self: *Ingestor) void {
+        // Free all owned relation data
+        var it = self.relations.iterator();
+        while (it.next()) |entry| {
+            var rel = entry.value_ptr;
+            rel.deinit(self.allocator);
+        }
+        self.relations.deinit();
+        self.batch_buf.deinit();
+        self.replicator.deinit();
+        self.dest.close();
+    }
+};
