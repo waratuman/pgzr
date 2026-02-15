@@ -146,6 +146,7 @@ pub fn encodeStartup(
     buf: []u8,
     user: []const u8,
     database: []const u8,
+    replication: bool,
 ) []const u8 {
     var w = MsgWriter{ .buf = buf };
     const len_offset: usize = 0;
@@ -155,8 +156,10 @@ pub fn encodeStartup(
     w.writeString(user);
     w.writeString("database");
     w.writeString(database);
-    w.writeString("replication");
-    w.writeString("database");
+    if (replication) {
+        w.writeString("replication");
+        w.writeString("database");
+    }
     w.writeByte(0); // final terminator
     w.patchLength(len_offset);
     return w.getWritten();
@@ -276,25 +279,39 @@ pub fn parseError(body: []const u8) ErrorInfo {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "encodeStartup" {
+test "encodeStartup with replication" {
     var buf: [4096]u8 = undefined;
-    const msg = encodeStartup(&buf, "postgres", "mydb");
+    const msg = encodeStartup(&buf, "postgres", "mydb", true);
 
-    // Length field (first 4 bytes, big-endian)
     const length = std.mem.readInt(u32, msg[0..4], .big);
     try std.testing.expectEqual(length, @as(u32, @intCast(msg.len)));
 
-    // Protocol version
     const version = std.mem.readInt(u32, msg[4..8], .big);
     try std.testing.expectEqual(PROTOCOL_VERSION, version);
 
-    // Should contain "user\0postgres\0database\0mydb\0replication\0database\0\0"
     try std.testing.expect(std.mem.indexOf(u8, msg, "user") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "postgres") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "database") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "mydb") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "replication") != null);
-    // Last byte should be the double-null terminator
+    try std.testing.expectEqual(@as(u8, 0), msg[msg.len - 1]);
+}
+
+test "encodeStartup without replication" {
+    var buf: [4096]u8 = undefined;
+    const msg = encodeStartup(&buf, "postgres", "mydb", false);
+
+    const length = std.mem.readInt(u32, msg[0..4], .big);
+    try std.testing.expectEqual(length, @as(u32, @intCast(msg.len)));
+
+    const version = std.mem.readInt(u32, msg[4..8], .big);
+    try std.testing.expectEqual(PROTOCOL_VERSION, version);
+
+    try std.testing.expect(std.mem.indexOf(u8, msg, "user") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "postgres") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "database") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "mydb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "replication") == null);
     try std.testing.expectEqual(@as(u8, 0), msg[msg.len - 1]);
 }
 

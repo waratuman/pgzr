@@ -81,7 +81,7 @@ pub const Connection = struct {
         var send_buf: [4096]u8 = undefined;
 
         // Send StartupMessage
-        const startup = protocol.encodeStartup(&send_buf, config.user, config.database);
+        const startup = protocol.encodeStartup(&send_buf, config.user, config.database, config.replication);
         try transport.writeAll(startup);
 
         // Authenticate
@@ -208,6 +208,111 @@ pub const Connection = struct {
                     _ = try protocol.readBody(self.transport, header, self.recv_buf);
                     result.in_copy_mode = true;
                     return result;
+                },
+                protocol.MSG_NOTICE => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                },
+                else => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                },
+            }
+        }
+    }
+
+    /// Execute a simple query that may be larger than the stack buffer.
+    /// The send buffer is heap-allocated and freed after sending.
+    /// Does not return result rows — use for INSERT/UPDATE/DELETE/DDL.
+    pub fn execLarge(self: *Connection, allocator: std.mem.Allocator, query: []const u8) QueryError!void {
+        // Query message: 'Q' (1) + int32 len (4) + query + '\0' (1)
+        const msg_len = 1 + 4 + query.len + 1;
+        const buf = allocator.alloc(u8, msg_len) catch return error.OutOfMemory;
+        defer allocator.free(buf);
+
+        const msg = protocol.encodeQuery(buf, query);
+        try self.transport.writeAll(msg);
+
+        while (true) {
+            const header = try protocol.readHeader(self.transport);
+
+            switch (header.msg_type) {
+                protocol.MSG_ROW_DESC,
+                protocol.MSG_DATA_ROW,
+                protocol.MSG_CMD_COMPLETE,
+                protocol.MSG_NOTICE,
+                => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                },
+                protocol.MSG_READY => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    return;
+                },
+                protocol.MSG_ERROR => {
+                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
+                    const err = protocol.parseError(body);
+                    std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
+                    return error.ServerError;
+                },
+                else => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                },
+            }
+        }
+    }
+
+    /// Execute a simple query and invoke a callback for each DataRow.
+    /// The callback receives the column data slice (borrowed from recv_buf)
+    /// and must copy any data it needs before returning.
+    /// Returns the number of rows yielded.
+    pub fn queryRows(
+        self: *Connection,
+        query: []const u8,
+        context: anytype,
+        callback: fn (@TypeOf(context), []const QueryColumn) void,
+    ) QueryError!usize {
+        var send_buf: [4096]u8 = undefined;
+        const msg = protocol.encodeQuery(&send_buf, query);
+        try self.transport.writeAll(msg);
+
+        var row_count: usize = 0;
+
+        while (true) {
+            const header = try protocol.readHeader(self.transport);
+
+            switch (header.msg_type) {
+                protocol.MSG_ROW_DESC => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                },
+                protocol.MSG_DATA_ROW => {
+                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
+                    const col_count = std.mem.readInt(u16, body[0..2], .big);
+                    var cols: [16]QueryColumn = undefined;
+                    var pos: usize = 2;
+                    for (0..col_count) |i| {
+                        const col_len_raw = std.mem.readInt(i32, body[pos..][0..4], .big);
+                        pos += 4;
+                        if (col_len_raw < 0) {
+                            cols[i] = .{ .data = "", .is_null = true };
+                        } else {
+                            const col_len: usize = @intCast(col_len_raw);
+                            cols[i] = .{ .data = body[pos .. pos + col_len], .is_null = false };
+                            pos += col_len;
+                        }
+                    }
+                    callback(context, cols[0..col_count]);
+                    row_count += 1;
+                },
+                protocol.MSG_CMD_COMPLETE => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                },
+                protocol.MSG_READY => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    return row_count;
+                },
+                protocol.MSG_ERROR => {
+                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
+                    const err = protocol.parseError(body);
+                    std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
+                    return error.ServerError;
                 },
                 protocol.MSG_NOTICE => {
                     _ = try protocol.readBody(self.transport, header, self.recv_buf);

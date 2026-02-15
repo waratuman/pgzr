@@ -22,6 +22,9 @@ pub const ConnConfig = struct {
     socket_path: ?[]const u8 = null,
     /// TLS connection mode.
     tls: TlsMode = .disable,
+    /// Whether to open a replication connection. Set to false for normal
+    /// connections (e.g. the destination database for WAL storage).
+    replication: bool = true,
 };
 
 pub const ReplicatorConfig = struct {
@@ -50,6 +53,38 @@ pub const ReplicatorConfig = struct {
     /// Expected system identifier. If set and the server reports a different
     /// system ID, `Replicator.init` returns `error.SystemIdMismatch`.
     expected_systemid: ?[]const u8 = null,
+};
+
+pub const IngestConfig = struct {
+    source: ReplicatorConfig,
+    dest: ConnConfig,
+    source_id: []const u8,
+    /// Maximum batch size in bytes before flushing (default 4 MiB).
+    max_batch_size: usize = 4 * 1024 * 1024,
+};
+
+pub const ProcessorConfig = struct {
+    dest: ConnConfig,
+    source_id: []const u8,
+    /// Maximum number of batches to claim per processing cycle.
+    batch_limit: u32 = 10,
+    /// Polling interval in milliseconds when no pending batches are found.
+    poll_interval_ms: u64 = 1_000,
+};
+
+pub const RelationColumnInfo = struct {
+    flags: u8,
+    name: []const u8,
+    type_oid: u32,
+    type_modifier: i32,
+};
+
+pub const RelationInfo = struct {
+    oid: u32,
+    namespace: []const u8,
+    name: []const u8,
+    replica_identity: u8,
+    columns: []const RelationColumnInfo,
 };
 
 pub const WalMessage = struct {
