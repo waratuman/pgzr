@@ -168,10 +168,38 @@ try processor.run();
 ```bash
 zig build                  # build library + examples
 zig build test             # run unit tests
+zig build lib              # build shared library (libpgzr.dylib/so)
 zig build example          # run examples/basic.zig
 zig build ingest-example   # run examples/ingest.zig
 zig build integration-test # run integration tests (requires PostgreSQL)
 zig build pipeline-test    # run pipeline integration tests (requires PostgreSQL)
+```
+
+### Shared Library (C ABI)
+
+Build `libpgzr.dylib` (macOS) or `libpgzr.so` (Linux) for use from Ruby,
+Python, or any language with FFI:
+
+```bash
+zig build lib
+ls zig-out/lib/libpgzr.*
+```
+
+Exported functions:
+
+```
+pgzr_ingestor_new(config)   → *Ingestor or NULL
+pgzr_ingestor_run(ptr)      → 0 on success, -1 on error
+pgzr_ingestor_stop(ptr)     → void (thread-safe)
+pgzr_ingestor_free(ptr)     → void
+
+pgzr_processor_new(config)       → *Processor or NULL
+pgzr_processor_run(ptr)          → 0 on success, -1 on error
+pgzr_processor_process_one(ptr)  → 1 if batch processed, 0 if none, -1 on error
+pgzr_processor_stop(ptr)         → void (thread-safe)
+pgzr_processor_free(ptr)         → void
+
+pgzr_last_error(out_len)    → pointer to error message
 ```
 
 ## Manual Example
@@ -217,6 +245,7 @@ src/
   schema.zig      -- DDL for pipeline tables (wal_batches, transactions, events, columns)
   query.zig       -- SQL escaping helpers (strings, bytea, UUIDs, timestamps)
   pg_types.zig    -- PostgreSQL OID-to-type-name lookup
+  cabi.zig        -- C ABI exports for shared library (Ruby/Python FFI)
 examples/
   basic.zig       -- minimal replication example (test_decoding)
   ingest.zig      -- WAL ingest pipeline example (pgoutput)

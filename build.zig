@@ -102,6 +102,20 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("integration-test", "Run integration tests (requires PostgreSQL)");
     integration_step.dependOn(&run_integration.step);
 
+    // Shared library (C ABI for Ruby FFI)
+    const lib = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "pgzr",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cabi.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(lib);
+    const lib_step = b.step("lib", "Build shared library (libpgzr.dylib/so)");
+    lib_step.dependOn(b.getInstallStep());
+
     // Pipeline integration tests (requires a running PostgreSQL instance)
     const pipeline_tests = b.addExecutable(.{
         .name = "pipeline-tests",
