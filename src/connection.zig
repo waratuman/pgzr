@@ -184,7 +184,8 @@ pub const Connection = struct {
                 protocol.MSG_DATA_ROW => {
                     const body = try protocol.readBody(self.transport, header, self.recv_buf);
                     if (result.column_count == 0) {
-                        const col_count = std.mem.readInt(u16, body[0..2], .big);
+                        const raw_col_count = std.mem.readInt(u16, body[0..2], .big);
+                        const col_count = @min(raw_col_count, result.columns.len);
                         var pos: usize = 2;
                         for (0..col_count) |i| {
                             const col_len_raw = std.mem.readInt(i32, body[pos..][0..4], .big);
@@ -193,6 +194,11 @@ pub const Connection = struct {
                                 result.columns[i] = .{ .data = "", .is_null = true };
                             } else {
                                 const col_len: usize = @intCast(col_len_raw);
+                                if (stable_pos + col_len > stable_base) {
+                                    // Column data exceeds stable region — skip remaining columns
+                                    result.column_count = i;
+                                    break;
+                                }
                                 const src = body[pos .. pos + col_len];
                                 const dest = self.recv_buf[stable_base + stable_pos ..][0..col_len];
                                 @memcpy(dest, src);
@@ -201,7 +207,7 @@ pub const Connection = struct {
                                 pos += col_len;
                             }
                         }
-                        result.column_count = col_count;
+                        if (result.column_count == 0) result.column_count = col_count;
                     }
                 },
                 protocol.MSG_CMD_COMPLETE => {
@@ -304,7 +310,8 @@ pub const Connection = struct {
                 protocol.MSG_DATA_ROW => {
                     const body = try protocol.readBody(self.transport, header, self.recv_buf);
                     if (result.column_count == 0) {
-                        const col_count = std.mem.readInt(u16, body[0..2], .big);
+                        const raw_col_count = std.mem.readInt(u16, body[0..2], .big);
+                        const col_count = @min(raw_col_count, result.columns.len);
                         var pos: usize = 2;
                         for (0..col_count) |i| {
                             const col_len_raw = std.mem.readInt(i32, body[pos..][0..4], .big);
@@ -313,8 +320,11 @@ pub const Connection = struct {
                                 result.columns[i] = .{ .data = "", .is_null = true };
                             } else {
                                 const col_len: usize = @intCast(col_len_raw);
+                                if (stable_pos + col_len > stable_base) {
+                                    result.column_count = i;
+                                    break;
+                                }
                                 const src = body[pos .. pos + col_len];
-                                // Copy into stable region
                                 const dest = self.recv_buf[stable_base + stable_pos ..][0..col_len];
                                 @memcpy(dest, src);
                                 result.columns[i] = .{ .data = dest, .is_null = false };
@@ -322,7 +332,7 @@ pub const Connection = struct {
                                 pos += col_len;
                             }
                         }
-                        result.column_count = col_count;
+                        if (result.column_count == 0) result.column_count = col_count;
                     }
                 },
                 protocol.MSG_CMD_COMPLETE => {

@@ -90,7 +90,7 @@ pub const Processor = struct {
         };
     }
 
-    pub const ProcessError = Connection.QueryError || std.mem.Allocator.Error || pgoutput.DecodeError;
+    pub const ProcessError = Connection.QueryError || std.mem.Allocator.Error || pgoutput.DecodeError || error{InvalidUuid};
 
     /// Process one pending batch. Returns true if a batch was claimed,
     /// false if no pending batches were found.

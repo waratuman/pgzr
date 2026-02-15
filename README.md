@@ -13,6 +13,58 @@ dependencies.
 - Batch splitting for large transactions
 - Auto-reconnection with exponential backoff
 
+## Architecture
+
+PGZR provides three layers that can be used independently or composed into a
+full pipeline:
+
+### Mode 1: Low-level Replication (Replicator)
+
+Stream raw WAL messages directly from PostgreSQL:
+
+```
+┌──────────┐    WAL stream     ┌────────────┐
+│ Source DB │ ────────────────> │ Replicator │ ──> raw WAL messages
+│ (PG)     │   pgoutput/       │            │     to your code
+└──────────┘   test_decoding   └────────────┘
+```
+
+### Mode 2: WAL Ingest Pipeline (Ingestor)
+
+Stream WAL from a source database and store packed batches in a destination
+database for later processing:
+
+```
+┌──────────┐    WAL stream     ┌───────────┐   packed batches   ┌─────────┐
+│ Source DB │ ────────────────> │ Ingestor  │ ────────────────>  │ Dest DB │
+│ (PG)     │   pgoutput        │           │   wal_batches      │ (PG)    │
+└──────────┘                   └───────────┘   table             └─────────┘
+```
+
+### Mode 3: Full Pipeline (Ingestor + Processor)
+
+Ingest WAL, store batches, then process them into structured tables:
+
+```
+┌──────────┐  WAL   ┌───────────┐  batches  ┌─────────┐  read   ┌───────────┐
+│ Source DB │ ────>  │ Ingestor  │ ────────> │ Dest DB │ <────── │ Processor │
+│ (PG)     │        │           │           │ (PG)    │ ──────> │           │
+└──────────┘        └───────────┘           └─────────┘  write  └───────────┘
+                                                │
+                                                v
+                                    ┌───────────────────────┐
+                                    │ transactions          │
+                                    │ events                │
+                                    │ columns               │
+                                    │ (structured audit log)│
+                                    └───────────────────────┘
+```
+
+Large transactions are automatically split into partial batches by the
+Ingestor (with `complete=false`). The Processor accumulates partial batches
+and processes them as a single unit when the final `complete=true` batch
+arrives.
+
 ## Usage
 
 ### Low-level Replication
@@ -175,6 +227,3 @@ benchmark/
   bench.zig       -- pgzr vs pg_replication (Ruby) benchmark
 ```
 
-## License
-
-MIT

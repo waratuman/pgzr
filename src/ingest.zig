@@ -82,7 +82,7 @@ pub const Ingestor = struct {
         };
     }
 
-    pub const RunError = Replicator.NextError || Connection.QueryError || std.mem.Allocator.Error;
+    pub const RunError = Replicator.NextError || Connection.QueryError || std.mem.Allocator.Error || error{InvalidUuid};
 
     /// Main ingest loop. Streams WAL from source and stores packed batches
     /// in the destination database. Blocks until the replicator is stopped
