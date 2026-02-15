@@ -256,3 +256,14 @@ benchmark/
   bench.zig       -- pgzr vs pg_replication (Ruby) benchmark
 ```
 
+## Future Work
+
+- **Pipeline mode for dest queries** — Currently the processor uses the simple
+  query protocol, issuing one round-trip per SQL statement. PostgreSQL's
+  extended query protocol supports pipeline mode (Parse/Bind/Execute/Sync)
+  which allows sending an entire batch of queries without waiting for
+  individual responses. This would collapse all event and column INSERTs for a
+  batch into a single network round-trip. Requires implementing the extended
+  query protocol, client-side UUID generation (to remove the `RETURNING id`
+  dependency between event and column INSERTs), and pipeline error handling.
+
