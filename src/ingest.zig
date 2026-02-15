@@ -18,6 +18,7 @@ pub const Ingestor = struct {
     batch_start_lsn: Lsn,
     batch_end_lsn: Lsn,
     batch_msg_count: usize,
+    in_transaction: bool,
 
     // Relation cache (owned copies)
     relations: std.AutoHashMap(u32, OwnedRelation),
@@ -73,6 +74,7 @@ pub const Ingestor = struct {
             .batch_start_lsn = Lsn.zero,
             .batch_end_lsn = Lsn.zero,
             .batch_msg_count = 0,
+            .in_transaction = false,
             .relations = std.AutoHashMap(u32, OwnedRelation).init(allocator),
             .col_buf = undefined,
             .tuple_buf = undefined,
@@ -85,6 +87,10 @@ pub const Ingestor = struct {
     /// Main ingest loop. Streams WAL from source and stores packed batches
     /// in the destination database. Blocks until the replicator is stopped
     /// or end_position is reached.
+    ///
+    /// Batches are flushed on COMMIT boundaries. If a transaction exceeds
+    /// `max_batch_size`, the batch is split mid-transaction with
+    /// `complete=false`. The processor reassembles partial batches.
     pub fn run(self: *Ingestor) RunError!void {
         while (try self.replicator.next()) |wal_msg| {
             const data = wal_msg.data;
@@ -95,6 +101,11 @@ pub const Ingestor = struct {
                 self.batch_start_lsn = wal_msg.wal_start;
             }
             self.batch_end_lsn = wal_msg.wal_start;
+
+            // Track transaction boundaries
+            if (data[0] == 'B') {
+                self.in_transaction = true;
+            }
 
             // Parse relation messages to maintain the cache
             if (data[0] == 'R') {
@@ -107,26 +118,35 @@ pub const Ingestor = struct {
             try self.batch_buf.appendSlice(data);
             self.batch_msg_count += 1;
 
-            // Flush on COMMIT boundaries
-            if (data[0] == 'C') {
-                try self.flushBatch();
+            // Flush on COMMIT or StreamCommit boundaries
+            if (data[0] == 'C' or data[0] == 'c') {
+                self.in_transaction = false;
+                try self.flushBatch(true);
                 self.replicator.ack(wal_msg.wal_start);
+                continue;
             }
 
-            // Also flush if batch exceeds size cap (but only on transaction boundaries)
-            if (self.batch_buf.items.len >= self.config.max_batch_size and data[0] == 'C') {
-                // Already flushed above on commit, this is a no-op safety check
+            // Flush mid-transaction when batch size limit is exceeded
+            if (self.batch_buf.items.len >= self.config.max_batch_size) {
+                if (self.in_transaction) {
+                    // Partial batch — processor will reassemble
+                    try self.flushBatch(false);
+                } else {
+                    // Between transactions — safe to flush as complete
+                    try self.flushBatch(true);
+                    self.replicator.ack(wal_msg.wal_start);
+                }
             }
         }
 
         // Flush any remaining batch data
         if (self.batch_msg_count > 0) {
-            try self.flushBatch();
+            try self.flushBatch(!self.in_transaction);
         }
     }
 
     fn updateRelationCache(self: *Ingestor, data: []const u8) !void {
-        const msg = pgoutput.decode(data, &self.col_buf, &self.tuple_buf, &self.tuple_buf2) catch return;
+        const msg = pgoutput.decode(data, &self.col_buf, &self.tuple_buf, &self.tuple_buf2, null) catch return;
         const rel = switch (msg) {
             .relation => |r| r,
             else => return,
@@ -166,7 +186,7 @@ pub const Ingestor = struct {
         });
     }
 
-    fn flushBatch(self: *Ingestor) !void {
+    fn flushBatch(self: *Ingestor, complete: bool) !void {
         if (self.batch_msg_count == 0) return;
 
         const data_hex = try query.escapeBytea(self.allocator, self.batch_buf.items);
@@ -182,7 +202,7 @@ pub const Ingestor = struct {
         var sql = std.ArrayList(u8).init(self.allocator);
         defer sql.deinit();
 
-        try sql.appendSlice("INSERT INTO wal_batches (source_id, start_lsn, end_lsn, data, relations) VALUES (");
+        try sql.appendSlice("INSERT INTO wal_batches (source_id, start_lsn, end_lsn, data, relations, complete) VALUES (");
         try sql.appendSlice(source_id);
         try sql.appendSlice(", ");
 
@@ -199,7 +219,14 @@ pub const Ingestor = struct {
         try sql.appendSlice(", ");
 
         try sql.appendSlice(relations_json);
-        try sql.append(')');
+        try sql.appendSlice(", ");
+
+        if (complete) {
+            try sql.appendSlice("true");
+        } else {
+            try sql.appendSlice("false");
+        }
+        try sql.appendSlice(") ON CONFLICT (source_id, start_lsn) DO NOTHING");
 
         try self.dest.execLarge(self.allocator, sql.items);
 

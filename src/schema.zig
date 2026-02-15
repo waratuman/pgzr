@@ -9,6 +9,7 @@ pub const create_wal_batches =
     \\    data            BYTEA NOT NULL,
     \\    relations       JSONB,
     \\    state           TEXT NOT NULL DEFAULT 'pending',
+    \\    complete        BOOLEAN NOT NULL DEFAULT true,
     \\    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     \\    UNIQUE (source_id, start_lsn)
     \\)

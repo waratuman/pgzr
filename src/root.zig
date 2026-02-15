@@ -14,6 +14,7 @@ pub const query = @import("query.zig");
 pub const pg_types = @import("pg_types.zig");
 pub const schema = @import("schema.zig");
 pub const Ingestor = @import("ingest.zig").Ingestor;
+pub const Processor = @import("processor.zig").Processor;
 
 test {
     _ = @import("lsn.zig");

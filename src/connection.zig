@@ -259,6 +259,71 @@ pub const Connection = struct {
         }
     }
 
+    /// Execute a large query and return the first DataRow result.
+    /// Like execLarge but captures the first row (for RETURNING clauses).
+    pub fn execLargeWithResult(self: *Connection, allocator: std.mem.Allocator, query: []const u8) QueryError!QueryResult {
+        const msg_len = 1 + 4 + query.len + 1;
+        const buf = allocator.alloc(u8, msg_len) catch return error.OutOfMemory;
+        defer allocator.free(buf);
+
+        const msg = protocol.encodeQuery(buf, query);
+        try self.transport.writeAll(msg);
+
+        var result = QueryResult{
+            .columns = undefined,
+            .column_count = 0,
+            .in_copy_mode = false,
+        };
+
+        while (true) {
+            const header = try protocol.readHeader(self.transport);
+
+            switch (header.msg_type) {
+                protocol.MSG_ROW_DESC => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                },
+                protocol.MSG_DATA_ROW => {
+                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
+                    if (result.column_count == 0) {
+                        const col_count = std.mem.readInt(u16, body[0..2], .big);
+                        var pos: usize = 2;
+                        for (0..col_count) |i| {
+                            const col_len_raw = std.mem.readInt(i32, body[pos..][0..4], .big);
+                            pos += 4;
+                            if (col_len_raw < 0) {
+                                result.columns[i] = .{ .data = "", .is_null = true };
+                            } else {
+                                const col_len: usize = @intCast(col_len_raw);
+                                result.columns[i] = .{ .data = body[pos .. pos + col_len], .is_null = false };
+                                pos += col_len;
+                            }
+                        }
+                        result.column_count = col_count;
+                    }
+                },
+                protocol.MSG_CMD_COMPLETE => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                },
+                protocol.MSG_READY => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    return result;
+                },
+                protocol.MSG_ERROR => {
+                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
+                    const err = protocol.parseError(body);
+                    std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
+                    return error.ServerError;
+                },
+                protocol.MSG_NOTICE => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                },
+                else => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                },
+            }
+        }
+    }
+
     /// Execute a simple query and invoke a callback for each DataRow.
     /// The callback receives the column data slice (borrowed from recv_buf)
     /// and must copy any data it needs before returning.

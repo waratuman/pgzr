@@ -27,6 +27,13 @@ pub const Processor = struct {
     current_txn_timestamp: i64,
     in_transaction: bool,
 
+    // Streaming context (proto v2+)
+    current_stream_xid: ?u32,
+
+    // Batch accumulation for partial (split) batches
+    pending_data: std.ArrayList(u8),
+    pending_batch_ids: std.ArrayList([]u8),
+
     // Stop flag for graceful shutdown
     stop_flag: std.atomic.Value(bool),
 
@@ -76,14 +83,21 @@ pub const Processor = struct {
             .current_txn_xid = 0,
             .current_txn_timestamp = 0,
             .in_transaction = false,
+            .current_stream_xid = null,
+            .pending_data = std.ArrayList(u8).init(allocator),
+            .pending_batch_ids = std.ArrayList([]u8).init(allocator),
             .stop_flag = std.atomic.Value(bool).init(false),
         };
     }
 
     pub const ProcessError = Connection.QueryError || std.mem.Allocator.Error || pgoutput.DecodeError;
 
-    /// Process one pending batch. Returns true if a batch was processed,
+    /// Process one pending batch. Returns true if a batch was claimed,
     /// false if no pending batches were found.
+    ///
+    /// Partial batches (complete=false) are accumulated in memory until
+    /// a complete batch arrives, then all accumulated data is processed
+    /// as one logical unit.
     pub fn processOne(self: *Processor) ProcessError!bool {
         // Claim a batch
         const source_id = try query_mod.escapeUuid(self.allocator, self.config.source_id);
@@ -97,52 +111,81 @@ pub const Processor = struct {
             \\   WHERE source_id={s} AND state='pending'
             \\   ORDER BY start_lsn LIMIT 1
             \\   FOR UPDATE SKIP LOCKED
-            \\ ) RETURNING id, data, start_lsn, end_lsn
+            \\ ) RETURNING id, data, complete
         , .{source_id}) catch unreachable;
 
         const result = try self.dest.simpleQuery(claim_sql);
         if (result.column_count == 0) return false;
 
-        // Extract batch id and data
         const batch_id = result.columns[0].data;
-
-        // data comes back as bytea hex: \xDEADBEEF...
         const raw_data = result.columns[1].data;
+        const complete_str = result.columns[2].data;
+        const is_complete = complete_str.len > 0 and complete_str[0] == 't';
 
-        // Copy batch_id for use in later queries (it's borrowed from recv_buf)
+        // Copy batch_id (borrowed from recv_buf)
         const batch_id_copy = try self.allocator.alloc(u8, batch_id.len);
-        defer self.allocator.free(batch_id_copy);
         @memcpy(batch_id_copy, batch_id);
 
         // Decode hex bytea to binary
         const batch_data = try self.decodeBytea(raw_data);
-        defer self.allocator.free(batch_data);
 
-        // Process all messages in the batch
-        self.processBatch(batch_data, batch_id_copy) catch |err| {
-            // On error, mark batch as error state
-            var err_buf: [256]u8 = undefined;
-            const err_sql = std.fmt.bufPrint(&err_buf,
-                "UPDATE wal_batches SET state='error' WHERE id={s}",
-                .{batch_id_copy},
-            ) catch unreachable;
-            _ = self.dest.simpleQuery(err_sql) catch {};
+        // Accumulate data and batch ID
+        try self.pending_data.appendSlice(batch_data);
+        self.allocator.free(batch_data);
+        try self.pending_batch_ids.append(batch_id_copy);
+
+        if (!is_complete) {
+            // Partial batch — wait for the complete one
+            return true;
+        }
+
+        // Complete batch — process all accumulated data
+        const all_data = self.pending_data.items;
+        self.processBatch(all_data) catch |err| {
+            // On error, mark all accumulated batches as error
+            self.markBatchesError();
+            self.clearPending();
             return err;
         };
 
-        // On success, delete the batch
-        var del_buf: [128]u8 = undefined;
-        const del_sql = std.fmt.bufPrint(&del_buf,
-            "DELETE FROM wal_batches WHERE id={s}",
-            .{batch_id_copy},
-        ) catch unreachable;
-        _ = try self.dest.simpleQuery(del_sql);
+        // On success, delete all accumulated batches
+        self.deleteBatches() catch {};
+        self.clearPending();
 
         return true;
     }
 
-    fn processBatch(self: *Processor, data: []const u8, batch_id: []const u8) !void {
-        _ = batch_id;
+    fn markBatchesError(self: *Processor) void {
+        for (self.pending_batch_ids.items) |bid| {
+            var err_buf: [256]u8 = undefined;
+            const err_sql = std.fmt.bufPrint(&err_buf,
+                "UPDATE wal_batches SET state='error' WHERE id={s}",
+                .{bid},
+            ) catch continue;
+            _ = self.dest.simpleQuery(err_sql) catch {};
+        }
+    }
+
+    fn deleteBatches(self: *Processor) !void {
+        for (self.pending_batch_ids.items) |bid| {
+            var del_buf: [128]u8 = undefined;
+            const del_sql = std.fmt.bufPrint(&del_buf,
+                "DELETE FROM wal_batches WHERE id={s}",
+                .{bid},
+            ) catch continue;
+            _ = try self.dest.simpleQuery(del_sql);
+        }
+    }
+
+    fn clearPending(self: *Processor) void {
+        for (self.pending_batch_ids.items) |bid| {
+            self.allocator.free(bid);
+        }
+        self.pending_batch_ids.clearRetainingCapacity();
+        self.pending_data.clearRetainingCapacity();
+    }
+
+    fn processBatch(self: *Processor, data: []const u8) !void {
         var pos: usize = 0;
 
         while (pos + 4 <= data.len) {
@@ -153,7 +196,13 @@ pub const Processor = struct {
             const msg_data = data[pos .. pos + msg_len];
             pos += msg_len;
 
-            const msg = try pgoutput.decode(msg_data, &self.col_buf, &self.tuple_buf, &self.tuple_buf2);
+            const msg = try pgoutput.decode(
+                msg_data,
+                &self.col_buf,
+                &self.tuple_buf,
+                &self.tuple_buf2,
+                self.current_stream_xid,
+            );
 
             switch (msg) {
                 .begin => |begin| {
@@ -181,8 +230,48 @@ pub const Processor = struct {
                     try self.insertEvent(del.relation_oid, 2, del.old_tuple, null);
                 },
                 .truncate => {
-                    // Truncate events logged as type 3, no column data
                     try self.insertTruncateEvent();
+                },
+                // Proto v2: streaming
+                .stream_start => |ss| {
+                    self.current_stream_xid = ss.xid;
+                },
+                .stream_stop => {
+                    self.current_stream_xid = null;
+                },
+                .stream_commit => |sc| {
+                    self.current_stream_xid = null;
+                    if (self.in_transaction) {
+                        try self.insertTransaction(sc.lsn);
+                        self.in_transaction = false;
+                    }
+                },
+                .stream_abort => {
+                    self.current_stream_xid = null;
+                    self.in_transaction = false;
+                },
+                // Proto v3: two-phase commit
+                .begin_prepare => |bp| {
+                    self.current_txn_lsn = bp.lsn;
+                    self.current_txn_xid = bp.xid;
+                    self.current_txn_timestamp = bp.timestamp;
+                    self.in_transaction = true;
+                },
+                .prepare => {
+                    // Prepared but not yet committed — keep txn state
+                },
+                .commit_prepared => |cp| {
+                    self.current_txn_timestamp = cp.timestamp;
+                    if (self.in_transaction) {
+                        try self.insertTransaction(cp.lsn);
+                        self.in_transaction = false;
+                    }
+                },
+                .rollback_prepared => {
+                    self.in_transaction = false;
+                },
+                .stream_prepare => {
+                    // Prepared within streaming — keep txn state
                 },
                 else => {},
             }
@@ -458,12 +547,9 @@ pub const Processor = struct {
                         hasher.update(b);
                     },
                     .null_value => {
-                        // Represent NULL as length 0xFFFFFFFF
                         hasher.update(&[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
                     },
-                    .unchanged => {
-                        // Skip unchanged columns in digest
-                    },
+                    .unchanged => {},
                 }
             }
         }
@@ -475,7 +561,6 @@ pub const Processor = struct {
     }
 
     fn updateRelationCache(self: *Processor, rel: pgoutput.Relation) !void {
-        // Remove old entry if it exists
         if (self.relations.fetchRemove(rel.oid)) |entry| {
             var old = entry.value;
             old.deinit(self.allocator);
@@ -509,9 +594,7 @@ pub const Processor = struct {
     }
 
     fn decodeBytea(self: *Processor, hex_data: []const u8) ![]u8 {
-        // PostgreSQL bytea hex format: \xDEADBEEF...
         if (hex_data.len < 2 or hex_data[0] != '\\' or hex_data[1] != 'x') {
-            // Not hex format, return a copy
             const copy = try self.allocator.alloc(u8, hex_data.len);
             @memcpy(copy, hex_data);
             return copy;
@@ -519,8 +602,7 @@ pub const Processor = struct {
 
         const hex = hex_data[2..];
         if (hex.len % 2 != 0) {
-            const copy = try self.allocator.alloc(u8, 0);
-            return copy;
+            return try self.allocator.alloc(u8, 0);
         }
 
         const out_len = hex.len / 2;
@@ -529,7 +611,7 @@ pub const Processor = struct {
         for (0..out_len) |i| {
             const hi = hexDigit(hex[i * 2]) orelse {
                 self.allocator.free(out);
-                return error.OutOfMemory; // reuse existing error
+                return error.OutOfMemory;
             };
             const lo = hexDigit(hex[i * 2 + 1]) orelse {
                 self.allocator.free(out);
@@ -573,6 +655,9 @@ pub const Processor = struct {
             rel.deinit(self.allocator);
         }
         self.relations.deinit();
+        self.clearPending();
+        self.pending_data.deinit();
+        self.pending_batch_ids.deinit();
         self.dest.close();
     }
 };
