@@ -14,6 +14,8 @@ pub const Connection = struct {
     backend_pid: u32 = 0,
     backend_key: u32 = 0,
     recv_buf: []u8,
+    /// Reusable send buffer for execLarge/execLargeWithResult.
+    send_buf: std.ArrayListUnmanaged(u8) = .{},
     /// Heap-allocated transport state (PlainState or TlsState).
     plain_state: ?*PlainState = null,
     tls_state: ?*TlsState = null,
@@ -239,13 +241,14 @@ pub const Connection = struct {
     }
 
     /// Execute a simple query that may be larger than the stack buffer.
-    /// The send buffer is heap-allocated and freed after sending.
+    /// Uses a reusable send buffer to avoid per-call allocations.
     /// Does not return result rows — use for INSERT/UPDATE/DELETE/DDL.
     pub fn execLarge(self: *Connection, allocator: std.mem.Allocator, query: []const u8) QueryError!void {
         // Query message: 'Q' (1) + int32 len (4) + query + '\0' (1)
         const msg_len = 1 + 4 + query.len + 1;
-        const buf = allocator.alloc(u8, msg_len) catch return error.OutOfMemory;
-        defer allocator.free(buf);
+        self.send_buf.clearRetainingCapacity();
+        self.send_buf.ensureTotalCapacity(allocator, msg_len) catch return error.OutOfMemory;
+        const buf = self.send_buf.allocatedSlice()[0..msg_len];
 
         const msg = protocol.encodeQuery(buf, query);
         try self.transport.writeAll(msg);
@@ -284,8 +287,9 @@ pub const Connection = struct {
     /// survives subsequent protocol reads.
     pub fn execLargeWithResult(self: *Connection, allocator: std.mem.Allocator, query: []const u8) QueryError!QueryResult {
         const msg_len = 1 + 4 + query.len + 1;
-        const buf = allocator.alloc(u8, msg_len) catch return error.OutOfMemory;
-        defer allocator.free(buf);
+        self.send_buf.clearRetainingCapacity();
+        self.send_buf.ensureTotalCapacity(allocator, msg_len) catch return error.OutOfMemory;
+        const buf = self.send_buf.allocatedSlice()[0..msg_len];
 
         const msg = protocol.encodeQuery(buf, query);
         try self.transport.writeAll(msg);
@@ -425,6 +429,7 @@ pub const Connection = struct {
 
     pub fn close(self: *Connection) void {
         self.transport.close();
+        self.send_buf.deinit(self.allocator);
         self.allocator.free(self.recv_buf);
         if (self.tls_state) |ts| self.allocator.destroy(ts);
         if (self.plain_state) |ps| self.allocator.destroy(ps);

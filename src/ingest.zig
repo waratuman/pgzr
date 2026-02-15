@@ -189,35 +189,22 @@ pub const Ingestor = struct {
     fn flushBatch(self: *Ingestor, complete: bool) !void {
         if (self.batch_msg_count == 0) return;
 
-        const data_hex = try query.escapeBytea(self.allocator, self.batch_buf.items);
-        defer self.allocator.free(data_hex);
-
         const relations_json = try self.serializeRelations();
         defer self.allocator.free(relations_json);
 
-        const source_id = try query.escapeUuid(self.allocator, self.config.source_id);
-        defer self.allocator.free(source_id);
-
-        // Build INSERT query
+        // Build INSERT query with inline hex encoding (no intermediate data_hex allocation)
         var sql: std.ArrayListUnmanaged(u8) = .{};
         defer sql.deinit(self.allocator);
 
         try sql.appendSlice(self.allocator, "INSERT INTO wal_batches (source_id, start_lsn, end_lsn, data, relations, complete) VALUES (");
-        try sql.appendSlice(self.allocator, source_id);
+        try query.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
         try sql.appendSlice(self.allocator, ", ");
-
-        var lsn_buf: [20]u8 = undefined;
-        const start_str = std.fmt.bufPrint(&lsn_buf, "{d}", .{self.batch_start_lsn.value}) catch unreachable;
-        try sql.appendSlice(self.allocator, start_str);
+        try query.appendIntValue(&sql, self.allocator, self.batch_start_lsn.value);
         try sql.appendSlice(self.allocator, ", ");
-
-        const end_str = std.fmt.bufPrint(&lsn_buf, "{d}", .{self.batch_end_lsn.value}) catch unreachable;
-        try sql.appendSlice(self.allocator, end_str);
+        try query.appendIntValue(&sql, self.allocator, self.batch_end_lsn.value);
         try sql.appendSlice(self.allocator, ", ");
-
-        try sql.appendSlice(self.allocator, data_hex);
+        try query.appendEscapedBytea(&sql, self.allocator, self.batch_buf.items);
         try sql.appendSlice(self.allocator, ", ");
-
         try sql.appendSlice(self.allocator, relations_json);
         try sql.appendSlice(self.allocator, ", ");
 

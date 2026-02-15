@@ -142,6 +142,87 @@ fn isValidUuid(s: []const u8) bool {
     return true;
 }
 
+// ── Append helpers (zero-alloc, write directly into SQL builder) ───────
+
+/// Append a SQL string literal to the list, escaping single quotes.
+pub fn appendEscapedString(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: []const u8) !void {
+    try list.append(alloc, '\'');
+    for (value) |c| {
+        if (c == '\'') try list.append(alloc, '\'');
+        try list.append(alloc, c);
+    }
+    try list.append(alloc, '\'');
+}
+
+/// Append a hex-encoded bytea literal to the list: '\xdeadbeef'
+pub fn appendEscapedBytea(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: []const u8) !void {
+    try list.appendSlice(alloc, "'\\x");
+    const hex = "0123456789abcdef";
+    for (value) |byte| {
+        try list.append(alloc, hex[byte >> 4]);
+        try list.append(alloc, hex[byte & 0x0f]);
+    }
+    try list.append(alloc, '\'');
+}
+
+/// Append a validated UUID as a SQL literal: 'xxxxxxxx-xxxx-...'
+pub fn appendEscapedUuid(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, uuid: []const u8) !void {
+    if (!isValidUuid(uuid)) return error.InvalidUuid;
+    try list.append(alloc, '\'');
+    try list.appendSlice(alloc, uuid);
+    try list.append(alloc, '\'');
+}
+
+/// Append SQL NULL literal.
+pub fn appendNull(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator) !void {
+    try list.appendSlice(alloc, "NULL");
+}
+
+/// Append an integer as a SQL literal (no quotes).
+pub fn appendIntValue(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: anytype) !void {
+    var tmp: [20]u8 = undefined;
+    const slice = std.fmt.bufPrint(&tmp, "{d}", .{value}) catch unreachable;
+    try list.appendSlice(alloc, slice);
+}
+
+/// Append a PostgreSQL timestamp as a SQL literal.
+pub fn appendTimestamp(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, pg_usec: i64) !void {
+    const pg_epoch_offset_us: i64 = 946_684_800 * 1_000_000;
+    const unix_us = pg_usec + pg_epoch_offset_us;
+    const clamped_us = @max(unix_us, 0);
+    const unix_sec = @divFloor(clamped_us, @as(i64, 1_000_000));
+    const frac_us: u64 = @intCast(@mod(clamped_us, 1_000_000));
+
+    const epoch_secs: u64 = @intCast(unix_sec);
+    const es = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
+    const day = es.getEpochDay();
+    const yd = day.calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+
+    var buf: [40]u8 = undefined;
+    const result = std.fmt.bufPrint(&buf, "'{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}+00'", .{
+        yd.year,
+        @as(u32, @intFromEnum(md.month)),
+        @as(u32, md.day_index) + 1,
+        ds.getHoursIntoDay(),
+        ds.getMinutesIntoHour(),
+        ds.getSecondsIntoMinute(),
+        frac_us,
+    }) catch unreachable;
+
+    try list.appendSlice(alloc, result);
+}
+
+/// Append a bytea value or NULL if data is null.
+pub fn appendByteaOrNull(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: ?[]const u8) !void {
+    if (value) |v| {
+        try appendEscapedBytea(list, alloc, v);
+    } else {
+        try appendNull(list, alloc);
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 test "escapeString: simple" {
@@ -315,4 +396,106 @@ test "escapeUuid: OOM" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, escapeUuid(failing.allocator(), "550e8400-e29b-41d4-a716-446655440000"));
     try std.testing.expect(failing.has_induced_failure);
+}
+
+// ── Append helper tests ───────────────────────────────────────────────
+
+test "appendEscapedString: simple" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendEscapedString(&list, std.testing.allocator, "hello");
+    try std.testing.expectEqualStrings("'hello'", list.items);
+}
+
+test "appendEscapedString: with quotes" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendEscapedString(&list, std.testing.allocator, "it's");
+    try std.testing.expectEqualStrings("'it''s'", list.items);
+}
+
+test "appendEscapedBytea: simple" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendEscapedBytea(&list, std.testing.allocator, &[_]u8{ 0xde, 0xad });
+    try std.testing.expectEqualStrings("'\\xdead'", list.items);
+}
+
+test "appendEscapedUuid: valid" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendEscapedUuid(&list, std.testing.allocator, "550e8400-e29b-41d4-a716-446655440000");
+    try std.testing.expectEqualStrings("'550e8400-e29b-41d4-a716-446655440000'", list.items);
+}
+
+test "appendEscapedUuid: invalid" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InvalidUuid, appendEscapedUuid(&list, std.testing.allocator, "bad"));
+}
+
+test "appendNull" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendNull(&list, std.testing.allocator);
+    try std.testing.expectEqualStrings("NULL", list.items);
+}
+
+test "appendIntValue: positive" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendIntValue(&list, std.testing.allocator, @as(u64, 42));
+    try std.testing.expectEqualStrings("42", list.items);
+}
+
+test "appendIntValue: negative" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendIntValue(&list, std.testing.allocator, @as(i64, -100));
+    try std.testing.expectEqualStrings("-100", list.items);
+}
+
+test "appendTimestamp: pg epoch" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendTimestamp(&list, std.testing.allocator, 0);
+    try std.testing.expectEqualStrings("'2000-01-01 00:00:00.000000+00'", list.items);
+}
+
+test "appendByteaOrNull: with data" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendByteaOrNull(&list, std.testing.allocator, &[_]u8{ 0xab });
+    try std.testing.expectEqualStrings("'\\xab'", list.items);
+}
+
+test "appendByteaOrNull: null" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendByteaOrNull(&list, std.testing.allocator, null);
+    try std.testing.expectEqualStrings("NULL", list.items);
+}
+
+test "appendEscapedString: matches escapeString" {
+    const input = "test'value''with\"quotes";
+    const heap_result = try escapeString(std.testing.allocator, input);
+    defer std.testing.allocator.free(heap_result);
+
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendEscapedString(&list, std.testing.allocator, input);
+
+    try std.testing.expectEqualStrings(heap_result, list.items);
+}
+
+test "appendEscapedBytea: matches escapeBytea" {
+    const input = &[_]u8{ 0x00, 0xff, 0x42, 0xab };
+    const heap_result = try escapeBytea(std.testing.allocator, input);
+    defer std.testing.allocator.free(heap_result);
+
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendEscapedBytea(&list, std.testing.allocator, input);
+
+    try std.testing.expectEqualStrings(heap_result, list.items);
 }
