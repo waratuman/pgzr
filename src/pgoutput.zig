@@ -39,22 +39,26 @@ pub const Relation = struct {
     name: []const u8,
     replica_identity: u8,
     columns: []const Column,
+    xid: ?u32 = null,
 };
 
 pub const Insert = struct {
     relation_oid: u32,
     new_tuple: []const ColumnData,
+    xid: ?u32 = null,
 };
 
 pub const Update = struct {
     relation_oid: u32,
     old_tuple: ?[]const ColumnData,
     new_tuple: []const ColumnData,
+    xid: ?u32 = null,
 };
 
 pub const Delete = struct {
     relation_oid: u32,
     old_tuple: []const ColumnData,
+    xid: ?u32 = null,
 };
 
 pub const Truncate = struct {
@@ -62,6 +66,7 @@ pub const Truncate = struct {
     relation_count: u32,
     /// Raw big-endian packed OID data. Use `relationOid(index)` to read individual OIDs.
     oid_data: []const u8,
+    xid: ?u32 = null,
 
     pub fn relationOid(self: Truncate, index: u32) DecodeError!u32 {
         const offset = index * 4;
@@ -74,6 +79,7 @@ pub const TypeInfo = struct {
     oid: u32,
     namespace: []const u8,
     name: []const u8,
+    xid: ?u32 = null,
 };
 
 pub const Origin = struct {
@@ -86,9 +92,80 @@ pub const LogicalMessage = struct {
     lsn: u64,
     prefix: []const u8,
     content: []const u8,
+    xid: ?u32 = null,
+};
+
+// Proto v2: Streaming large in-progress transactions (PG14+)
+pub const StreamStart = struct {
+    xid: u32,
+    first_segment: bool,
+};
+
+pub const StreamStop = struct {};
+
+pub const StreamCommit = struct {
+    xid: u32,
+    flags: u8,
+    lsn: u64,
+    end_lsn: u64,
+    timestamp: i64,
+};
+
+pub const StreamAbort = struct {
+    xid: u32,
+    sub_xid: u32,
+    abort_lsn: ?u64 = null,
+    abort_timestamp: ?i64 = null,
+};
+
+// Proto v3: Two-phase commit (PG15+)
+pub const BeginPrepare = struct {
+    lsn: u64,
+    end_lsn: u64,
+    timestamp: i64,
+    xid: u32,
+    gid: []const u8,
+};
+
+pub const PrepareMsg = struct {
+    flags: u8,
+    lsn: u64,
+    end_lsn: u64,
+    timestamp: i64,
+    xid: u32,
+    gid: []const u8,
+};
+
+pub const CommitPrepared = struct {
+    flags: u8,
+    lsn: u64,
+    end_lsn: u64,
+    timestamp: i64,
+    xid: u32,
+    gid: []const u8,
+};
+
+pub const RollbackPrepared = struct {
+    flags: u8,
+    end_lsn: u64,
+    rollback_end_lsn: u64,
+    prepare_timestamp: i64,
+    rollback_timestamp: i64,
+    xid: u32,
+    gid: []const u8,
+};
+
+pub const StreamPrepare = struct {
+    flags: u8,
+    lsn: u64,
+    end_lsn: u64,
+    timestamp: i64,
+    xid: u32,
+    gid: []const u8,
 };
 
 pub const PgoutputMessage = union(enum) {
+    // Proto v1
     begin: Begin,
     commit: Commit,
     relation: Relation,
@@ -99,6 +176,17 @@ pub const PgoutputMessage = union(enum) {
     type_info: TypeInfo,
     origin: Origin,
     message: LogicalMessage,
+    // Proto v2: streaming
+    stream_start: StreamStart,
+    stream_stop: StreamStop,
+    stream_commit: StreamCommit,
+    stream_abort: StreamAbort,
+    // Proto v3: two-phase commit
+    begin_prepare: BeginPrepare,
+    prepare: PrepareMsg,
+    commit_prepared: CommitPrepared,
+    rollback_prepared: RollbackPrepared,
+    stream_prepare: StreamPrepare,
 };
 
 pub const DecodeError = error{
@@ -110,25 +198,73 @@ pub const DecodeError = error{
 /// Decode a pgoutput binary message from the WAL data payload.
 /// All returned slices borrow from the input `data` buffer.
 /// The caller must provide scratch buffers for columns and tuple data.
+///
+/// `stream_xid`: when non-null, indicates we are inside a streaming context
+/// (between StreamStart and StreamStop). In proto_version 2+, DML messages
+/// within a stream have an extra Int32 xid prepended before their normal
+/// fields. The caller manages stream state and passes the xid from StreamStart.
 pub fn decode(
     data: []const u8,
     col_buf: []Column,
     tuple_buf: []ColumnData,
     tuple_buf2: []ColumnData,
+    stream_xid: ?u32,
 ) DecodeError!PgoutputMessage {
     if (data.len == 0) return error.InvalidMessage;
+
+    // For streamed DML messages, skip the leading Int32 xid
+    const xid_offset: usize = if (stream_xid != null) 4 else 0;
 
     return switch (data[0]) {
         'B' => .{ .begin = try decodeBegin(data[1..]) },
         'C' => .{ .commit = try decodeCommit(data[1..]) },
-        'R' => .{ .relation = try decodeRelation(data[1..], col_buf) },
-        'I' => .{ .insert = try decodeInsert(data[1..], tuple_buf) },
-        'U' => .{ .update = try decodeUpdate(data[1..], tuple_buf, tuple_buf2) },
-        'D' => .{ .delete = try decodeDelete(data[1..], tuple_buf) },
-        'T' => .{ .truncate = try decodeTruncate(data[1..]) },
-        'Y' => .{ .type_info = try decodeTypeInfo(data[1..]) },
+        'R' => blk: {
+            var rel = try decodeRelation(data[1 + xid_offset ..], col_buf);
+            rel.xid = stream_xid;
+            break :blk .{ .relation = rel };
+        },
+        'I' => blk: {
+            var ins = try decodeInsert(data[1 + xid_offset ..], tuple_buf);
+            ins.xid = stream_xid;
+            break :blk .{ .insert = ins };
+        },
+        'U' => blk: {
+            var upd = try decodeUpdate(data[1 + xid_offset ..], tuple_buf, tuple_buf2);
+            upd.xid = stream_xid;
+            break :blk .{ .update = upd };
+        },
+        'D' => blk: {
+            var del = try decodeDelete(data[1 + xid_offset ..], tuple_buf);
+            del.xid = stream_xid;
+            break :blk .{ .delete = del };
+        },
+        'T' => blk: {
+            var trunc = try decodeTruncate(data[1 + xid_offset ..]);
+            trunc.xid = stream_xid;
+            break :blk .{ .truncate = trunc };
+        },
+        'Y' => blk: {
+            var ti = try decodeTypeInfo(data[1 + xid_offset ..]);
+            ti.xid = stream_xid;
+            break :blk .{ .type_info = ti };
+        },
         'O' => .{ .origin = try decodeOrigin(data[1..]) },
-        'M' => .{ .message = try decodeLogicalMessage(data[1..]) },
+        'M' => blk: {
+            var msg = try decodeLogicalMessage(data[1 + xid_offset ..]);
+            msg.xid = stream_xid;
+            break :blk .{ .message = msg };
+        },
+        // Proto v2: streaming
+        'S' => .{ .stream_start = try decodeStreamStart(data[1..]) },
+        'E' => .{ .stream_stop = .{} },
+        'c' => .{ .stream_commit = try decodeStreamCommit(data[1..]) },
+        'A' => .{ .stream_abort = try decodeStreamAbort(data[1..]) },
+        // Proto v3: two-phase commit
+        'b' => .{ .begin_prepare = try decodeBeginPrepare(data[1..]) },
+        'P' => .{ .prepare = try decodePrepare(data[1..]) },
+        'K' => .{ .commit_prepared = try decodeCommitPrepared(data[1..]) },
+        'r' => .{ .rollback_prepared = try decodeRollbackPrepared(data[1..]) },
+        'p' => .{ .stream_prepare = try decodeStreamPrepare(data[1..]) },
         else => error.UnknownMessageType,
     };
 }
@@ -342,6 +478,108 @@ fn decodeLogicalMessage(data: []const u8) DecodeError!LogicalMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Proto v2: Streaming decoders
+// ---------------------------------------------------------------------------
+
+fn decodeStreamStart(data: []const u8) DecodeError!StreamStart {
+    var pos: usize = 0;
+    const xid = try readU32(data, &pos);
+    const first = try readU8(data, &pos);
+    return .{ .xid = xid, .first_segment = first != 0 };
+}
+
+fn decodeStreamCommit(data: []const u8) DecodeError!StreamCommit {
+    var pos: usize = 0;
+    const xid = try readU32(data, &pos);
+    const flags = try readU8(data, &pos);
+    const lsn = try readU64(data, &pos);
+    const end_lsn = try readU64(data, &pos);
+    const timestamp = try readI64(data, &pos);
+    return .{ .xid = xid, .flags = flags, .lsn = lsn, .end_lsn = end_lsn, .timestamp = timestamp };
+}
+
+fn decodeStreamAbort(data: []const u8) DecodeError!StreamAbort {
+    var pos: usize = 0;
+    const xid = try readU32(data, &pos);
+    const sub_xid = try readU32(data, &pos);
+    // Proto v4 extension: abort_lsn and abort_timestamp if data remains
+    var abort_lsn: ?u64 = null;
+    var abort_timestamp: ?i64 = null;
+    if (pos + 16 <= data.len) {
+        abort_lsn = try readU64(data, &pos);
+        abort_timestamp = try readI64(data, &pos);
+    }
+    return .{ .xid = xid, .sub_xid = sub_xid, .abort_lsn = abort_lsn, .abort_timestamp = abort_timestamp };
+}
+
+// ---------------------------------------------------------------------------
+// Proto v3: Two-phase commit decoders
+// ---------------------------------------------------------------------------
+
+fn decodeBeginPrepare(data: []const u8) DecodeError!BeginPrepare {
+    var pos: usize = 0;
+    const lsn = try readU64(data, &pos);
+    const end_lsn = try readU64(data, &pos);
+    const timestamp = try readI64(data, &pos);
+    const xid = try readU32(data, &pos);
+    const gid = try readCString(data, &pos);
+    return .{ .lsn = lsn, .end_lsn = end_lsn, .timestamp = timestamp, .xid = xid, .gid = gid };
+}
+
+fn decodePrepare(data: []const u8) DecodeError!PrepareMsg {
+    var pos: usize = 0;
+    const flags = try readU8(data, &pos);
+    const lsn = try readU64(data, &pos);
+    const end_lsn = try readU64(data, &pos);
+    const timestamp = try readI64(data, &pos);
+    const xid = try readU32(data, &pos);
+    const gid = try readCString(data, &pos);
+    return .{ .flags = flags, .lsn = lsn, .end_lsn = end_lsn, .timestamp = timestamp, .xid = xid, .gid = gid };
+}
+
+fn decodeCommitPrepared(data: []const u8) DecodeError!CommitPrepared {
+    var pos: usize = 0;
+    const flags = try readU8(data, &pos);
+    const lsn = try readU64(data, &pos);
+    const end_lsn = try readU64(data, &pos);
+    const timestamp = try readI64(data, &pos);
+    const xid = try readU32(data, &pos);
+    const gid = try readCString(data, &pos);
+    return .{ .flags = flags, .lsn = lsn, .end_lsn = end_lsn, .timestamp = timestamp, .xid = xid, .gid = gid };
+}
+
+fn decodeRollbackPrepared(data: []const u8) DecodeError!RollbackPrepared {
+    var pos: usize = 0;
+    const flags = try readU8(data, &pos);
+    const end_lsn = try readU64(data, &pos);
+    const rollback_end_lsn = try readU64(data, &pos);
+    const prepare_timestamp = try readI64(data, &pos);
+    const rollback_timestamp = try readI64(data, &pos);
+    const xid = try readU32(data, &pos);
+    const gid = try readCString(data, &pos);
+    return .{
+        .flags = flags,
+        .end_lsn = end_lsn,
+        .rollback_end_lsn = rollback_end_lsn,
+        .prepare_timestamp = prepare_timestamp,
+        .rollback_timestamp = rollback_timestamp,
+        .xid = xid,
+        .gid = gid,
+    };
+}
+
+fn decodeStreamPrepare(data: []const u8) DecodeError!StreamPrepare {
+    var pos: usize = 0;
+    const flags = try readU8(data, &pos);
+    const lsn = try readU64(data, &pos);
+    const end_lsn = try readU64(data, &pos);
+    const timestamp = try readI64(data, &pos);
+    const xid = try readU32(data, &pos);
+    const gid = try readCString(data, &pos);
+    return .{ .flags = flags, .lsn = lsn, .end_lsn = end_lsn, .timestamp = timestamp, .xid = xid, .gid = gid };
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -356,7 +594,7 @@ test "decode Begin" {
     var col_buf: [0]Column = undefined;
     var tuple_buf: [0]ColumnData = undefined;
     var tuple_buf2: [0]ColumnData = undefined;
-    const msg = try decode(&buf, &col_buf, &tuple_buf, &tuple_buf2);
+    const msg = try decode(&buf, &col_buf, &tuple_buf, &tuple_buf2, null);
     const begin = msg.begin;
     try std.testing.expectEqual(@as(u64, 100), begin.final_lsn);
     try std.testing.expectEqual(@as(i64, 200), begin.timestamp);
@@ -375,7 +613,7 @@ test "decode Commit" {
     var col_buf: [0]Column = undefined;
     var tuple_buf: [0]ColumnData = undefined;
     var tuple_buf2: [0]ColumnData = undefined;
-    const msg = try decode(&buf, &col_buf, &tuple_buf, &tuple_buf2);
+    const msg = try decode(&buf, &col_buf, &tuple_buf, &tuple_buf2, null);
     const commit = msg.commit;
     try std.testing.expectEqual(@as(u64, 100), commit.lsn);
     try std.testing.expectEqual(@as(u64, 200), commit.end_lsn);
@@ -422,7 +660,7 @@ test "decode Relation" {
     var col_buf: [16]Column = undefined;
     var tuple_buf: [16]ColumnData = undefined;
     var tuple_buf2: [16]ColumnData = undefined;
-    const msg = try decode(buf[0..pos], &col_buf, &tuple_buf, &tuple_buf2);
+    const msg = try decode(buf[0..pos], &col_buf, &tuple_buf, &tuple_buf2, null);
     const rel = msg.relation;
     try std.testing.expectEqual(@as(u32, 16384), rel.oid);
     try std.testing.expectEqualStrings("public", rel.namespace);
@@ -466,7 +704,7 @@ test "decode Insert" {
     var col_buf: [16]Column = undefined;
     var tuple_buf: [16]ColumnData = undefined;
     var tuple_buf2: [16]ColumnData = undefined;
-    const msg = try decode(buf[0..pos], &col_buf, &tuple_buf, &tuple_buf2);
+    const msg = try decode(buf[0..pos], &col_buf, &tuple_buf, &tuple_buf2, null);
     const ins = msg.insert;
     try std.testing.expectEqual(@as(u32, 16384), ins.relation_oid);
     try std.testing.expectEqual(@as(usize, 2), ins.new_tuple.len);
@@ -496,7 +734,7 @@ test "decode Delete" {
     var col_buf: [16]Column = undefined;
     var tuple_buf: [16]ColumnData = undefined;
     var tuple_buf2: [16]ColumnData = undefined;
-    const msg = try decode(buf[0..pos], &col_buf, &tuple_buf, &tuple_buf2);
+    const msg = try decode(buf[0..pos], &col_buf, &tuple_buf, &tuple_buf2, null);
     const del = msg.delete;
     try std.testing.expectEqual(@as(u32, 16384), del.relation_oid);
     try std.testing.expectEqual(@as(usize, 1), del.old_tuple.len);
@@ -529,7 +767,7 @@ test "decode NULL and unchanged columns" {
     var col_buf: [16]Column = undefined;
     var tuple_buf: [16]ColumnData = undefined;
     var tuple_buf2: [16]ColumnData = undefined;
-    const msg = try decode(buf[0..pos], &col_buf, &tuple_buf, &tuple_buf2);
+    const msg = try decode(buf[0..pos], &col_buf, &tuple_buf, &tuple_buf2, null);
     const ins = msg.insert;
     try std.testing.expectEqual(@as(usize, 3), ins.new_tuple.len);
     try std.testing.expect(ins.new_tuple[0] == .null_value);
@@ -546,7 +784,7 @@ test "decode Origin" {
     var col_buf: [0]Column = undefined;
     var tuple_buf: [0]ColumnData = undefined;
     var tuple_buf2: [0]ColumnData = undefined;
-    const msg = try decode(buf[0..16], &col_buf, &tuple_buf, &tuple_buf2);
+    const msg = try decode(buf[0..16], &col_buf, &tuple_buf, &tuple_buf2, null);
     const orig = msg.origin;
     try std.testing.expectEqual(@as(u64, 12345), orig.lsn);
     try std.testing.expectEqualStrings("origin", orig.name);
@@ -557,5 +795,203 @@ test "unknown message type" {
     var col_buf: [0]Column = undefined;
     var tuple_buf: [0]ColumnData = undefined;
     var tuple_buf2: [0]ColumnData = undefined;
-    try std.testing.expectError(error.UnknownMessageType, decode(&buf, &col_buf, &tuple_buf, &tuple_buf2));
+    try std.testing.expectError(error.UnknownMessageType, decode(&buf, &col_buf, &tuple_buf, &tuple_buf2, null));
+}
+
+// ---------------------------------------------------------------------------
+// Proto v2-v4 tests
+// ---------------------------------------------------------------------------
+
+test "decode StreamStart" {
+    var buf: [6]u8 = undefined;
+    buf[0] = 'S';
+    std.mem.writeInt(u32, buf[1..5], 100, .big);
+    buf[5] = 1;
+
+    var col_buf: [0]Column = undefined;
+    var tuple_buf: [0]ColumnData = undefined;
+    var tuple_buf2: [0]ColumnData = undefined;
+    const msg = try decode(&buf, &col_buf, &tuple_buf, &tuple_buf2, null);
+    const ss = msg.stream_start;
+    try std.testing.expectEqual(@as(u32, 100), ss.xid);
+    try std.testing.expect(ss.first_segment);
+}
+
+test "decode StreamStop" {
+    const buf = [_]u8{'E'};
+    var col_buf: [0]Column = undefined;
+    var tuple_buf: [0]ColumnData = undefined;
+    var tuple_buf2: [0]ColumnData = undefined;
+    const msg = try decode(&buf, &col_buf, &tuple_buf, &tuple_buf2, null);
+    try std.testing.expect(msg == .stream_stop);
+}
+
+test "decode StreamCommit" {
+    var buf: [30]u8 = undefined;
+    buf[0] = 'c';
+    std.mem.writeInt(u32, buf[1..5], 100, .big);
+    buf[5] = 0;
+    std.mem.writeInt(u64, buf[6..14], 200, .big);
+    std.mem.writeInt(u64, buf[14..22], 300, .big);
+    std.mem.writeInt(i64, buf[22..30], 400, .big);
+
+    var col_buf: [0]Column = undefined;
+    var tuple_buf: [0]ColumnData = undefined;
+    var tuple_buf2: [0]ColumnData = undefined;
+    const msg = try decode(&buf, &col_buf, &tuple_buf, &tuple_buf2, null);
+    const sc = msg.stream_commit;
+    try std.testing.expectEqual(@as(u32, 100), sc.xid);
+    try std.testing.expectEqual(@as(u64, 200), sc.lsn);
+    try std.testing.expectEqual(@as(u64, 300), sc.end_lsn);
+    try std.testing.expectEqual(@as(i64, 400), sc.timestamp);
+}
+
+test "decode StreamAbort v2" {
+    var buf: [9]u8 = undefined;
+    buf[0] = 'A';
+    std.mem.writeInt(u32, buf[1..5], 100, .big);
+    std.mem.writeInt(u32, buf[5..9], 101, .big);
+
+    var col_buf: [0]Column = undefined;
+    var tuple_buf: [0]ColumnData = undefined;
+    var tuple_buf2: [0]ColumnData = undefined;
+    const msg = try decode(&buf, &col_buf, &tuple_buf, &tuple_buf2, null);
+    const sa = msg.stream_abort;
+    try std.testing.expectEqual(@as(u32, 100), sa.xid);
+    try std.testing.expectEqual(@as(u32, 101), sa.sub_xid);
+    try std.testing.expect(sa.abort_lsn == null);
+    try std.testing.expect(sa.abort_timestamp == null);
+}
+
+test "decode StreamAbort v4 with abort lsn/timestamp" {
+    var buf: [25]u8 = undefined;
+    buf[0] = 'A';
+    std.mem.writeInt(u32, buf[1..5], 100, .big);
+    std.mem.writeInt(u32, buf[5..9], 101, .big);
+    std.mem.writeInt(u64, buf[9..17], 500, .big);
+    std.mem.writeInt(i64, buf[17..25], 600, .big);
+
+    var col_buf: [0]Column = undefined;
+    var tuple_buf: [0]ColumnData = undefined;
+    var tuple_buf2: [0]ColumnData = undefined;
+    const msg = try decode(&buf, &col_buf, &tuple_buf, &tuple_buf2, null);
+    const sa = msg.stream_abort;
+    try std.testing.expectEqual(@as(u32, 100), sa.xid);
+    try std.testing.expectEqual(@as(u32, 101), sa.sub_xid);
+    try std.testing.expectEqual(@as(u64, 500), sa.abort_lsn.?);
+    try std.testing.expectEqual(@as(i64, 600), sa.abort_timestamp.?);
+}
+
+test "decode BeginPrepare" {
+    var buf: [128]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 'b';
+    pos += 1;
+    std.mem.writeInt(u64, buf[pos..][0..8], 100, .big);
+    pos += 8;
+    std.mem.writeInt(u64, buf[pos..][0..8], 200, .big);
+    pos += 8;
+    std.mem.writeInt(i64, buf[pos..][0..8], 300, .big);
+    pos += 8;
+    std.mem.writeInt(u32, buf[pos..][0..4], 42, .big);
+    pos += 4;
+    @memcpy(buf[pos..][0..8], "my_txn\x00\x00");
+    pos += 7; // null-terminated string "my_txn"
+
+    var col_buf: [0]Column = undefined;
+    var tuple_buf: [0]ColumnData = undefined;
+    var tuple_buf2: [0]ColumnData = undefined;
+    const msg = try decode(buf[0..pos], &col_buf, &tuple_buf, &tuple_buf2, null);
+    const bp = msg.begin_prepare;
+    try std.testing.expectEqual(@as(u64, 100), bp.lsn);
+    try std.testing.expectEqual(@as(u64, 200), bp.end_lsn);
+    try std.testing.expectEqual(@as(i64, 300), bp.timestamp);
+    try std.testing.expectEqual(@as(u32, 42), bp.xid);
+    try std.testing.expectEqualStrings("my_txn", bp.gid);
+}
+
+test "decode CommitPrepared" {
+    var buf: [128]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 'K';
+    pos += 1;
+    buf[pos] = 0; // flags
+    pos += 1;
+    std.mem.writeInt(u64, buf[pos..][0..8], 100, .big);
+    pos += 8;
+    std.mem.writeInt(u64, buf[pos..][0..8], 200, .big);
+    pos += 8;
+    std.mem.writeInt(i64, buf[pos..][0..8], 300, .big);
+    pos += 8;
+    std.mem.writeInt(u32, buf[pos..][0..4], 42, .big);
+    pos += 4;
+    @memcpy(buf[pos..][0..7], "my_txn\x00");
+    pos += 7;
+
+    var col_buf: [0]Column = undefined;
+    var tuple_buf: [0]ColumnData = undefined;
+    var tuple_buf2: [0]ColumnData = undefined;
+    const msg = try decode(buf[0..pos], &col_buf, &tuple_buf, &tuple_buf2, null);
+    const cp = msg.commit_prepared;
+    try std.testing.expectEqual(@as(u64, 100), cp.lsn);
+    try std.testing.expectEqual(@as(u32, 42), cp.xid);
+    try std.testing.expectEqualStrings("my_txn", cp.gid);
+}
+
+test "decode streamed Insert with xid" {
+    // Streamed Insert: 'I' + Int32(xid=99) + Int32(oid=16384) + 'N' + TupleData(1 col: text "hi")
+    var buf: [128]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 'I';
+    pos += 1;
+    std.mem.writeInt(u32, buf[pos..][0..4], 99, .big); // xid (skipped by decoder)
+    pos += 4;
+    std.mem.writeInt(u32, buf[pos..][0..4], 16384, .big);
+    pos += 4;
+    buf[pos] = 'N';
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], 1, .big);
+    pos += 2;
+    buf[pos] = 't';
+    pos += 1;
+    std.mem.writeInt(i32, buf[pos..][0..4], 2, .big);
+    pos += 4;
+    @memcpy(buf[pos..][0..2], "hi");
+    pos += 2;
+
+    var col_buf: [16]Column = undefined;
+    var tuple_buf: [16]ColumnData = undefined;
+    var tuple_buf2: [16]ColumnData = undefined;
+    const msg = try decode(buf[0..pos], &col_buf, &tuple_buf, &tuple_buf2, 99);
+    const ins = msg.insert;
+    try std.testing.expectEqual(@as(u32, 16384), ins.relation_oid);
+    try std.testing.expectEqual(@as(u32, 99), ins.xid.?);
+    try std.testing.expectEqualStrings("hi", ins.new_tuple[0].text);
+}
+
+test "decode non-streamed Insert has null xid" {
+    var buf: [128]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 'I';
+    pos += 1;
+    std.mem.writeInt(u32, buf[pos..][0..4], 16384, .big);
+    pos += 4;
+    buf[pos] = 'N';
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], 1, .big);
+    pos += 2;
+    buf[pos] = 't';
+    pos += 1;
+    std.mem.writeInt(i32, buf[pos..][0..4], 2, .big);
+    pos += 4;
+    @memcpy(buf[pos..][0..2], "hi");
+    pos += 2;
+
+    var col_buf: [16]Column = undefined;
+    var tuple_buf: [16]ColumnData = undefined;
+    var tuple_buf2: [16]ColumnData = undefined;
+    const msg = try decode(buf[0..pos], &col_buf, &tuple_buf, &tuple_buf2, null);
+    const ins = msg.insert;
+    try std.testing.expectEqual(@as(u32, 16384), ins.relation_oid);
+    try std.testing.expect(ins.xid == null);
 }
