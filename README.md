@@ -267,3 +267,9 @@ benchmark/
   query protocol, client-side UUID generation (to remove the `RETURNING id`
   dependency between event and column INSERTs), and pipeline error handling.
 
+- **io_uring / kqueue** — The transport layer currently uses blocking I/O.
+  Using io_uring (Linux) or kqueue (macOS) would allow non-blocking,
+  event-driven I/O — enabling a single thread to manage multiple replication
+  connections and reduce syscall overhead. Zig's `std.posix` provides the
+  building blocks for both.
+
