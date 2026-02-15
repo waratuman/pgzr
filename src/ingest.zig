@@ -14,7 +14,7 @@ pub const Ingestor = struct {
     config: types.IngestConfig,
 
     // Batch accumulation
-    batch_buf: std.ArrayList(u8),
+    batch_buf: std.ArrayListUnmanaged(u8),
     batch_start_lsn: Lsn,
     batch_end_lsn: Lsn,
     batch_msg_count: usize,
@@ -70,7 +70,7 @@ pub const Ingestor = struct {
             .dest = dest,
             .allocator = allocator,
             .config = config,
-            .batch_buf = std.ArrayList(u8).init(allocator),
+            .batch_buf = .{},
             .batch_start_lsn = Lsn.zero,
             .batch_end_lsn = Lsn.zero,
             .batch_msg_count = 0,
@@ -114,8 +114,8 @@ pub const Ingestor = struct {
 
             // Append message to batch: [4-byte big-endian length][message bytes]
             const len: u32 = @intCast(data.len);
-            try self.batch_buf.appendSlice(&std.mem.toBytes(std.mem.nativeTo(u32, len, .big)));
-            try self.batch_buf.appendSlice(data);
+            try self.batch_buf.appendSlice(self.allocator, &std.mem.toBytes(std.mem.nativeTo(u32, len, .big)));
+            try self.batch_buf.appendSlice(self.allocator, data);
             self.batch_msg_count += 1;
 
             // Flush on COMMIT or StreamCommit boundaries
@@ -199,34 +199,34 @@ pub const Ingestor = struct {
         defer self.allocator.free(source_id);
 
         // Build INSERT query
-        var sql = std.ArrayList(u8).init(self.allocator);
-        defer sql.deinit();
+        var sql: std.ArrayListUnmanaged(u8) = .{};
+        defer sql.deinit(self.allocator);
 
-        try sql.appendSlice("INSERT INTO wal_batches (source_id, start_lsn, end_lsn, data, relations, complete) VALUES (");
-        try sql.appendSlice(source_id);
-        try sql.appendSlice(", ");
+        try sql.appendSlice(self.allocator, "INSERT INTO wal_batches (source_id, start_lsn, end_lsn, data, relations, complete) VALUES (");
+        try sql.appendSlice(self.allocator, source_id);
+        try sql.appendSlice(self.allocator, ", ");
 
         var lsn_buf: [20]u8 = undefined;
         const start_str = std.fmt.bufPrint(&lsn_buf, "{d}", .{self.batch_start_lsn.value}) catch unreachable;
-        try sql.appendSlice(start_str);
-        try sql.appendSlice(", ");
+        try sql.appendSlice(self.allocator, start_str);
+        try sql.appendSlice(self.allocator, ", ");
 
         const end_str = std.fmt.bufPrint(&lsn_buf, "{d}", .{self.batch_end_lsn.value}) catch unreachable;
-        try sql.appendSlice(end_str);
-        try sql.appendSlice(", ");
+        try sql.appendSlice(self.allocator, end_str);
+        try sql.appendSlice(self.allocator, ", ");
 
-        try sql.appendSlice(data_hex);
-        try sql.appendSlice(", ");
+        try sql.appendSlice(self.allocator, data_hex);
+        try sql.appendSlice(self.allocator, ", ");
 
-        try sql.appendSlice(relations_json);
-        try sql.appendSlice(", ");
+        try sql.appendSlice(self.allocator, relations_json);
+        try sql.appendSlice(self.allocator, ", ");
 
         if (complete) {
-            try sql.appendSlice("true");
+            try sql.appendSlice(self.allocator, "true");
         } else {
-            try sql.appendSlice("false");
+            try sql.appendSlice(self.allocator, "false");
         }
-        try sql.appendSlice(") ON CONFLICT (source_id, start_lsn) DO NOTHING");
+        try sql.appendSlice(self.allocator, ") ON CONFLICT (source_id, start_lsn) DO NOTHING");
 
         try self.dest.execLarge(self.allocator, sql.items);
 
@@ -236,89 +236,89 @@ pub const Ingestor = struct {
     }
 
     fn serializeRelations(self: *Ingestor) ![]u8 {
-        var json = std.ArrayList(u8).init(self.allocator);
-        errdefer json.deinit();
+        var json: std.ArrayListUnmanaged(u8) = .{};
+        errdefer json.deinit(self.allocator);
 
-        try json.append('\'');
-        try json.append('{');
+        try json.append(self.allocator, '\'');
+        try json.append(self.allocator, '{');
 
         var first_rel = true;
         var it = self.relations.iterator();
         while (it.next()) |entry| {
             const rel = entry.value_ptr;
-            if (!first_rel) try json.append(',');
+            if (!first_rel) try json.append(self.allocator, ',');
             first_rel = false;
 
             // Key: OID as string
-            try json.append('"');
+            try json.append(self.allocator, '"');
             var oid_buf: [10]u8 = undefined;
             const oid_str = std.fmt.bufPrint(&oid_buf, "{d}", .{rel.oid}) catch unreachable;
-            try json.appendSlice(oid_str);
-            try json.appendSlice("\":{");
+            try json.appendSlice(self.allocator, oid_str);
+            try json.appendSlice(self.allocator, "\":{");
 
             // schema
-            try json.appendSlice("\"schema\":\"");
-            try appendJsonEscaped(&json, rel.namespace);
-            try json.appendSlice("\",");
+            try json.appendSlice(self.allocator, "\"schema\":\"");
+            try appendJsonEscaped(&json, self.allocator, rel.namespace);
+            try json.appendSlice(self.allocator, "\",");
 
             // table
-            try json.appendSlice("\"table\":\"");
-            try appendJsonEscaped(&json, rel.name);
-            try json.appendSlice("\",");
+            try json.appendSlice(self.allocator, "\"table\":\"");
+            try appendJsonEscaped(&json, self.allocator, rel.name);
+            try json.appendSlice(self.allocator, "\",");
 
             // relreplident
-            try json.appendSlice("\"relreplident\":");
+            try json.appendSlice(self.allocator, "\"relreplident\":");
             var ri_buf: [3]u8 = undefined;
             const ri_str = std.fmt.bufPrint(&ri_buf, "{d}", .{rel.replica_identity}) catch unreachable;
-            try json.appendSlice(ri_str);
-            try json.append(',');
+            try json.appendSlice(self.allocator, ri_str);
+            try json.append(self.allocator, ',');
 
             // columns
-            try json.appendSlice("\"columns\":[");
+            try json.appendSlice(self.allocator, "\"columns\":[");
             for (rel.columns, 0..) |col, i| {
-                if (i > 0) try json.append(',');
-                try json.append('{');
+                if (i > 0) try json.append(self.allocator, ',');
+                try json.append(self.allocator, '{');
 
-                try json.appendSlice("\"flags\":");
+                try json.appendSlice(self.allocator, "\"flags\":");
                 var flags_buf: [3]u8 = undefined;
                 const flags_str = std.fmt.bufPrint(&flags_buf, "{d}", .{col.flags}) catch unreachable;
-                try json.appendSlice(flags_str);
-                try json.append(',');
+                try json.appendSlice(self.allocator, flags_str);
+                try json.append(self.allocator, ',');
 
-                try json.appendSlice("\"name\":\"");
-                try appendJsonEscaped(&json, col.name);
-                try json.appendSlice("\",");
+                try json.appendSlice(self.allocator, "\"name\":\"");
+                try appendJsonEscaped(&json, self.allocator, col.name);
+                try json.appendSlice(self.allocator, "\",");
 
-                try json.appendSlice("\"oid\":");
+                try json.appendSlice(self.allocator, "\"oid\":");
                 var col_oid_buf: [10]u8 = undefined;
                 const col_oid_str = std.fmt.bufPrint(&col_oid_buf, "{d}", .{col.type_oid}) catch unreachable;
-                try json.appendSlice(col_oid_str);
-                try json.append(',');
+                try json.appendSlice(self.allocator, col_oid_str);
+                try json.append(self.allocator, ',');
 
-                try json.appendSlice("\"typmod\":");
+                try json.appendSlice(self.allocator, "\"typmod\":");
                 var typmod_buf: [11]u8 = undefined;
                 const typmod_str = std.fmt.bufPrint(&typmod_buf, "{d}", .{col.type_modifier}) catch unreachable;
-                try json.appendSlice(typmod_str);
+                try json.appendSlice(self.allocator, typmod_str);
 
-                try json.append('}');
+                try json.append(self.allocator, '}');
             }
-            try json.appendSlice("]}");
+            try json.appendSlice(self.allocator, "]}");
         }
 
-        try json.appendSlice("}'::jsonb");
+        try json.appendSlice(self.allocator, "}'::jsonb");
 
-        return json.toOwnedSlice();
+        return json.toOwnedSlice(self.allocator);
     }
 
-    fn appendJsonEscaped(list: *std.ArrayList(u8), s: []const u8) !void {
+    fn appendJsonEscaped(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) !void {
         for (s) |c| {
             switch (c) {
-                '"' => try list.appendSlice("\\\""),
-                '\\' => try list.appendSlice("\\\\"),
-                '\n' => try list.appendSlice("\\n"),
-                '\r' => try list.appendSlice("\\r"),
-                '\t' => try list.appendSlice("\\t"),
-                else => try list.append(c),
+                '"' => try list.appendSlice(allocator, "\\\""),
+                '\\' => try list.appendSlice(allocator, "\\\\"),
+                '\n' => try list.appendSlice(allocator, "\\n"),
+                '\r' => try list.appendSlice(allocator, "\\r"),
+                '\t' => try list.appendSlice(allocator, "\\t"),
+                else => try list.append(allocator, c),
             }
         }
     }
@@ -339,7 +339,7 @@ pub const Ingestor = struct {
             rel.deinit(self.allocator);
         }
         self.relations.deinit();
-        self.batch_buf.deinit();
+        self.batch_buf.deinit(self.allocator);
         self.replicator.deinit();
         self.dest.close();
     }

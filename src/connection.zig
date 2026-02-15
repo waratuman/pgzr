@@ -152,9 +152,12 @@ pub const Connection = struct {
 
     pub const QueryError = protocol.ReadError || protocol.ReadBodyError || Transport.WriteError || error{
         ServerError,
+        OutOfMemory,
     };
 
     /// Execute a simple query and return the first DataRow result.
+    /// Column data is copied into the second half of recv_buf so it
+    /// survives subsequent protocol reads within this call.
     /// For CopyBothResponse (START_REPLICATION), returns with in_copy_mode=true.
     pub fn simpleQuery(self: *Connection, query: []const u8) QueryError!QueryResult {
         var send_buf: [4096]u8 = undefined;
@@ -167,6 +170,10 @@ pub const Connection = struct {
             .in_copy_mode = false,
         };
 
+        // Reserve second half of recv_buf for stable column data copies
+        const stable_base = self.recv_buf.len / 2;
+        var stable_pos: usize = 0;
+
         while (true) {
             const header = try protocol.readHeader(self.transport);
 
@@ -176,30 +183,36 @@ pub const Connection = struct {
                 },
                 protocol.MSG_DATA_ROW => {
                     const body = try protocol.readBody(self.transport, header, self.recv_buf);
-                    const col_count = std.mem.readInt(u16, body[0..2], .big);
-                    var pos: usize = 2;
-                    for (0..col_count) |i| {
-                        const col_len_raw = std.mem.readInt(i32, body[pos..][0..4], .big);
-                        pos += 4;
-                        if (col_len_raw < 0) {
-                            result.columns[i] = .{ .data = "", .is_null = true };
-                        } else {
-                            const col_len: usize = @intCast(col_len_raw);
-                            result.columns[i] = .{ .data = body[pos .. pos + col_len], .is_null = false };
-                            pos += col_len;
+                    if (result.column_count == 0) {
+                        const col_count = std.mem.readInt(u16, body[0..2], .big);
+                        var pos: usize = 2;
+                        for (0..col_count) |i| {
+                            const col_len_raw = std.mem.readInt(i32, body[pos..][0..4], .big);
+                            pos += 4;
+                            if (col_len_raw < 0) {
+                                result.columns[i] = .{ .data = "", .is_null = true };
+                            } else {
+                                const col_len: usize = @intCast(col_len_raw);
+                                const src = body[pos .. pos + col_len];
+                                const dest = self.recv_buf[stable_base + stable_pos ..][0..col_len];
+                                @memcpy(dest, src);
+                                result.columns[i] = .{ .data = dest, .is_null = false };
+                                stable_pos += col_len;
+                                pos += col_len;
+                            }
                         }
+                        result.column_count = col_count;
                     }
-                    result.column_count = col_count;
                 },
                 protocol.MSG_CMD_COMPLETE => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                 },
                 protocol.MSG_READY => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                     return result;
                 },
                 protocol.MSG_ERROR => {
-                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
+                    const body = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
                     return error.ServerError;
@@ -210,10 +223,10 @@ pub const Connection = struct {
                     return result;
                 },
                 protocol.MSG_NOTICE => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                 },
                 else => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                 },
             }
         }
@@ -261,6 +274,8 @@ pub const Connection = struct {
 
     /// Execute a large query and return the first DataRow result.
     /// Like execLarge but captures the first row (for RETURNING clauses).
+    /// Column data is copied into the second half of recv_buf so it
+    /// survives subsequent protocol reads.
     pub fn execLargeWithResult(self: *Connection, allocator: std.mem.Allocator, query: []const u8) QueryError!QueryResult {
         const msg_len = 1 + 4 + query.len + 1;
         const buf = allocator.alloc(u8, msg_len) catch return error.OutOfMemory;
@@ -274,6 +289,10 @@ pub const Connection = struct {
             .column_count = 0,
             .in_copy_mode = false,
         };
+
+        // Reserve second half of recv_buf for stable column data copies
+        const stable_base = self.recv_buf.len / 2;
+        var stable_pos: usize = 0;
 
         while (true) {
             const header = try protocol.readHeader(self.transport);
@@ -294,7 +313,12 @@ pub const Connection = struct {
                                 result.columns[i] = .{ .data = "", .is_null = true };
                             } else {
                                 const col_len: usize = @intCast(col_len_raw);
-                                result.columns[i] = .{ .data = body[pos .. pos + col_len], .is_null = false };
+                                const src = body[pos .. pos + col_len];
+                                // Copy into stable region
+                                const dest = self.recv_buf[stable_base + stable_pos ..][0..col_len];
+                                @memcpy(dest, src);
+                                result.columns[i] = .{ .data = dest, .is_null = false };
+                                stable_pos += col_len;
                                 pos += col_len;
                             }
                         }
@@ -302,23 +326,23 @@ pub const Connection = struct {
                     }
                 },
                 protocol.MSG_CMD_COMPLETE => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                 },
                 protocol.MSG_READY => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                     return result;
                 },
                 protocol.MSG_ERROR => {
-                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
+                    const body = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
                     return error.ServerError;
                 },
                 protocol.MSG_NOTICE => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                 },
                 else => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                 },
             }
         }

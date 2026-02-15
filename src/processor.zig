@@ -31,8 +31,8 @@ pub const Processor = struct {
     current_stream_xid: ?u32,
 
     // Batch accumulation for partial (split) batches
-    pending_data: std.ArrayList(u8),
-    pending_batch_ids: std.ArrayList([]u8),
+    pending_data: std.ArrayListUnmanaged(u8),
+    pending_batch_ids: std.ArrayListUnmanaged([]u8),
 
     // Stop flag for graceful shutdown
     stop_flag: std.atomic.Value(bool),
@@ -84,8 +84,8 @@ pub const Processor = struct {
             .current_txn_timestamp = 0,
             .in_transaction = false,
             .current_stream_xid = null,
-            .pending_data = std.ArrayList(u8).init(allocator),
-            .pending_batch_ids = std.ArrayList([]u8).init(allocator),
+            .pending_data = .{},
+            .pending_batch_ids = .{},
             .stop_flag = std.atomic.Value(bool).init(false),
         };
     }
@@ -130,9 +130,9 @@ pub const Processor = struct {
         const batch_data = try self.decodeBytea(raw_data);
 
         // Accumulate data and batch ID
-        try self.pending_data.appendSlice(batch_data);
+        try self.pending_data.appendSlice(self.allocator, batch_data);
         self.allocator.free(batch_data);
-        try self.pending_batch_ids.append(batch_id_copy);
+        try self.pending_batch_ids.append(self.allocator, batch_id_copy);
 
         if (!is_complete) {
             // Partial batch — wait for the complete one
@@ -210,12 +210,10 @@ pub const Processor = struct {
                     self.current_txn_xid = begin.xid;
                     self.current_txn_timestamp = begin.timestamp;
                     self.in_transaction = true;
+                    try self.insertTransaction(begin.final_lsn);
                 },
-                .commit => |commit| {
-                    if (self.in_transaction) {
-                        try self.insertTransaction(commit.lsn);
-                        self.in_transaction = false;
-                    }
+                .commit => {
+                    self.in_transaction = false;
                 },
                 .relation => |rel| {
                     try self.updateRelationCache(rel);
@@ -239,12 +237,9 @@ pub const Processor = struct {
                 .stream_stop => {
                     self.current_stream_xid = null;
                 },
-                .stream_commit => |sc| {
+                .stream_commit => {
                     self.current_stream_xid = null;
-                    if (self.in_transaction) {
-                        try self.insertTransaction(sc.lsn);
-                        self.in_transaction = false;
-                    }
+                    self.in_transaction = false;
                 },
                 .stream_abort => {
                     self.current_stream_xid = null;
@@ -256,16 +251,13 @@ pub const Processor = struct {
                     self.current_txn_xid = bp.xid;
                     self.current_txn_timestamp = bp.timestamp;
                     self.in_transaction = true;
+                    try self.insertTransaction(bp.lsn);
                 },
                 .prepare => {
                     // Prepared but not yet committed — keep txn state
                 },
-                .commit_prepared => |cp| {
-                    self.current_txn_timestamp = cp.timestamp;
-                    if (self.in_transaction) {
-                        try self.insertTransaction(cp.lsn);
-                        self.in_transaction = false;
-                    }
+                .commit_prepared => {
+                    self.in_transaction = false;
                 },
                 .rollback_prepared => {
                     self.in_transaction = false;
@@ -344,38 +336,38 @@ pub const Processor = struct {
         defer self.allocator.free(table_name);
 
         // INSERT event and get back the event ID
-        var sql = std.ArrayList(u8).init(self.allocator);
-        defer sql.deinit();
+        var sql: std.ArrayListUnmanaged(u8) = .{};
+        defer sql.deinit(self.allocator);
 
-        try sql.appendSlice(
+        try sql.appendSlice(self.allocator,
             "INSERT INTO events (source_id, lsn, type, schema_name, table_name, committed_at, " ++
                 "identity_digest, previous_identity_digest, transaction_id) " ++
                 "VALUES (",
         );
-        try sql.appendSlice(source_id);
-        try sql.appendSlice(", ");
+        try sql.appendSlice(self.allocator, source_id);
+        try sql.appendSlice(self.allocator, ", ");
         var lsn_buf: [20]u8 = undefined;
         const lsn_str = std.fmt.bufPrint(&lsn_buf, "{d}", .{self.current_txn_lsn}) catch unreachable;
-        try sql.appendSlice(lsn_str);
-        try sql.appendSlice(", ");
+        try sql.appendSlice(self.allocator, lsn_str);
+        try sql.appendSlice(self.allocator, ", ");
         var type_buf: [1]u8 = undefined;
         const type_str = std.fmt.bufPrint(&type_buf, "{d}", .{event_type}) catch unreachable;
-        try sql.appendSlice(type_str);
-        try sql.appendSlice(", ");
-        try sql.appendSlice(schema_name);
-        try sql.appendSlice(", ");
-        try sql.appendSlice(table_name);
-        try sql.appendSlice(", ");
-        try sql.appendSlice(committed_at);
-        try sql.appendSlice(", ");
-        try sql.appendSlice(id_hex);
-        try sql.appendSlice(", ");
-        try sql.appendSlice(prev_id_hex);
-        try sql.appendSlice(", (SELECT id FROM transactions WHERE source_id=");
-        try sql.appendSlice(source_id);
-        try sql.appendSlice(" AND lsn=");
-        try sql.appendSlice(lsn_str);
-        try sql.appendSlice(")) RETURNING id");
+        try sql.appendSlice(self.allocator, type_str);
+        try sql.appendSlice(self.allocator, ", ");
+        try sql.appendSlice(self.allocator, schema_name);
+        try sql.appendSlice(self.allocator, ", ");
+        try sql.appendSlice(self.allocator, table_name);
+        try sql.appendSlice(self.allocator, ", ");
+        try sql.appendSlice(self.allocator, committed_at);
+        try sql.appendSlice(self.allocator, ", ");
+        try sql.appendSlice(self.allocator, id_hex);
+        try sql.appendSlice(self.allocator, ", ");
+        try sql.appendSlice(self.allocator, prev_id_hex);
+        try sql.appendSlice(self.allocator, ", (SELECT id FROM transactions WHERE source_id=");
+        try sql.appendSlice(self.allocator, source_id);
+        try sql.appendSlice(self.allocator, " AND lsn=");
+        try sql.appendSlice(self.allocator, lsn_str);
+        try sql.appendSlice(self.allocator, ")) RETURNING id");
 
         const event_result = try self.dest.execLargeWithResult(self.allocator, sql.items);
         if (event_result.column_count == 0) return;
@@ -472,45 +464,45 @@ pub const Processor = struct {
             const type_name_escaped = try query_mod.escapeString(self.allocator, type_name);
             defer self.allocator.free(type_name_escaped);
 
-            var sql = std.ArrayList(u8).init(self.allocator);
-            defer sql.deinit();
+            var sql: std.ArrayListUnmanaged(u8) = .{};
+            defer sql.deinit(self.allocator);
 
-            try sql.appendSlice(
+            try sql.appendSlice(self.allocator,
                 "INSERT INTO columns (event_id, source_id, name, type_oid, type_name, " ++
                     "value, previous_value, identity, ordinal) VALUES (",
             );
-            try sql.appendSlice(event_id_escaped);
-            try sql.appendSlice(", ");
-            try sql.appendSlice(source_id);
-            try sql.appendSlice(", ");
-            try sql.appendSlice(col_name);
-            try sql.appendSlice(", ");
+            try sql.appendSlice(self.allocator, event_id_escaped);
+            try sql.appendSlice(self.allocator, ", ");
+            try sql.appendSlice(self.allocator, source_id);
+            try sql.appendSlice(self.allocator, ", ");
+            try sql.appendSlice(self.allocator, col_name);
+            try sql.appendSlice(self.allocator, ", ");
 
             var oid_buf: [10]u8 = undefined;
             const oid_str = std.fmt.bufPrint(&oid_buf, "{d}", .{col.type_oid}) catch unreachable;
-            try sql.appendSlice(oid_str);
-            try sql.appendSlice(", ");
+            try sql.appendSlice(self.allocator, oid_str);
+            try sql.appendSlice(self.allocator, ", ");
 
-            try sql.appendSlice(type_name_escaped);
-            try sql.appendSlice(", ");
+            try sql.appendSlice(self.allocator, type_name_escaped);
+            try sql.appendSlice(self.allocator, ", ");
 
-            try sql.appendSlice(value_sql);
-            try sql.appendSlice(", ");
+            try sql.appendSlice(self.allocator, value_sql);
+            try sql.appendSlice(self.allocator, ", ");
 
-            try sql.appendSlice(prev_value_sql);
-            try sql.appendSlice(", ");
+            try sql.appendSlice(self.allocator, prev_value_sql);
+            try sql.appendSlice(self.allocator, ", ");
 
             if (is_identity) {
-                try sql.appendSlice("true");
+                try sql.appendSlice(self.allocator, "true");
             } else {
-                try sql.appendSlice("false");
+                try sql.appendSlice(self.allocator, "false");
             }
-            try sql.appendSlice(", ");
+            try sql.appendSlice(self.allocator, ", ");
 
             var ord_buf: [5]u8 = undefined;
             const ord_str = std.fmt.bufPrint(&ord_buf, "{d}", .{i}) catch unreachable;
-            try sql.appendSlice(ord_str);
-            try sql.append(')');
+            try sql.appendSlice(self.allocator, ord_str);
+            try sql.append(self.allocator, ')');
 
             try self.dest.execLarge(self.allocator, sql.items);
         }
@@ -656,8 +648,8 @@ pub const Processor = struct {
         }
         self.relations.deinit();
         self.clearPending();
-        self.pending_data.deinit();
-        self.pending_batch_ids.deinit();
+        self.pending_data.deinit(self.allocator);
+        self.pending_batch_ids.deinit(self.allocator);
         self.dest.close();
     }
 };

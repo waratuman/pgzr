@@ -30,4 +30,5 @@ test {
     _ = @import("pg_types.zig");
     _ = @import("schema.zig");
     _ = @import("ingest.zig");
+    _ = @import("processor.zig");
 }

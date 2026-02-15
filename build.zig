@@ -31,6 +31,28 @@ pub fn build(b: *std.Build) void {
     const example_step = b.step("example", "Run the basic example");
     example_step.dependOn(&run_example.step);
 
+    // Ingest example
+    const ingest_example = b.addExecutable(.{
+        .name = "ingest-example",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/ingest.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pgzr", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(ingest_example);
+
+    const run_ingest_example = b.addRunArtifact(ingest_example);
+    run_ingest_example.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_ingest_example.addArgs(args);
+    }
+    const ingest_example_step = b.step("ingest-example", "Run the ingest pipeline example");
+    ingest_example_step.dependOn(&run_ingest_example.step);
+
     // Tests
     const mod_tests = b.addTest(.{
         .root_module = mod,
@@ -79,4 +101,23 @@ pub fn build(b: *std.Build) void {
     run_integration.step.dependOn(b.getInstallStep());
     const integration_step = b.step("integration-test", "Run integration tests (requires PostgreSQL)");
     integration_step.dependOn(&run_integration.step);
+
+    // Pipeline integration tests (requires a running PostgreSQL instance)
+    const pipeline_tests = b.addExecutable(.{
+        .name = "pipeline-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/pipeline.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pgzr", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(pipeline_tests);
+
+    const run_pipeline = b.addRunArtifact(pipeline_tests);
+    run_pipeline.step.dependOn(b.getInstallStep());
+    const pipeline_step = b.step("pipeline-test", "Run pipeline integration tests (requires PostgreSQL)");
+    pipeline_step.dependOn(&run_pipeline.step);
 }

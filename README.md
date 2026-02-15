@@ -3,7 +3,21 @@
 A pure Zig library implementing PostgreSQL logical replication. No C
 dependencies.
 
+## Features
+
+- Pure Zig, zero C dependencies
+- TCP, Unix socket, and TLS connections
+- SCRAM-SHA-256, MD5, and cleartext authentication
+- pgoutput protocol versions 1-4 (streaming, two-phase commit)
+- WAL ingest and processing pipeline (store and replay WAL as an audit trail)
+- Batch splitting for large transactions
+- Auto-reconnection with exponential backoff
+
 ## Usage
+
+### Low-level Replication
+
+Stream raw WAL messages from a logical replication slot:
 
 ```zig
 const std = @import("std");
@@ -23,7 +37,8 @@ pub fn main() !void {
         },
         .slot_name = "my_slot",
         .options = &.{
-            .{ "include-timestamp", "on" },
+            .{ "proto_version", "1" },
+            .{ "publication_names", "my_pub" },
         },
     });
     defer repl.deinit();
@@ -35,6 +50,61 @@ pub fn main() !void {
 }
 ```
 
+### WAL Ingest Pipeline
+
+Stream WAL from a source database and store packed batches in a destination
+database for later processing:
+
+```zig
+var ingestor = try pgzr.Ingestor.init(allocator, .{
+    .source = .{
+        .conn = .{
+            .host = "127.0.0.1",
+            .port = 5432,
+            .user = "postgres",
+            .database = "source_db",
+        },
+        .slot_name = "my_slot",
+        .options = &.{
+            .{ "proto_version", "1" },
+            .{ "publication_names", "my_pub" },
+        },
+    },
+    .dest = .{
+        .host = "127.0.0.1",
+        .port = 5432,
+        .user = "postgres",
+        .database = "dest_db",
+        .replication = false,
+    },
+    .source_id = "00000000-0000-0000-0000-000000000001",
+    .max_batch_size = 4 * 1024 * 1024, // 4 MiB
+});
+defer ingestor.deinit();
+
+try ingestor.run();
+```
+
+### WAL Processor
+
+Process stored WAL batches into structured transactions, events, and columns:
+
+```zig
+var processor = try pgzr.Processor.init(allocator, .{
+    .dest = .{
+        .host = "127.0.0.1",
+        .port = 5432,
+        .user = "postgres",
+        .database = "dest_db",
+        .replication = false,
+    },
+    .source_id = "00000000-0000-0000-0000-000000000001",
+});
+defer processor.deinit();
+
+try processor.run();
+```
+
 ## Prerequisites
 
 - Zig 0.15.2+
@@ -44,10 +114,12 @@ pub fn main() !void {
 ## Building
 
 ```bash
-zig build                  # build library + example
+zig build                  # build library + examples
 zig build test             # run unit tests
-zig build example          # build and run examples/basic.zig
+zig build example          # run examples/basic.zig
+zig build ingest-example   # run examples/ingest.zig
 zig build integration-test # run integration tests (requires PostgreSQL)
+zig build pipeline-test    # run pipeline integration tests (requires PostgreSQL)
 ```
 
 ## Manual Example
@@ -81,18 +153,26 @@ src/
   root.zig        -- public API re-exports
   replicator.zig  -- high-level replication loop (IDENTIFY_SYSTEM, START_REPLICATION, streaming, feedback)
   connection.zig  -- TCP/Unix socket connection, TLS upgrade, startup handshake, simple query execution
-  transport.zig   -- Transport abstraction (plain TCP/Unix and TLS)
+  transport.zig   -- transport abstraction (plain TCP/Unix and TLS)
   protocol.zig    -- wire protocol encoding/decoding
   auth.zig        -- cleartext, MD5, and SCRAM-SHA-256 authentication
   scram.zig       -- SCRAM-SHA-256 (RFC 5802) implementation
-  pgoutput.zig    -- pgoutput binary protocol decoder (Begin, Commit, Relation, Insert, Update, Delete, etc.)
+  pgoutput.zig    -- pgoutput binary protocol decoder (proto versions 1-4)
   lsn.zig         -- LSN type (parse, format, binary I/O)
-  types.zig       -- ConnConfig, ReplicatorConfig, WalMessage, TlsMode
+  types.zig       -- ConnConfig, ReplicatorConfig, IngestConfig, ProcessorConfig, etc.
+  ingest.zig      -- stage 1: stream WAL from source, pack into batches, store in dest
+  processor.zig   -- stage 2: read batches, decode pgoutput, write transactions/events/columns
+  schema.zig      -- DDL for pipeline tables (wal_batches, transactions, events, columns)
+  query.zig       -- SQL escaping helpers (strings, bytea, UUIDs, timestamps)
+  pg_types.zig    -- PostgreSQL OID-to-type-name lookup
 examples/
-  basic.zig       -- minimal working example
+  basic.zig       -- minimal replication example (test_decoding)
+  ingest.zig      -- WAL ingest pipeline example (pgoutput)
 tests/
-  integration.zig -- integration tests (replication, start/end position, LSN tracking,
-                     timeline/systemid validation, feedback, stop, async)
+  integration.zig -- replicator integration tests
+  pipeline.zig    -- ingest + processor pipeline integration tests
+benchmark/
+  bench.zig       -- pgzr vs pg_replication (Ruby) benchmark
 ```
 
 ## License
