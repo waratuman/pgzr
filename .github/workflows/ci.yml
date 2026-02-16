@@ -60,3 +60,4 @@ jobs:
         run: zig build pipeline-test
         env:
           PGUSER: postgres
+          PGHOST: 127.0.0.1
