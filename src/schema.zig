@@ -17,7 +17,7 @@ pub const create_wal_batches =
 
 pub const create_transactions =
     \\CREATE TABLE IF NOT EXISTS transactions (
-    \\    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    \\    id              BIGSERIAL PRIMARY KEY,
     \\    source_id       UUID NOT NULL,
     \\    lsn             BIGINT NOT NULL,
     \\    xid             INTEGER NOT NULL,
@@ -26,40 +26,48 @@ pub const create_transactions =
     \\)
 ;
 
-pub const create_events =
-    \\CREATE TABLE IF NOT EXISTS events (
-    \\    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    \\    transaction_id          UUID NOT NULL REFERENCES transactions(id),
-    \\    source_id               UUID NOT NULL,
-    \\    lsn                     BIGINT NOT NULL,
-    \\    type                    SMALLINT NOT NULL,
-    \\    schema_name             TEXT NOT NULL,
-    \\    table_name              TEXT NOT NULL,
-    \\    committed_at            TIMESTAMPTZ NOT NULL,
-    \\    identity_digest         BYTEA,
-    \\    previous_identity_digest BYTEA
+pub const create_relation_snapshots =
+    \\CREATE TABLE IF NOT EXISTS relation_snapshots (
+    \\    id               BIGSERIAL PRIMARY KEY,
+    \\    source_id        UUID NOT NULL,
+    \\    lsn              BIGINT NOT NULL,
+    \\    rel_oid          INTEGER NOT NULL,
+    \\    schema_name      TEXT NOT NULL,
+    \\    table_name       TEXT NOT NULL,
+    \\    replica_identity SMALLINT NOT NULL,
+    \\    columns          JSONB NOT NULL,
+    \\    UNIQUE (source_id, rel_oid, lsn)
     \\)
 ;
 
-pub const create_columns =
-    \\CREATE TABLE IF NOT EXISTS columns (
-    \\    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    \\    event_id        UUID NOT NULL REFERENCES events(id),
-    \\    source_id       UUID NOT NULL,
-    \\    name            TEXT NOT NULL,
-    \\    type_oid        INTEGER NOT NULL,
-    \\    type_name       TEXT NOT NULL,
-    \\    value           BYTEA,
-    \\    previous_value  BYTEA,
-    \\    identity        BOOLEAN NOT NULL DEFAULT false,
-    \\    ordinal         SMALLINT NOT NULL
+pub const create_events =
+    \\CREATE TABLE IF NOT EXISTS events (
+    \\    id                       BIGSERIAL PRIMARY KEY,
+    \\    transaction_id           BIGINT NOT NULL REFERENCES transactions(id),
+    \\    rel_oid                  INTEGER NOT NULL,
+    \\    type                     CHAR(1) NOT NULL,
+    \\    identity_digest          BYTEA,
+    \\    previous_identity_digest BYTEA,
+    \\    data                     JSONB,
+    \\    old_data                 JSONB
     \\)
+;
+
+pub const create_events_indexes =
+    \\CREATE INDEX IF NOT EXISTS idx_events_transaction_id ON events (transaction_id)
+;
+
+pub const create_events_identity_index =
+    \\CREATE INDEX IF NOT EXISTS idx_events_identity_digest ON events (identity_digest)
+    \\    WHERE identity_digest IS NOT NULL
 ;
 
 /// Create all tables if they don't already exist.
 pub fn ensureSchema(conn: *Connection) !void {
     _ = try conn.simpleQuery(create_wal_batches);
     _ = try conn.simpleQuery(create_transactions);
+    _ = try conn.simpleQuery(create_relation_snapshots);
     _ = try conn.simpleQuery(create_events);
-    _ = try conn.simpleQuery(create_columns);
+    _ = try conn.simpleQuery(create_events_indexes);
+    _ = try conn.simpleQuery(create_events_identity_index);
 }

@@ -32,7 +32,7 @@ fn runPsqlCapture(allocator: std.mem.Allocator, db: []const u8, sql: []const u8)
     child.stderr_behavior = .Ignore;
     _ = try child.spawn();
 
-    var stdout_buf: [256]u8 = undefined;
+    var stdout_buf: [4096]u8 = undefined;
     var total: usize = 0;
     while (total < stdout_buf.len) {
         const n = child.stdout.?.read(stdout_buf[total..]) catch break;
@@ -131,7 +131,7 @@ fn setup(allocator: std.mem.Allocator) !void {
         return err;
     };
 
-    _ = dest.simpleQuery("TRUNCATE columns, events, transactions, wal_batches CASCADE") catch {};
+    _ = dest.simpleQuery("TRUNCATE events, relation_snapshots, transactions, wal_batches CASCADE") catch {};
 }
 
 fn teardown(allocator: std.mem.Allocator) void {
@@ -209,7 +209,7 @@ fn testIngestStoresBatches(allocator: std.mem.Allocator) !void {
 }
 
 // =========================================================================
-// Test 2: Processor parses batches into transactions/events/columns
+// Test 2: Processor parses batches into transactions/events with JSONB data
 // =========================================================================
 fn testProcessorParsesBatches(allocator: std.mem.Allocator) !void {
     std.debug.print("  Test: processor parses batches... ", .{});
@@ -255,19 +255,28 @@ fn testProcessorParsesBatches(allocator: std.mem.Allocator) !void {
 
     // Verify events were created (2 inserts)
     const event_count = try queryCount(allocator, DEST_DB,
-        "SELECT count(*) FROM events WHERE source_id='" ++ SOURCE_ID ++ "' AND type=0",
+        "SELECT count(*) FROM events WHERE type='I'",
     );
     if (event_count != 2) {
         std.debug.print("FAIL (expected 2 insert events, got {d})\n", .{event_count});
         return error.ServerError;
     }
 
-    // Verify columns were created (id, name, quantity = 3 columns per event * 2 events = 6)
-    const col_count = try queryCount(allocator, DEST_DB,
-        "SELECT count(*) FROM columns WHERE source_id='" ++ SOURCE_ID ++ "'",
+    // Verify events have JSONB data
+    const data_count = try queryCount(allocator, DEST_DB,
+        "SELECT count(*) FROM events WHERE data IS NOT NULL AND data != 'null'::jsonb",
     );
-    if (col_count != 6) {
-        std.debug.print("FAIL (expected 6 columns, got {d})\n", .{col_count});
+    if (data_count != 2) {
+        std.debug.print("FAIL (expected 2 events with data, got {d})\n", .{data_count});
+        return error.ServerError;
+    }
+
+    // Verify relation_snapshots were created
+    const snapshot_count = try queryCount(allocator, DEST_DB,
+        "SELECT count(*) FROM relation_snapshots WHERE source_id='" ++ SOURCE_ID ++ "'",
+    );
+    if (snapshot_count == 0) {
+        std.debug.print("FAIL (no relation snapshots)\n", .{});
         return error.ServerError;
     }
 
@@ -280,7 +289,7 @@ fn testProcessorParsesBatches(allocator: std.mem.Allocator) !void {
         return error.ServerError;
     }
 
-    std.debug.print("OK ({d} txn, {d} events, {d} columns)\n", .{ txn_count, event_count, col_count });
+    std.debug.print("OK ({d} txn, {d} events, {d} snapshots)\n", .{ txn_count, event_count, snapshot_count });
 }
 
 // =========================================================================
@@ -356,7 +365,7 @@ fn testUpdateAndDelete(allocator: std.mem.Allocator) !void {
 
     // Verify events: inserts, updates, deletes
     const insert_count = try queryCount(allocator, DEST_DB,
-        "SELECT count(*) FROM events WHERE source_id='" ++ SOURCE_ID ++ "' AND type=0",
+        "SELECT count(*) FROM events WHERE type='I'",
     );
     // Previous test created 2 inserts, this test adds 1 more
     if (insert_count < 3) {
@@ -365,7 +374,7 @@ fn testUpdateAndDelete(allocator: std.mem.Allocator) !void {
     }
 
     const update_count = try queryCount(allocator, DEST_DB,
-        "SELECT count(*) FROM events WHERE source_id='" ++ SOURCE_ID ++ "' AND type=1",
+        "SELECT count(*) FROM events WHERE type='U'",
     );
     if (update_count < 1) {
         std.debug.print("FAIL (expected >= 1 update event, got {d})\n", .{update_count});
@@ -373,7 +382,7 @@ fn testUpdateAndDelete(allocator: std.mem.Allocator) !void {
     }
 
     const delete_count = try queryCount(allocator, DEST_DB,
-        "SELECT count(*) FROM events WHERE source_id='" ++ SOURCE_ID ++ "' AND type=2",
+        "SELECT count(*) FROM events WHERE type='D'",
     );
     if (delete_count < 1) {
         std.debug.print("FAIL (expected >= 1 delete event, got {d})\n", .{delete_count});
@@ -386,36 +395,85 @@ fn testUpdateAndDelete(allocator: std.mem.Allocator) !void {
 }
 
 // =========================================================================
-// Test 4: Column values are correctly stored
+// Test 4: JSONB data and old_data values are correctly stored
 // =========================================================================
-fn testColumnValues(allocator: std.mem.Allocator) !void {
-    std.debug.print("  Test: column values stored correctly... ", .{});
+fn testJsonbValues(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: JSONB data values stored correctly... ", .{});
 
-    // Check that update events have previous_value set
-    const prev_val_count = try queryCount(allocator, DEST_DB,
-        \\SELECT count(*) FROM columns c
-        \\ JOIN events e ON e.id = c.event_id
-        \\ WHERE e.source_id='00000000-0000-0000-0000-000000000001'
-        \\   AND e.type = 1
-        \\   AND c.previous_value IS NOT NULL
+    // Check that update events have old_data set
+    const old_data_count = try queryCount(allocator, DEST_DB,
+        "SELECT count(*) FROM events WHERE type='U' AND old_data IS NOT NULL AND old_data != 'null'::jsonb",
     );
-    if (prev_val_count == 0) {
-        std.debug.print("FAIL (no previous_value on update columns)\n", .{});
+    if (old_data_count == 0) {
+        std.debug.print("FAIL (no old_data on update events)\n", .{});
         return error.ServerError;
     }
 
-    // Verify column names exist
+    // Verify data contains expected column names
     const name_col_count = try queryCount(allocator, DEST_DB,
-        \\SELECT count(*) FROM columns
-        \\ WHERE source_id='00000000-0000-0000-0000-000000000001'
-        \\   AND name = 'name'
+        "SELECT count(*) FROM events WHERE data ? 'name'",
     );
     if (name_col_count == 0) {
-        std.debug.print("FAIL (no 'name' column found)\n", .{});
+        std.debug.print("FAIL (no events with 'name' key in data)\n", .{});
         return error.ServerError;
     }
 
-    std.debug.print("OK ({d} columns with previous_value)\n", .{prev_val_count});
+    // Verify data contains expected column names
+    const quantity_col_count = try queryCount(allocator, DEST_DB,
+        "SELECT count(*) FROM events WHERE data ? 'quantity'",
+    );
+    if (quantity_col_count == 0) {
+        std.debug.print("FAIL (no events with 'quantity' key in data)\n", .{});
+        return error.ServerError;
+    }
+
+    // Verify delete events have old_data but no data
+    const delete_data_count = try queryCount(allocator, DEST_DB,
+        "SELECT count(*) FROM events WHERE type='D' AND old_data IS NOT NULL AND (data IS NULL)",
+    );
+    if (delete_data_count == 0) {
+        std.debug.print("FAIL (delete events should have old_data and null data)\n", .{});
+        return error.ServerError;
+    }
+
+    std.debug.print("OK ({d} updates with old_data, {d} events with name key)\n", .{ old_data_count, name_col_count });
+}
+
+// =========================================================================
+// Test 5: Relation snapshots contain column metadata
+// =========================================================================
+fn testRelationSnapshots(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: relation snapshots... ", .{});
+
+    // Verify snapshot has columns JSONB
+    const snapshot_with_cols = try queryCount(allocator, DEST_DB,
+        "SELECT count(*) FROM relation_snapshots WHERE jsonb_array_length(columns) > 0",
+    );
+    if (snapshot_with_cols == 0) {
+        std.debug.print("FAIL (no snapshots with columns)\n", .{});
+        return error.ServerError;
+    }
+
+    // Verify snapshot contains 'name' column metadata
+    const has_name = try queryCount(allocator, DEST_DB,
+        \\SELECT count(*) FROM relation_snapshots
+        \\ WHERE columns @> '[{"name": "name"}]'
+    );
+    if (has_name == 0) {
+        std.debug.print("FAIL (snapshot missing 'name' column)\n", .{});
+        return error.ServerError;
+    }
+
+    // Verify snapshot table_name is 'items'
+    const items_snap = try queryCount(allocator, DEST_DB,
+        "SELECT count(*) FROM relation_snapshots WHERE table_name = 'items'",
+    );
+    if (items_snap == 0) {
+        std.debug.print("FAIL (no snapshot for 'items' table)\n", .{});
+        return error.ServerError;
+    }
+
+    std.debug.print("OK ({d} snapshots with columns)\n", .{snapshot_with_cols});
 }
 
 // =========================================================================
@@ -450,7 +508,11 @@ pub fn main() !void {
         failures += 1;
     };
 
-    testColumnValues(allocator) catch {
+    testJsonbValues(allocator) catch {
+        failures += 1;
+    };
+
+    testRelationSnapshots(allocator) catch {
         failures += 1;
     };
 

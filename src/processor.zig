@@ -25,6 +25,7 @@ pub const Processor = struct {
     current_txn_lsn: u64,
     current_txn_xid: u32,
     current_txn_timestamp: i64,
+    current_txn_id: ?i64,
     in_transaction: bool,
 
     // Streaming context (proto v2+)
@@ -43,6 +44,7 @@ pub const Processor = struct {
         name: []u8,
         replica_identity: u8,
         columns: []OwnedColumn,
+        snapshot_lsn: ?u64,
 
         fn deinit(self: *OwnedRelation, allocator: std.mem.Allocator) void {
             allocator.free(self.namespace);
@@ -82,6 +84,7 @@ pub const Processor = struct {
             .current_txn_lsn = 0,
             .current_txn_xid = 0,
             .current_txn_timestamp = 0,
+            .current_txn_id = null,
             .in_transaction = false,
             .current_stream_xid = null,
             .pending_data = .{},
@@ -213,22 +216,24 @@ pub const Processor = struct {
                     self.current_txn_xid = begin.xid;
                     self.current_txn_timestamp = begin.timestamp;
                     self.in_transaction = true;
-                    try self.insertTransaction(begin.final_lsn);
+                    self.current_txn_id = try self.insertTransaction(begin.final_lsn);
                 },
                 .commit => {
                     self.in_transaction = false;
+                    self.current_txn_id = null;
                 },
                 .relation => |rel| {
                     try self.updateRelationCache(rel);
+                    try self.insertRelationSnapshot(rel);
                 },
                 .insert => |ins| {
-                    try self.insertEvent(ins.relation_oid, 0, ins.new_tuple, null);
+                    try self.insertEvent(ins.relation_oid, 'I', ins.new_tuple, null);
                 },
                 .update => |upd| {
-                    try self.insertEvent(upd.relation_oid, 1, upd.new_tuple, upd.old_tuple);
+                    try self.insertEvent(upd.relation_oid, 'U', upd.new_tuple, upd.old_tuple);
                 },
                 .delete => |del| {
-                    try self.insertEvent(del.relation_oid, 2, del.old_tuple, null);
+                    try self.insertEvent(del.relation_oid, 'D', null, del.old_tuple);
                 },
                 .truncate => {
                     try self.insertTruncateEvent();
@@ -243,10 +248,12 @@ pub const Processor = struct {
                 .stream_commit => {
                     self.current_stream_xid = null;
                     self.in_transaction = false;
+                    self.current_txn_id = null;
                 },
                 .stream_abort => {
                     self.current_stream_xid = null;
                     self.in_transaction = false;
+                    self.current_txn_id = null;
                 },
                 // Proto v3: two-phase commit
                 .begin_prepare => |bp| {
@@ -254,16 +261,18 @@ pub const Processor = struct {
                     self.current_txn_xid = bp.xid;
                     self.current_txn_timestamp = bp.timestamp;
                     self.in_transaction = true;
-                    try self.insertTransaction(bp.lsn);
+                    self.current_txn_id = try self.insertTransaction(bp.lsn);
                 },
                 .prepare => {
                     // Prepared but not yet committed — keep txn state
                 },
                 .commit_prepared => {
                     self.in_transaction = false;
+                    self.current_txn_id = null;
                 },
                 .rollback_prepared => {
                     self.in_transaction = false;
+                    self.current_txn_id = null;
                 },
                 .stream_prepare => {
                     // Prepared within streaming — keep txn state
@@ -273,7 +282,7 @@ pub const Processor = struct {
         }
     }
 
-    fn insertTransaction(self: *Processor, lsn: u64) !void {
+    fn insertTransaction(self: *Processor, lsn: u64) !?i64 {
         var sql: std.ArrayListUnmanaged(u8) = .{};
         defer sql.deinit(self.allocator);
 
@@ -285,22 +294,105 @@ pub const Processor = struct {
         try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_xid);
         try sql.appendSlice(self.allocator, ", ");
         try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
-        try sql.appendSlice(self.allocator, ") ON CONFLICT (source_id, lsn) DO NOTHING");
+        try sql.appendSlice(self.allocator, ") ON CONFLICT (source_id, lsn) DO NOTHING RETURNING id");
+
+        const result = try self.dest.execLargeWithResult(self.allocator, sql.items);
+        if (result.column_count > 0 and result.columns[0].data.len > 0) {
+            return std.fmt.parseInt(i64, result.columns[0].data, 10) catch null;
+        }
+        // ON CONFLICT hit — look up existing id
+        var lookup_sql: std.ArrayListUnmanaged(u8) = .{};
+        defer lookup_sql.deinit(self.allocator);
+
+        try lookup_sql.appendSlice(self.allocator, "SELECT id FROM transactions WHERE source_id=");
+        try query_mod.appendEscapedUuid(&lookup_sql, self.allocator, self.config.source_id);
+        try lookup_sql.appendSlice(self.allocator, " AND lsn=");
+        try query_mod.appendIntValue(&lookup_sql, self.allocator, lsn);
+
+        const lookup_result = try self.dest.simpleQuery(lookup_sql.items);
+        if (lookup_result.column_count > 0 and lookup_result.columns[0].data.len > 0) {
+            return std.fmt.parseInt(i64, lookup_result.columns[0].data, 10) catch null;
+        }
+        return null;
+    }
+
+    fn insertRelationSnapshot(self: *Processor, rel: pgoutput.Relation) !void {
+        // Check if we already have a snapshot for this OID at this LSN
+        if (self.relations.get(rel.oid)) |owned| {
+            if (owned.snapshot_lsn != null and owned.snapshot_lsn.? == self.current_txn_lsn) {
+                return; // Already inserted for this LSN
+            }
+        }
+
+        var sql: std.ArrayListUnmanaged(u8) = .{};
+        defer sql.deinit(self.allocator);
+
+        try sql.appendSlice(self.allocator,
+            "INSERT INTO relation_snapshots (source_id, lsn, rel_oid, schema_name, table_name, replica_identity, columns) VALUES (",
+        );
+        try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
+        try sql.appendSlice(self.allocator, ", ");
+        try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
+        try sql.appendSlice(self.allocator, ", ");
+        try query_mod.appendIntValue(&sql, self.allocator, rel.oid);
+        try sql.appendSlice(self.allocator, ", ");
+        try query_mod.appendEscapedString(&sql, self.allocator, rel.namespace);
+        try sql.appendSlice(self.allocator, ", ");
+        try query_mod.appendEscapedString(&sql, self.allocator, rel.name);
+        try sql.appendSlice(self.allocator, ", ");
+        try query_mod.appendIntValue(&sql, self.allocator, rel.replica_identity);
+        try sql.appendSlice(self.allocator, ", '");
+
+        // Build JSONB columns array
+        try sql.appendSlice(self.allocator, "[");
+        for (rel.columns, 0..) |col, i| {
+            if (i > 0) try sql.appendSlice(self.allocator, ",");
+            try sql.appendSlice(self.allocator, "{\"name\":");
+            try appendJsonString(&sql, self.allocator, col.name);
+            try sql.appendSlice(self.allocator, ",\"oid\":");
+            try query_mod.appendIntValue(&sql, self.allocator, col.type_oid);
+            try sql.appendSlice(self.allocator, ",\"type\":");
+            var type_name_buf: [32]u8 = undefined;
+            const type_name = pg_types.oidToName(col.type_oid, &type_name_buf);
+            try appendJsonString(&sql, self.allocator, type_name);
+            try sql.appendSlice(self.allocator, ",\"identity\":");
+            if ((col.flags & 1) != 0) {
+                try sql.appendSlice(self.allocator, "true");
+            } else {
+                try sql.appendSlice(self.allocator, "false");
+            }
+            try sql.appendSlice(self.allocator, ",\"ordinal\":");
+            try query_mod.appendIntValue(&sql, self.allocator, i);
+            try sql.append(self.allocator, '}');
+        }
+        try sql.appendSlice(self.allocator, "]");
+
+        try sql.appendSlice(self.allocator, "') ON CONFLICT (source_id, rel_oid, lsn) DO NOTHING");
 
         try self.dest.execLarge(self.allocator, sql.items);
+
+        // Update snapshot_lsn in cache
+        if (self.relations.getPtr(rel.oid)) |owned| {
+            owned.snapshot_lsn = self.current_txn_lsn;
+        }
     }
 
     fn insertEvent(
         self: *Processor,
         relation_oid: u32,
-        event_type: u2,
-        tuple: []const pgoutput.ColumnData,
+        event_type: u8,
+        tuple: ?[]const pgoutput.ColumnData,
         old_tuple: ?[]const pgoutput.ColumnData,
     ) !void {
         const rel = self.relations.get(relation_oid) orelse return;
 
-        // Compute identity digests (still needs heap for SHA256 output)
-        const identity_digest = try self.computeIdentityDigest(rel, tuple);
+        // Compute identity digests
+        const identity_digest = if (tuple) |t|
+            try self.computeIdentityDigest(rel, t)
+        else if (old_tuple) |ot|
+            try self.computeIdentityDigest(rel, ot)
+        else
+            null;
         defer if (identity_digest) |d| self.allocator.free(d);
 
         const prev_identity_digest = if (old_tuple) |ot|
@@ -313,37 +405,54 @@ pub const Processor = struct {
         defer sql.deinit(self.allocator);
 
         try sql.appendSlice(self.allocator,
-            "INSERT INTO events (source_id, lsn, type, schema_name, table_name, committed_at, " ++
-                "identity_digest, previous_identity_digest, transaction_id) VALUES (",
+            "INSERT INTO events (transaction_id, rel_oid, type, " ++
+                "identity_digest, previous_identity_digest, data, old_data) VALUES (",
         );
-        try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
+
+        // transaction_id
+        if (self.current_txn_id) |txn_id| {
+            try query_mod.appendIntValue(&sql, self.allocator, txn_id);
+        } else {
+            try sql.appendSlice(self.allocator, "(SELECT id FROM transactions WHERE source_id=");
+            try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
+            try sql.appendSlice(self.allocator, " AND lsn=");
+            try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
+            try sql.append(self.allocator, ')');
+        }
         try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
-        try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendIntValue(&sql, self.allocator, event_type);
-        try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendEscapedString(&sql, self.allocator, rel.namespace);
-        try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendEscapedString(&sql, self.allocator, rel.name);
-        try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
-        try sql.appendSlice(self.allocator, ", ");
+
+        // rel_oid
+        try query_mod.appendIntValue(&sql, self.allocator, relation_oid);
+        try sql.appendSlice(self.allocator, ", '");
+        try sql.append(self.allocator, event_type);
+        try sql.appendSlice(self.allocator, "', ");
+
+        // identity_digest
         try query_mod.appendByteaOrNull(&sql, self.allocator, identity_digest);
         try sql.appendSlice(self.allocator, ", ");
+
+        // previous_identity_digest
         try query_mod.appendByteaOrNull(&sql, self.allocator, prev_identity_digest);
-        try sql.appendSlice(self.allocator, ", (SELECT id FROM transactions WHERE source_id=");
-        try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
-        try sql.appendSlice(self.allocator, " AND lsn=");
-        try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
-        try sql.appendSlice(self.allocator, ")) RETURNING id");
+        try sql.appendSlice(self.allocator, ", ");
 
-        const event_result = try self.dest.execLargeWithResult(self.allocator, sql.items);
-        if (event_result.column_count == 0) return;
+        // data JSONB — build from tuple
+        if (tuple) |t| {
+            try self.appendTupleAsJsonb(&sql, rel, t);
+        } else {
+            try sql.appendSlice(self.allocator, "NULL");
+        }
+        try sql.appendSlice(self.allocator, ", ");
 
-        const event_id = event_result.columns[0].data;
+        // old_data JSONB — build from old_tuple
+        if (old_tuple) |ot| {
+            try self.appendTupleAsJsonb(&sql, rel, ot);
+        } else {
+            try sql.appendSlice(self.allocator, "NULL");
+        }
 
-        // Insert all columns in a single multi-row INSERT
-        try self.insertColumns(event_id, rel, tuple, old_tuple);
+        try sql.append(self.allocator, ')');
+
+        try self.dest.execLarge(self.allocator, sql.items);
     }
 
     fn insertTruncateEvent(self: *Processor) !void {
@@ -351,107 +460,81 @@ pub const Processor = struct {
         defer sql.deinit(self.allocator);
 
         try sql.appendSlice(self.allocator,
-            "INSERT INTO events (source_id, lsn, type, schema_name, table_name, committed_at, transaction_id) VALUES (",
+            "INSERT INTO events (transaction_id, rel_oid, type, data, old_data) VALUES (",
         );
-        try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
-        try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
-        try sql.appendSlice(self.allocator, ", 3, '', '', ");
-        try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
-        try sql.appendSlice(self.allocator, ", (SELECT id FROM transactions WHERE source_id=");
-        try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
-        try sql.appendSlice(self.allocator, " AND lsn=");
-        try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
-        try sql.appendSlice(self.allocator, "))");
+
+        // transaction_id
+        if (self.current_txn_id) |txn_id| {
+            try query_mod.appendIntValue(&sql, self.allocator, txn_id);
+        } else {
+            try sql.appendSlice(self.allocator, "(SELECT id FROM transactions WHERE source_id=");
+            try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
+            try sql.appendSlice(self.allocator, " AND lsn=");
+            try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
+            try sql.append(self.allocator, ')');
+        }
+
+        try sql.appendSlice(self.allocator, ", 0, 'T', NULL, NULL)");
 
         try self.dest.execLarge(self.allocator, sql.items);
     }
 
-    fn insertColumns(
+    /// Append a pgoutput tuple as a JSONB literal ('{"col":"val",...}')
+    /// or NULL if the tuple has no data.
+    fn appendTupleAsJsonb(
         self: *Processor,
-        event_id: []const u8,
+        sql: *std.ArrayListUnmanaged(u8),
         rel: OwnedRelation,
         tuple: []const pgoutput.ColumnData,
-        old_tuple: ?[]const pgoutput.ColumnData,
     ) !void {
-        if (rel.columns.len == 0) return;
-
-        var sql: std.ArrayListUnmanaged(u8) = .{};
-        defer sql.deinit(self.allocator);
-
-        try sql.appendSlice(self.allocator,
-            "INSERT INTO columns (event_id, source_id, name, type_oid, type_name, " ++
-                "value, previous_value, identity, ordinal) VALUES ",
-        );
-
-        for (rel.columns, 0..) |col, i| {
-            if (i > 0) try sql.appendSlice(self.allocator, ", ");
-            try sql.append(self.allocator, '(');
-
-            // event_id
-            try query_mod.appendEscapedUuid(&sql, self.allocator, event_id);
-            try sql.appendSlice(self.allocator, ", ");
-
-            // source_id
-            try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
-            try sql.appendSlice(self.allocator, ", ");
-
-            // name
-            try query_mod.appendEscapedString(&sql, self.allocator, col.name);
-            try sql.appendSlice(self.allocator, ", ");
-
-            // type_oid
-            try query_mod.appendIntValue(&sql, self.allocator, col.type_oid);
-            try sql.appendSlice(self.allocator, ", ");
-
-            // type_name
-            var type_name_buf: [32]u8 = undefined;
-            const type_name = pg_types.oidToName(col.type_oid, &type_name_buf);
-            try query_mod.appendEscapedString(&sql, self.allocator, type_name);
-            try sql.appendSlice(self.allocator, ", ");
-
-            // value
-            const value_data: ?[]const u8 = if (i < tuple.len)
+        var has_any = false;
+        for (rel.columns, 0..) |_, i| {
+            if (i < tuple.len) {
                 switch (tuple[i]) {
-                    .text => |t| t,
-                    .binary => |b| b,
-                    .null_value => null,
-                    .unchanged => null,
+                    .text, .binary, .null_value => {
+                        has_any = true;
+                        break;
+                    },
+                    .unchanged => {},
                 }
-            else
-                null;
-            try query_mod.appendByteaOrNull(&sql, self.allocator, value_data);
-            try sql.appendSlice(self.allocator, ", ");
-
-            // previous_value
-            const prev_value_data: ?[]const u8 = if (old_tuple) |ot| blk: {
-                if (i < ot.len) {
-                    break :blk switch (ot[i]) {
-                        .text => |t| t,
-                        .binary => |b| b,
-                        .null_value => null,
-                        .unchanged => null,
-                    };
-                }
-                break :blk null;
-            } else null;
-            try query_mod.appendByteaOrNull(&sql, self.allocator, prev_value_data);
-            try sql.appendSlice(self.allocator, ", ");
-
-            // identity
-            if ((col.flags & 1) != 0) {
-                try sql.appendSlice(self.allocator, "true");
-            } else {
-                try sql.appendSlice(self.allocator, "false");
             }
-            try sql.appendSlice(self.allocator, ", ");
-
-            // ordinal
-            try query_mod.appendIntValue(&sql, self.allocator, i);
-            try sql.append(self.allocator, ')');
         }
 
-        try self.dest.execLarge(self.allocator, sql.items);
+        if (!has_any) {
+            try sql.appendSlice(self.allocator, "NULL");
+            return;
+        }
+
+        try sql.appendSlice(self.allocator, "'{");
+        var first = true;
+        for (rel.columns, 0..) |col, i| {
+            if (i >= tuple.len) continue;
+
+            switch (tuple[i]) {
+                .text => |t| {
+                    if (!first) try sql.appendSlice(self.allocator, ",");
+                    first = false;
+                    try appendJsonString(sql, self.allocator, col.name);
+                    try sql.append(self.allocator, ':');
+                    try appendJsonString(sql, self.allocator, t);
+                },
+                .binary => |b| {
+                    if (!first) try sql.appendSlice(self.allocator, ",");
+                    first = false;
+                    try appendJsonString(sql, self.allocator, col.name);
+                    try sql.append(self.allocator, ':');
+                    try appendJsonString(sql, self.allocator, b);
+                },
+                .null_value => {
+                    if (!first) try sql.appendSlice(self.allocator, ",");
+                    first = false;
+                    try appendJsonString(sql, self.allocator, col.name);
+                    try sql.appendSlice(self.allocator, ":null");
+                },
+                .unchanged => {},
+            }
+        }
+        try sql.appendSlice(self.allocator, "}'::jsonb");
     }
 
     fn computeIdentityDigest(self: *Processor, rel: OwnedRelation, tuple: []const pgoutput.ColumnData) !?[]u8 {
@@ -499,7 +582,10 @@ pub const Processor = struct {
     }
 
     fn updateRelationCache(self: *Processor, rel: pgoutput.Relation) !void {
+        // Preserve snapshot_lsn if updating an existing entry
+        var prev_snapshot_lsn: ?u64 = null;
         if (self.relations.fetchRemove(rel.oid)) |entry| {
+            prev_snapshot_lsn = entry.value.snapshot_lsn;
             var old = entry.value;
             old.deinit(self.allocator);
         }
@@ -528,6 +614,7 @@ pub const Processor = struct {
             .name = name,
             .replica_identity = rel.replica_identity,
             .columns = columns,
+            .snapshot_lsn = prev_snapshot_lsn,
         });
     }
 
@@ -599,3 +686,25 @@ pub const Processor = struct {
         self.dest.close();
     }
 };
+
+/// Append a JSON-escaped string (with surrounding double quotes) to the list.
+fn appendJsonString(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    try list.append(allocator, '"');
+    for (value) |c| {
+        switch (c) {
+            '"' => try list.appendSlice(allocator, "\\\""),
+            '\\' => try list.appendSlice(allocator, "\\\\"),
+            '\n' => try list.appendSlice(allocator, "\\n"),
+            '\r' => try list.appendSlice(allocator, "\\r"),
+            '\t' => try list.appendSlice(allocator, "\\t"),
+            // Control characters
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
+                var buf: [6]u8 = undefined;
+                _ = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
+                try list.appendSlice(allocator, &buf);
+            },
+            else => try list.append(allocator, c),
+        }
+    }
+    try list.append(allocator, '"');
+}

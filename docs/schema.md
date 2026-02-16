@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS wal_batches (
 | `end_lsn`    | WAL LSN of the last message in this batch |
 | `data`       | Packed binary pgoutput messages (length-prefixed) |
 | `relations`  | JSONB snapshot of relation metadata at batch time |
-| `state`      | `pending` → `processing` → deleted (or `error`) |
+| `state`      | `pending` -> `processing` -> deleted (or `error`) |
 | `complete`   | `false` for partial batches (mid-transaction split), `true` for final |
 | `created_at` | Timestamp when the batch was stored |
 
@@ -41,7 +41,7 @@ One row per replicated transaction.
 
 ```sql
 CREATE TABLE IF NOT EXISTS transactions (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id              BIGSERIAL PRIMARY KEY,
     source_id       UUID NOT NULL,
     lsn             BIGINT NOT NULL,
     xid             INTEGER NOT NULL,
@@ -52,73 +52,128 @@ CREATE TABLE IF NOT EXISTS transactions (
 
 | Column        | Description |
 |---------------|-------------|
-| `id`          | UUID primary key |
+| `id`          | Auto-incrementing primary key (BIGSERIAL) |
 | `source_id`   | UUID identifying the source database |
 | `lsn`         | Commit LSN of the transaction on the source |
 | `xid`         | Transaction ID (XID) on the source |
 | `committed_at`| Commit timestamp from the source WAL |
 
+## relation_snapshots
+
+Captures the schema of a source relation at a point in time. A new row is
+inserted only when the column metadata changes (DDL), so for a stable schema
+there is one row per table.
+
+```sql
+CREATE TABLE IF NOT EXISTS relation_snapshots (
+    id               BIGSERIAL PRIMARY KEY,
+    source_id        UUID NOT NULL,
+    lsn              BIGINT NOT NULL,
+    rel_oid          INTEGER NOT NULL,
+    schema_name      TEXT NOT NULL,
+    table_name       TEXT NOT NULL,
+    replica_identity SMALLINT NOT NULL,
+    columns          JSONB NOT NULL,
+    UNIQUE (source_id, rel_oid, lsn)
+);
+```
+
+| Column             | Description |
+|--------------------|-------------|
+| `id`               | Auto-incrementing primary key |
+| `source_id`        | UUID identifying the source database |
+| `lsn`              | LSN at which this schema snapshot was captured |
+| `rel_oid`          | PostgreSQL relation OID on the source |
+| `schema_name`      | Source schema (e.g. `public`) |
+| `table_name`       | Source table name |
+| `replica_identity` | Replica identity setting (0=default, 1=nothing, 2=full, 3=index) |
+| `columns`          | JSONB array of column descriptors (see below) |
+
+### columns JSONB format
+
+```json
+[
+  {"name": "id", "oid": 23, "type": "int4", "identity": true, "ordinal": 0},
+  {"name": "name", "oid": 25, "type": "text", "identity": false, "ordinal": 1}
+]
+```
+
+To look up the schema active at a given LSN:
+
+```sql
+SELECT * FROM relation_snapshots
+WHERE source_id = $1 AND rel_oid = $2 AND lsn <= $3
+ORDER BY lsn DESC LIMIT 1;
+```
+
 ## events
 
-One row per DML operation (INSERT, UPDATE, DELETE, TRUNCATE).
+One row per DML operation (INSERT, UPDATE, DELETE, TRUNCATE). Column data is
+stored inline as JSONB rather than in a separate table.
 
 ```sql
 CREATE TABLE IF NOT EXISTS events (
-    id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    transaction_id           UUID NOT NULL REFERENCES transactions(id),
-    source_id                UUID NOT NULL,
-    lsn                      BIGINT NOT NULL,
-    type                     SMALLINT NOT NULL,
-    schema_name              TEXT NOT NULL,
-    table_name               TEXT NOT NULL,
-    committed_at             TIMESTAMPTZ NOT NULL,
+    id                       BIGSERIAL PRIMARY KEY,
+    transaction_id           BIGINT NOT NULL REFERENCES transactions(id),
+    rel_oid                  INTEGER NOT NULL,
+    type                     CHAR(1) NOT NULL,
     identity_digest          BYTEA,
-    previous_identity_digest BYTEA
+    previous_identity_digest BYTEA,
+    data                     JSONB,
+    old_data                 JSONB
 );
+
+CREATE INDEX idx_events_transaction_id ON events (transaction_id);
+CREATE INDEX idx_events_identity_digest ON events (identity_digest)
+    WHERE identity_digest IS NOT NULL;
 ```
 
 | Column                    | Description |
 |---------------------------|-------------|
-| `id`                      | UUID primary key |
+| `id`                      | Auto-incrementing primary key (BIGSERIAL) |
 | `transaction_id`          | FK to the parent transaction |
-| `source_id`               | UUID identifying the source database |
-| `lsn`                     | Commit LSN of the parent transaction |
-| `type`                    | 0 = INSERT, 1 = UPDATE, 2 = DELETE, 3 = TRUNCATE |
-| `schema_name`             | Source schema (e.g. `public`) |
-| `table_name`              | Source table name |
-| `committed_at`            | Commit timestamp from the source WAL |
+| `rel_oid`                 | PostgreSQL relation OID on the source |
+| `type`                    | `I` = INSERT, `U` = UPDATE, `D` = DELETE, `T` = TRUNCATE |
 | `identity_digest`         | SHA-256 of identity column values (new tuple) |
 | `previous_identity_digest`| SHA-256 of identity column values (old tuple, for UPDATEs) |
+| `data`                    | JSONB object mapping column names to text values (new tuple) |
+| `old_data`                | JSONB object mapping column names to text values (old tuple) |
 
-## columns
+### data / old_data JSONB format
 
-One row per column per event. For a table with N columns, each INSERT/UPDATE/DELETE
-event produces N column rows.
+All values are stored as text strings (what pgoutput provides). SQL NULL
+values are represented as JSON null. Unchanged (TOASTed) columns are omitted.
 
-```sql
-CREATE TABLE IF NOT EXISTS columns (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    event_id        UUID NOT NULL REFERENCES events(id),
-    source_id       UUID NOT NULL,
-    name            TEXT NOT NULL,
-    type_oid        INTEGER NOT NULL,
-    type_name       TEXT NOT NULL,
-    value           BYTEA,
-    previous_value  BYTEA,
-    identity        BOOLEAN NOT NULL DEFAULT false,
-    ordinal         SMALLINT NOT NULL
-);
+```json
+-- INSERT INTO items (id, name, quantity) VALUES (1, 'widget', 10)
+-- type = 'I', data:
+{"id": "1", "name": "widget", "quantity": "10"}
+-- old_data: NULL
+
+-- UPDATE items SET quantity = 99 WHERE id = 1
+-- type = 'U', data:
+{"id": "1", "name": "widget", "quantity": "99"}
+-- old_data:
+{"id": "1", "name": "widget", "quantity": "10"}
+
+-- DELETE FROM items WHERE id = 1
+-- type = 'D', data: NULL
+-- old_data:
+{"id": "1", "name": "widget", "quantity": "99"}
 ```
 
-| Column           | Description |
-|------------------|-------------|
-| `id`             | UUID primary key |
-| `event_id`       | FK to the parent event |
-| `source_id`      | UUID identifying the source database |
-| `name`           | Column name |
-| `type_oid`       | PostgreSQL type OID |
-| `type_name`      | Human-readable type name (e.g. `int4`, `text`) |
-| `value`          | Current value as bytea (text representation), NULL if unchanged/null |
-| `previous_value` | Previous value for UPDATEs (requires REPLICA IDENTITY FULL) |
-| `identity`       | `true` if this column is part of the replica identity |
-| `ordinal`        | 0-based column position in the table |
+To get column type information, join to `relation_snapshots`:
+
+```sql
+SELECT e.*, rs.columns AS col_types
+FROM events e
+JOIN transactions t ON t.id = e.transaction_id
+JOIN LATERAL (
+    SELECT columns FROM relation_snapshots
+    WHERE source_id = t.source_id
+      AND rel_oid = e.rel_oid
+      AND lsn <= t.lsn
+    ORDER BY lsn DESC LIMIT 1
+) rs ON true
+WHERE e.transaction_id = $1;
+```

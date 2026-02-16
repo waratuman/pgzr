@@ -54,8 +54,8 @@ Ingest WAL, store batches, then process them into structured tables:
                                                 v
                                     ┌───────────────────────┐
                                     │ transactions          │
-                                    │ events                │
-                                    │ columns               │
+                                    │ events (JSONB data)   │
+                                    │ relation_snapshots    │
                                     │ (structured audit log)│
                                     └───────────────────────┘
 ```
@@ -139,7 +139,7 @@ try ingestor.run();
 
 ### WAL Processor
 
-Process stored WAL batches into structured transactions, events, and columns:
+Process stored WAL batches into structured transactions and events:
 
 ```zig
 var processor = try pgzr.Processor.init(allocator, .{
@@ -241,8 +241,8 @@ src/
   lsn.zig         -- LSN type (parse, format, binary I/O)
   types.zig       -- ConnConfig, ReplicatorConfig, IngestConfig, ProcessorConfig, etc.
   ingest.zig      -- stage 1: stream WAL from source, pack into batches, store in dest
-  processor.zig   -- stage 2: read batches, decode pgoutput, write transactions/events/columns
-  schema.zig      -- DDL for pipeline tables (wal_batches, transactions, events, columns)
+  processor.zig   -- stage 2: read batches, decode pgoutput, write transactions/events/relation_snapshots
+  schema.zig      -- DDL for pipeline tables (wal_batches, transactions, events, relation_snapshots)
   query.zig       -- SQL escaping helpers (strings, bytea, UUIDs, timestamps)
   pg_types.zig    -- PostgreSQL OID-to-type-name lookup
   cabi.zig        -- C ABI exports for shared library (Ruby/Python FFI)
