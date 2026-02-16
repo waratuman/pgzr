@@ -116,6 +116,28 @@ pub fn build(b: *std.Build) void {
     const lib_step = b.step("lib", "Build shared library (libpgzr.dylib/so)");
     lib_step.dependOn(b.getInstallStep());
 
+    // Pipeline benchmark (requires a running PostgreSQL instance)
+    const pipeline_bench = b.addExecutable(.{
+        .name = "pipeline-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmark/pipeline_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "pgzr", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(pipeline_bench);
+
+    const run_pipeline_bench = b.addRunArtifact(pipeline_bench);
+    run_pipeline_bench.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_pipeline_bench.addArgs(args);
+    }
+    const pipeline_bench_step = b.step("pipeline-bench", "Run pipeline benchmark (requires PostgreSQL)");
+    pipeline_bench_step.dependOn(&run_pipeline_bench.step);
+
     // Pipeline integration tests (requires a running PostgreSQL instance)
     const pipeline_tests = b.addExecutable(.{
         .name = "pipeline-tests",
