@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Unit tests
+        run: zig build test
+      - name: Build shared library
+        run: zig build lib
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Configure PostgreSQL for logical replication
+        run: |
+          psql -h 127.0.0.1 -U postgres -c "ALTER SYSTEM SET wal_level = 'logical';"
+          psql -h 127.0.0.1 -U postgres -c "ALTER SYSTEM SET max_replication_slots = 10;"
+          psql -h 127.0.0.1 -U postgres -c "ALTER SYSTEM SET max_wal_senders = 10;"
+          psql -h 127.0.0.1 -U postgres -c "SELECT pg_reload_conf();"
+        env:
+          PGPASSWORD: postgres
+      - name: Restart PostgreSQL to apply wal_level
+        run: |
+          docker restart ${{ job.services.postgres.id }}
+          sleep 5
+          until pg_isready -h 127.0.0.1 -U postgres; do sleep 1; done
+        env:
+          PGPASSWORD: postgres
+      - name: Unit tests
+        run: zig build test
+      - name: Pipeline tests
+        run: zig build pipeline-test
+        env:
+          PGUSER: postgres
