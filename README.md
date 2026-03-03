@@ -23,10 +23,10 @@ full pipeline:
 Stream raw WAL messages directly from PostgreSQL:
 
 ```
-┌──────────┐    WAL stream     ┌────────────┐
-│ Source DB │ ────────────────> │ Replicator │ ──> raw WAL messages
-│ (PG)     │   pgoutput/       │            │     to your code
-└──────────┘   test_decoding   └────────────┘
+┌───────────┐   WAL stream     ┌────────────┐
+│ Source DB │ ───────────────> │ Replicator │ ──> raw WAL messages
+│ (PG)      │   pgoutput/      │            │     to your code
+└───────────┘   test_decoding  └────────────┘
 ```
 
 ### Mode 2: WAL Ingest Pipeline (Ingestor)
@@ -35,10 +35,10 @@ Stream WAL from a source database and store packed batches in a destination
 database for later processing:
 
 ```
-┌──────────┐    WAL stream     ┌───────────┐   packed batches   ┌─────────┐
-│ Source DB │ ────────────────> │ Ingestor  │ ────────────────>  │ Dest DB │
-│ (PG)     │   pgoutput        │           │   wal_batches      │ (PG)    │
-└──────────┘                   └───────────┘   table             └─────────┘
+┌───────────┐   WAL stream     ┌───────────┐   packed batches   ┌─────────┐
+│ Source DB │ ───────────────> │ Ingestor  │ ─────────────────> │ Dest DB │
+│ (PG)      │   pgoutput       │           │   wal_batches      │ (PG)    │
+└───────────┘                  └───────────┘   table            └─────────┘
 ```
 
 ### Mode 3: Full Pipeline (Ingestor + Processor)
@@ -46,18 +46,18 @@ database for later processing:
 Ingest WAL, store batches, then process them into structured tables:
 
 ```
-┌──────────┐  WAL   ┌───────────┐  batches  ┌─────────┐  read   ┌───────────┐
-│ Source DB │ ────>  │ Ingestor  │ ────────> │ Dest DB │ <────── │ Processor │
-│ (PG)     │        │           │           │ (PG)    │ ──────> │           │
-└──────────┘        └───────────┘           └─────────┘  write  └───────────┘
-                                                │
-                                                v
-                                    ┌───────────────────────┐
-                                    │ transactions          │
-                                    │ events (JSONB data)   │
-                                    │ relation_snapshots    │
-                                    │ (structured audit log)│
-                                    └───────────────────────┘
+┌───────────┐  WAL  ┌───────────┐  batches  ┌─────────┐  read   ┌───────────┐
+│ Source DB │ ────> │ Ingestor  │ ────────> │ Dest DB │ <────── │ Processor │
+│ (PG)      │       │           │           │ (PG)    │ ──────> │           │
+└───────────┘       └───────────┘           └─────────┘  write  └───────────┘
+                                                 │
+                                                 v
+                                     ┌───────────────────────┐
+                                     │ transactions          │
+                                     │ events (JSONB data)   │
+                                     │ relation_snapshots    │
+                                     │ (structured audit log)│
+                                     └───────────────────────┘
 ```
 
 Large transactions are automatically split into partial batches by the
