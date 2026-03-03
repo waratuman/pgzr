@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+# Pre-commit hook: format staged .zig files in place and re-stage them.
+
+staged_zig_files=$(git diff --cached --name-only --diff-filter=d -- '*.zig')
+
+if [ -z "$staged_zig_files" ]; then
+    exit 0
+fi
+
+zig fmt $staged_zig_files
+git add $staged_zig_files
