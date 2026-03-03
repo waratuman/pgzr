@@ -21,10 +21,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(example);
 
     const run_example = b.addRunArtifact(example);
-    run_example.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_example.addArgs(args);
     }
@@ -43,10 +41,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(ingest_example);
 
     const run_ingest_example = b.addRunArtifact(ingest_example);
-    run_ingest_example.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_ingest_example.addArgs(args);
     }
@@ -73,10 +69,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(bench);
 
     const run_bench = b.addRunArtifact(bench);
-    run_bench.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_bench.addArgs(args);
     }
@@ -95,10 +89,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(integration_tests);
 
     const run_integration = b.addRunArtifact(integration_tests);
-    run_integration.step.dependOn(b.getInstallStep());
     const integration_step = b.step("integration-test", "Run integration tests (requires PostgreSQL)");
     integration_step.dependOn(&run_integration.step);
 
@@ -128,10 +120,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(pipeline_bench);
 
     const run_pipeline_bench = b.addRunArtifact(pipeline_bench);
-    run_pipeline_bench.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_pipeline_bench.addArgs(args);
     }
@@ -150,10 +140,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(pipeline_tests);
 
     const run_pipeline = b.addRunArtifact(pipeline_tests);
-    run_pipeline.step.dependOn(b.getInstallStep());
     const pipeline_step = b.step("pipeline-test", "Run pipeline integration tests (requires PostgreSQL)");
     pipeline_step.dependOn(&run_pipeline.step);
 }
