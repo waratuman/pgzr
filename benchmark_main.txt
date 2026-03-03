@@ -1,0 +1,24 @@
+PGZR Pipeline Benchmark (20-column wide table)
+================================================
+Rows: 1000
+
+Setting up...
+Inserting 1000 rows into source...
+Updating 200 rows...
+Deleting 100 rows...
+Total DML events: 1300 (1000 inserts + 200 updates + 100 deletes)
+
+Phase 1: Ingest WAL...
+  Ingest time: 0.0178s
+
+Phase 2: Process batches...
+  Process time: 0.1379s
+  Batches processed: 4
+
+Results
+-------
+  Transactions: 3
+  Events: 301
+  Total time: 0.1557s (ingest 0.0178s + process 0.1379s)
+  Process throughput: 9426 events/s
+  Table sizes: transactions: 40 kB, events: 120 kB, columns: 1056 kB
