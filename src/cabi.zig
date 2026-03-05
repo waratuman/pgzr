@@ -112,8 +112,8 @@ export fn pgzr_ingestor_new(config: *const PgzrIngestConfig) ?*Ingestor {
     const proto_ver = sliceFromCStr(config.proto_version);
     const pub_names = sliceFromCStr(config.publication_names);
 
-    // Build options array (up to 2 entries)
-    var options: [2][2][]const u8 = undefined;
+    // Build options array (up to 3 entries)
+    var options: [3][2][]const u8 = undefined;
     var opt_count: usize = 0;
 
     if (proto_ver.len > 0) {
@@ -124,6 +124,10 @@ export fn pgzr_ingestor_new(config: *const PgzrIngestConfig) ?*Ingestor {
         options[opt_count] = .{ "publication_names", pub_names };
         opt_count += 1;
     }
+    // Always enable logical decoding messages so pg_logical_emit_message
+    // metadata reaches the processor.
+    options[opt_count] = .{ "messages", "true" };
+    opt_count += 1;
 
     const ingest_config = types.IngestConfig{
         .source = .{
