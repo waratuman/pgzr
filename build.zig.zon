@@ -1,6 +1,6 @@
 .{
     .name = .pgzr,
-    .version = "0.2.1",
+    .version = "0.2.2",
     .fingerprint = 0x6c38234961b6c3a2,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{},
