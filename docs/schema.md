@@ -41,22 +41,26 @@ One row per replicated transaction.
 
 ```sql
 CREATE TABLE IF NOT EXISTS transactions (
-    id              BIGSERIAL PRIMARY KEY,
+    id              BIGSERIAL NOT NULL,
     source_id       UUID NOT NULL,
     lsn             BIGINT NOT NULL,
     xid             INTEGER NOT NULL,
     committed_at    TIMESTAMPTZ NOT NULL,
-    UNIQUE (source_id, lsn)
-);
+    PRIMARY KEY (id, committed_at),
+    UNIQUE (source_id, lsn, committed_at)
+) PARTITION BY RANGE (committed_at);
+
+CREATE TABLE IF NOT EXISTS transactions_default
+    PARTITION OF transactions DEFAULT;
 ```
 
 | Column        | Description |
 |---------------|-------------|
-| `id`          | Auto-incrementing primary key (BIGSERIAL) |
+| `id`          | Auto-incrementing primary key (BIGSERIAL), part of composite PK with `committed_at` |
 | `source_id`   | UUID identifying the source database |
 | `lsn`         | Commit LSN of the transaction on the source |
 | `xid`         | Transaction ID (XID) on the source |
-| `committed_at`| Commit timestamp from the source WAL |
+| `committed_at`| Commit timestamp from the source WAL (partition key) |
 
 ## relation_snapshots
 
@@ -113,15 +117,21 @@ stored inline as JSONB rather than in a separate table.
 
 ```sql
 CREATE TABLE IF NOT EXISTS events (
-    id                       BIGSERIAL PRIMARY KEY,
-    transaction_id           BIGINT NOT NULL REFERENCES transactions(id),
+    id                       BIGSERIAL NOT NULL,
+    transaction_id           BIGINT NOT NULL,
+    committed_at             TIMESTAMPTZ NOT NULL,
     rel_oid                  INTEGER NOT NULL,
     type                     CHAR(1) NOT NULL,
     identity_digest          BYTEA,
     previous_identity_digest BYTEA,
     data                     JSONB,
-    old_data                 JSONB
-);
+    old_data                 JSONB,
+    PRIMARY KEY (id, committed_at),
+    FOREIGN KEY (transaction_id, committed_at) REFERENCES transactions(id, committed_at)
+) PARTITION BY RANGE (committed_at);
+
+CREATE TABLE IF NOT EXISTS events_default
+    PARTITION OF events DEFAULT;
 
 CREATE INDEX idx_events_transaction_id ON events (transaction_id);
 CREATE INDEX idx_events_identity_digest ON events (identity_digest)
@@ -130,8 +140,9 @@ CREATE INDEX idx_events_identity_digest ON events (identity_digest)
 
 | Column                    | Description |
 |---------------------------|-------------|
-| `id`                      | Auto-incrementing primary key (BIGSERIAL) |
-| `transaction_id`          | FK to the parent transaction |
+| `id`                      | Auto-incrementing primary key (BIGSERIAL), part of composite PK with `committed_at` |
+| `transaction_id`          | FK to the parent transaction (composite with `committed_at`) |
+| `committed_at`            | Commit timestamp from the source WAL (partition key, denormalized from transactions) |
 | `rel_oid`                 | PostgreSQL relation OID on the source |
 | `type`                    | `I` = INSERT, `U` = UPDATE, `D` = DELETE, `T` = TRUNCATE |
 | `identity_digest`         | SHA-256 of identity column values (new tuple) |
@@ -167,7 +178,7 @@ To get column type information, join to `relation_snapshots`:
 ```sql
 SELECT e.*, rs.columns AS col_types
 FROM events e
-JOIN transactions t ON t.id = e.transaction_id
+JOIN transactions t ON t.id = e.transaction_id AND t.committed_at = e.committed_at
 JOIN LATERAL (
     SELECT columns FROM relation_snapshots
     WHERE source_id = t.source_id
@@ -177,3 +188,26 @@ JOIN LATERAL (
 ) rs ON true
 WHERE e.transaction_id = $1;
 ```
+
+## Partitioning
+
+Both `transactions` and `events` are partitioned by `committed_at` using
+PostgreSQL range partitioning. A default partition is created automatically
+to catch all rows. For better performance and retention management, create
+time-range partitions:
+
+```sql
+-- Monthly partitions
+CREATE TABLE transactions_2025_01 PARTITION OF transactions
+    FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+CREATE TABLE events_2025_01 PARTITION OF events
+    FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+
+-- To archive/drop old data, detach or drop the partition:
+ALTER TABLE events DETACH PARTITION events_2025_01;
+DROP TABLE events_2025_01;
+```
+
+`wal_batches` and `relation_snapshots` are not partitioned — `wal_batches`
+is a transient queue (rows deleted after processing) and `relation_snapshots`
+is very low volume (one row per DDL change).

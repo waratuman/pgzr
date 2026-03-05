@@ -106,14 +106,16 @@ pub const Processor = struct {
         var claim_sql: std.ArrayListUnmanaged(u8) = .{};
         defer claim_sql.deinit(self.allocator);
 
-        try claim_sql.appendSlice(self.allocator,
+        try claim_sql.appendSlice(
+            self.allocator,
             "UPDATE wal_batches SET state='processing'" ++
                 " WHERE id = (" ++
                 " SELECT id FROM wal_batches" ++
                 " WHERE source_id=",
         );
         try query_mod.appendEscapedUuid(&claim_sql, self.allocator, self.config.source_id);
-        try claim_sql.appendSlice(self.allocator,
+        try claim_sql.appendSlice(
+            self.allocator,
             " AND state='pending'" ++
                 " ORDER BY start_lsn LIMIT 1" ++
                 " FOR UPDATE SKIP LOCKED" ++
@@ -164,7 +166,8 @@ pub const Processor = struct {
     fn markBatchesError(self: *Processor) void {
         for (self.pending_batch_ids.items) |bid| {
             var err_buf: [256]u8 = undefined;
-            const err_sql = std.fmt.bufPrint(&err_buf,
+            const err_sql = std.fmt.bufPrint(
+                &err_buf,
                 "UPDATE wal_batches SET state='error' WHERE id={s}",
                 .{bid},
             ) catch continue;
@@ -175,7 +178,8 @@ pub const Processor = struct {
     fn deleteBatches(self: *Processor) !void {
         for (self.pending_batch_ids.items) |bid| {
             var del_buf: [128]u8 = undefined;
-            const del_sql = std.fmt.bufPrint(&del_buf,
+            const del_sql = std.fmt.bufPrint(
+                &del_buf,
                 "DELETE FROM wal_batches WHERE id={s}",
                 .{bid},
             ) catch continue;
@@ -294,7 +298,7 @@ pub const Processor = struct {
         try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_xid);
         try sql.appendSlice(self.allocator, ", ");
         try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
-        try sql.appendSlice(self.allocator, ") ON CONFLICT (source_id, lsn) DO NOTHING RETURNING id");
+        try sql.appendSlice(self.allocator, ") ON CONFLICT (source_id, lsn, committed_at) DO NOTHING RETURNING id");
 
         const result = try self.dest.execLargeWithResult(self.allocator, sql.items);
         if (result.column_count > 0 and result.columns[0].data.len > 0) {
@@ -308,6 +312,8 @@ pub const Processor = struct {
         try query_mod.appendEscapedUuid(&lookup_sql, self.allocator, self.config.source_id);
         try lookup_sql.appendSlice(self.allocator, " AND lsn=");
         try query_mod.appendIntValue(&lookup_sql, self.allocator, lsn);
+        try lookup_sql.appendSlice(self.allocator, " AND committed_at=");
+        try query_mod.appendTimestamp(&lookup_sql, self.allocator, self.current_txn_timestamp);
 
         const lookup_result = try self.dest.simpleQuery(lookup_sql.items);
         if (lookup_result.column_count > 0 and lookup_result.columns[0].data.len > 0) {
@@ -327,7 +333,8 @@ pub const Processor = struct {
         var sql: std.ArrayListUnmanaged(u8) = .{};
         defer sql.deinit(self.allocator);
 
-        try sql.appendSlice(self.allocator,
+        try sql.appendSlice(
+            self.allocator,
             "INSERT INTO relation_snapshots (source_id, lsn, rel_oid, schema_name, table_name, replica_identity, columns) VALUES (",
         );
         try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
@@ -404,8 +411,9 @@ pub const Processor = struct {
         var sql: std.ArrayListUnmanaged(u8) = .{};
         defer sql.deinit(self.allocator);
 
-        try sql.appendSlice(self.allocator,
-            "INSERT INTO events (transaction_id, rel_oid, type, " ++
+        try sql.appendSlice(
+            self.allocator,
+            "INSERT INTO events (transaction_id, committed_at, rel_oid, type, " ++
                 "identity_digest, previous_identity_digest, data, old_data) VALUES (",
         );
 
@@ -417,8 +425,14 @@ pub const Processor = struct {
             try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
             try sql.appendSlice(self.allocator, " AND lsn=");
             try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
+            try sql.appendSlice(self.allocator, " AND committed_at=");
+            try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
             try sql.append(self.allocator, ')');
         }
+        try sql.appendSlice(self.allocator, ", ");
+
+        // committed_at
+        try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
         try sql.appendSlice(self.allocator, ", ");
 
         // rel_oid
@@ -459,8 +473,9 @@ pub const Processor = struct {
         var sql: std.ArrayListUnmanaged(u8) = .{};
         defer sql.deinit(self.allocator);
 
-        try sql.appendSlice(self.allocator,
-            "INSERT INTO events (transaction_id, rel_oid, type, data, old_data) VALUES (",
+        try sql.appendSlice(
+            self.allocator,
+            "INSERT INTO events (transaction_id, committed_at, rel_oid, type, data, old_data) VALUES (",
         );
 
         // transaction_id
@@ -471,9 +486,13 @@ pub const Processor = struct {
             try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
             try sql.appendSlice(self.allocator, " AND lsn=");
             try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
+            try sql.appendSlice(self.allocator, " AND committed_at=");
+            try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
             try sql.append(self.allocator, ')');
         }
 
+        try sql.appendSlice(self.allocator, ", ");
+        try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
         try sql.appendSlice(self.allocator, ", 0, 'T', NULL, NULL)");
 
         try self.dest.execLarge(self.allocator, sql.items);
