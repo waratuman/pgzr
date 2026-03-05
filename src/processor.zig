@@ -39,6 +39,11 @@ pub const Processor = struct {
     metadata_chunks: std.ArrayListUnmanaged([]u8),
     metadata_table_oid: ?u32,
 
+    // Streaming event buffer (proto v2+): events are deferred until
+    // stream_commit when the commit timestamp becomes available.
+    is_streaming_txn: bool,
+    pending_stream_events: std.ArrayListUnmanaged([]u8),
+
     // Stop flag for graceful shutdown
     stop_flag: std.atomic.Value(bool),
 
@@ -95,6 +100,8 @@ pub const Processor = struct {
             .pending_batch_ids = .{},
             .metadata_chunks = .{},
             .metadata_table_oid = null,
+            .is_streaming_txn = false,
+            .pending_stream_events = .{},
             .stop_flag = std.atomic.Value(bool).init(false),
         };
     }
@@ -246,6 +253,8 @@ pub const Processor = struct {
                 .insert => |ins| {
                     if (self.isMetadataTable(ins.relation_oid)) {
                         try self.extractMetadataFromTuple(ins.relation_oid, ins.new_tuple);
+                    } else if (self.is_streaming_txn) {
+                        try self.bufferStreamEvent(ins.relation_oid, 'I', ins.new_tuple, null);
                     } else {
                         try self.insertEvent(ins.relation_oid, 'I', ins.new_tuple, null);
                     }
@@ -253,34 +262,61 @@ pub const Processor = struct {
                 .update => |upd| {
                     if (self.isMetadataTable(upd.relation_oid)) {
                         try self.extractMetadataFromTuple(upd.relation_oid, upd.new_tuple);
+                    } else if (self.is_streaming_txn) {
+                        try self.bufferStreamEvent(upd.relation_oid, 'U', upd.new_tuple, upd.old_tuple);
                     } else {
                         try self.insertEvent(upd.relation_oid, 'U', upd.new_tuple, upd.old_tuple);
                     }
                 },
                 .delete => |del| {
                     if (!self.isMetadataTable(del.relation_oid)) {
-                        try self.insertEvent(del.relation_oid, 'D', null, del.old_tuple);
+                        if (self.is_streaming_txn) {
+                            try self.bufferStreamEvent(del.relation_oid, 'D', null, del.old_tuple);
+                        } else {
+                            try self.insertEvent(del.relation_oid, 'D', null, del.old_tuple);
+                        }
                     }
                 },
                 .truncate => {
-                    try self.insertTruncateEvent();
+                    if (self.is_streaming_txn) {
+                        try self.bufferStreamEvent(0, 'T', null, null);
+                    } else {
+                        try self.insertTruncateEvent();
+                    }
                 },
-                // Proto v2: streaming
+                // Proto v2: streaming — events and metadata are buffered
+                // during stream chunks and flushed at commit time when
+                // the commit LSN and timestamp become available.
                 .stream_start => |ss| {
                     self.current_stream_xid = ss.xid;
+                    if (ss.first_segment) {
+                        self.current_txn_xid = ss.xid;
+                        self.in_transaction = true;
+                        self.is_streaming_txn = true;
+                        self.clearMetadataChunks();
+                        self.clearPendingStreamEvents();
+                    }
                 },
                 .stream_stop => {
                     self.current_stream_xid = null;
                 },
-                .stream_commit => {
+                .stream_commit => |sc| {
+                    self.current_txn_lsn = sc.lsn;
+                    self.current_txn_timestamp = sc.timestamp;
+                    self.current_txn_id = try self.insertTransaction(sc.lsn);
+                    try self.flushStreamEvents();
                     try self.flushMetadata();
                     self.current_stream_xid = null;
                     self.in_transaction = false;
+                    self.is_streaming_txn = false;
                     self.current_txn_id = null;
                 },
                 .stream_abort => {
+                    self.clearMetadataChunks();
+                    self.clearPendingStreamEvents();
                     self.current_stream_xid = null;
                     self.in_transaction = false;
+                    self.is_streaming_txn = false;
                     self.current_txn_id = null;
                 },
                 // Proto v3: two-phase commit
@@ -739,6 +775,133 @@ pub const Processor = struct {
         self.clearMetadataChunks();
     }
 
+    /// Buffer an event's value fragment during a streaming transaction.
+    /// The fragment contains everything except transaction_id and committed_at,
+    /// which are filled in at stream_commit time by flushStreamEvents.
+    fn bufferStreamEvent(
+        self: *Processor,
+        relation_oid: u32,
+        event_type: u8,
+        tuple: ?[]const pgoutput.ColumnData,
+        old_tuple: ?[]const pgoutput.ColumnData,
+    ) !void {
+        const rel = if (relation_oid != 0) self.relations.get(relation_oid) else null;
+
+        // Compute identity digests
+        const identity_digest = if (rel) |r| blk: {
+            break :blk if (tuple) |t|
+                try self.computeIdentityDigest(r, t)
+            else if (old_tuple) |ot|
+                try self.computeIdentityDigest(r, ot)
+            else
+                null;
+        } else null;
+        defer if (identity_digest) |d| self.allocator.free(d);
+
+        const prev_identity_digest = if (rel) |r| blk: {
+            break :blk if (old_tuple) |ot|
+                try self.computeIdentityDigest(r, ot)
+            else
+                null;
+        } else null;
+        defer if (prev_identity_digest) |d| self.allocator.free(d);
+
+        var frag: std.ArrayListUnmanaged(u8) = .{};
+        errdefer frag.deinit(self.allocator);
+
+        // rel_oid
+        try query_mod.appendIntValue(&frag, self.allocator, relation_oid);
+        try frag.appendSlice(self.allocator, ", '");
+        try frag.append(self.allocator, event_type);
+        try frag.appendSlice(self.allocator, "', ");
+
+        // identity_digest
+        try query_mod.appendByteaOrNull(&frag, self.allocator, identity_digest);
+        try frag.appendSlice(self.allocator, ", ");
+
+        // previous_identity_digest
+        try query_mod.appendByteaOrNull(&frag, self.allocator, prev_identity_digest);
+        try frag.appendSlice(self.allocator, ", ");
+
+        // data JSONB
+        if (rel) |r| {
+            if (tuple) |t| {
+                try self.appendTupleAsJsonb(&frag, r, t);
+            } else {
+                try frag.appendSlice(self.allocator, "NULL");
+            }
+        } else {
+            try frag.appendSlice(self.allocator, "NULL");
+        }
+        try frag.appendSlice(self.allocator, ", ");
+
+        // old_data JSONB
+        if (rel) |r| {
+            if (old_tuple) |ot| {
+                try self.appendTupleAsJsonb(&frag, r, ot);
+            } else {
+                try frag.appendSlice(self.allocator, "NULL");
+            }
+        } else {
+            try frag.appendSlice(self.allocator, "NULL");
+        }
+
+        const owned = try frag.toOwnedSlice(self.allocator);
+        try self.pending_stream_events.append(self.allocator, owned);
+    }
+
+    /// Insert all buffered streaming events with the now-known transaction_id
+    /// and committed_at timestamp.
+    fn flushStreamEvents(self: *Processor) !void {
+        if (self.pending_stream_events.items.len == 0) return;
+
+        var sql: std.ArrayListUnmanaged(u8) = .{};
+        defer sql.deinit(self.allocator);
+
+        try sql.appendSlice(
+            self.allocator,
+            "INSERT INTO events (transaction_id, committed_at, rel_oid, type, " ++
+                "identity_digest, previous_identity_digest, data, old_data) VALUES ",
+        );
+
+        for (self.pending_stream_events.items, 0..) |frag, i| {
+            if (i > 0) try sql.appendSlice(self.allocator, ", ");
+            try sql.append(self.allocator, '(');
+
+            // transaction_id
+            if (self.current_txn_id) |txn_id| {
+                try query_mod.appendIntValue(&sql, self.allocator, txn_id);
+            } else {
+                try sql.appendSlice(self.allocator, "(SELECT id FROM transactions WHERE source_id=");
+                try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
+                try sql.appendSlice(self.allocator, " AND lsn=");
+                try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
+                try sql.appendSlice(self.allocator, " AND committed_at=");
+                try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
+                try sql.append(self.allocator, ')');
+            }
+            try sql.appendSlice(self.allocator, ", ");
+
+            // committed_at
+            try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
+            try sql.appendSlice(self.allocator, ", ");
+
+            // rest of the values (rel_oid, type, digests, data, old_data)
+            try sql.appendSlice(self.allocator, frag);
+            try sql.append(self.allocator, ')');
+        }
+
+        try self.dest.execLarge(self.allocator, sql.items);
+        self.clearPendingStreamEvents();
+    }
+
+    fn clearPendingStreamEvents(self: *Processor) void {
+        for (self.pending_stream_events.items) |frag| {
+            self.allocator.free(frag);
+        }
+        self.pending_stream_events.clearRetainingCapacity();
+    }
+
     fn decodeBytea(self: *Processor, hex_data: []const u8) ![]u8 {
         if (hex_data.len < 2 or hex_data[0] != '\\' or hex_data[1] != 'x') {
             const copy = try self.allocator.alloc(u8, hex_data.len);
@@ -806,6 +969,8 @@ pub const Processor = struct {
         self.pending_batch_ids.deinit(self.allocator);
         self.clearMetadataChunks();
         self.metadata_chunks.deinit(self.allocator);
+        self.clearPendingStreamEvents();
+        self.pending_stream_events.deinit(self.allocator);
         self.dest.close();
     }
 };

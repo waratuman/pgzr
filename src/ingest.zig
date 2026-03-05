@@ -102,8 +102,8 @@ pub const Ingestor = struct {
             }
             self.batch_end_lsn = wal_msg.wal_start;
 
-            // Track transaction boundaries
-            if (data[0] == 'B') {
+            // Track transaction boundaries (Begin or StreamStart)
+            if (data[0] == 'B' or data[0] == 'S') {
                 self.in_transaction = true;
             }
 

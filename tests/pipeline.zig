@@ -784,6 +784,345 @@ fn testMetadataViaTable(allocator: std.mem.Allocator) !void {
 }
 
 // =========================================================================
+// Test 8: Proto v2 streaming — events buffered until commit
+// =========================================================================
+fn testStreamingEvents(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: proto v2 streaming events... ", .{});
+
+    // Set low work_mem to force streaming for small transactions
+    runPsql(allocator, SOURCE_DB, "ALTER SYSTEM SET logical_decoding_work_mem = '64kB'") catch {};
+    runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+
+    // Clear dest
+    runPsql(
+        allocator,
+        DEST_DB,
+        "TRUNCATE events, relation_snapshots, transactions, wal_batches CASCADE",
+    ) catch {};
+    runPsql(allocator, SOURCE_DB, "TRUNCATE items RESTART IDENTITY") catch {};
+
+    // Insert enough data to exceed logical_decoding_work_mem (64kB)
+    try runPsql(allocator, SOURCE_DB,
+        \\BEGIN;
+        \\INSERT INTO items (name, quantity) SELECT repeat('x', 1000) || g, g FROM generate_series(1, 100) g;
+        \\COMMIT;
+    );
+
+    const end_lsn = getCurrentWalLsn(allocator) catch |err| {
+        std.debug.print("FAIL (get LSN: {})\n", .{err});
+        return err;
+    };
+
+    // Ingest with proto v2 + streaming
+    var ingestor = pgzr.Ingestor.init(allocator, .{
+        .source = .{
+            .conn = sourceConnConfig(),
+            .slot_name = SLOT_NAME,
+            .end_position = end_lsn,
+            .options = &.{
+                .{ "proto_version", "2" },
+                .{ "publication_names", PUB_NAME },
+                .{ "streaming", "on" },
+            },
+        },
+        .dest = destConnConfig(),
+        .source_id = SOURCE_ID,
+    }) catch |err| {
+        std.debug.print("FAIL (init ingestor: {})\n", .{err});
+        // Reset work_mem before returning
+        runPsql(allocator, SOURCE_DB, "ALTER SYSTEM RESET logical_decoding_work_mem") catch {};
+        runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+        return err;
+    };
+    defer ingestor.deinit();
+
+    ingestor.run() catch |err| {
+        std.debug.print("FAIL (ingestor run: {})\n", .{err});
+        runPsql(allocator, SOURCE_DB, "ALTER SYSTEM RESET logical_decoding_work_mem") catch {};
+        runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+        return err;
+    };
+
+    // Process
+    var processor = pgzr.Processor.init(allocator, .{
+        .dest = destConnConfig(),
+        .source_id = SOURCE_ID,
+    }) catch |err| {
+        std.debug.print("FAIL (init processor: {})\n", .{err});
+        runPsql(allocator, SOURCE_DB, "ALTER SYSTEM RESET logical_decoding_work_mem") catch {};
+        runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+        return err;
+    };
+    defer processor.deinit();
+
+    var batch_count: u32 = 0;
+    while (true) {
+        const processed = processor.processOne() catch |err| {
+            std.debug.print("FAIL (processOne: {})\n", .{err});
+            runPsql(allocator, SOURCE_DB, "ALTER SYSTEM RESET logical_decoding_work_mem") catch {};
+            runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+            return err;
+        };
+        if (!processed) break;
+        batch_count += 1;
+        if (batch_count > 100) break;
+    }
+
+    // Reset work_mem
+    runPsql(allocator, SOURCE_DB, "ALTER SYSTEM RESET logical_decoding_work_mem") catch {};
+    runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+
+    // Verify transaction created
+    const txn_count = try queryCount(
+        allocator,
+        DEST_DB,
+        "SELECT count(*) FROM transactions",
+    );
+    if (txn_count == 0) {
+        std.debug.print("FAIL (no transactions)\n", .{});
+        return error.ServerError;
+    }
+
+    // Verify all events captured
+    const event_count = try queryCount(
+        allocator,
+        DEST_DB,
+        "SELECT count(*) FROM events WHERE type='I'",
+    );
+    if (event_count < 100) {
+        std.debug.print("FAIL (expected >= 100 insert events, got {d})\n", .{event_count});
+        return error.ServerError;
+    }
+
+    std.debug.print("OK ({d} txn, {d} events, {d} batches)\n", .{ txn_count, event_count, batch_count });
+}
+
+// =========================================================================
+// Test 9: Proto v2 streaming — metadata via pg_logical_emit_message
+// =========================================================================
+fn testStreamingMetadataViaMessage(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: proto v2 streaming with metadata via message... ", .{});
+
+    // Set low work_mem to force streaming
+    runPsql(allocator, SOURCE_DB, "ALTER SYSTEM SET logical_decoding_work_mem = '64kB'") catch {};
+    runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+
+    // Clear dest
+    runPsql(
+        allocator,
+        DEST_DB,
+        "TRUNCATE events, relation_snapshots, transactions, wal_batches CASCADE",
+    ) catch {};
+    runPsql(allocator, SOURCE_DB, "TRUNCATE items RESTART IDENTITY") catch {};
+
+    // Insert with metadata + enough data to trigger streaming
+    try runPsql(allocator, SOURCE_DB,
+        \\BEGIN;
+        \\SELECT pg_logical_emit_message(true, 'test_metadata', '{"stream_test":true,"user":{"id":99}}');
+        \\INSERT INTO items (name, quantity) SELECT repeat('y', 1000) || g, g FROM generate_series(1, 100) g;
+        \\COMMIT;
+    );
+
+    const end_lsn = getCurrentWalLsn(allocator) catch |err| {
+        std.debug.print("FAIL (get LSN: {})\n", .{err});
+        return err;
+    };
+
+    // Ingest with proto v2 + streaming + messages
+    var ingestor = pgzr.Ingestor.init(allocator, .{
+        .source = .{
+            .conn = sourceConnConfig(),
+            .slot_name = SLOT_NAME,
+            .end_position = end_lsn,
+            .options = &.{
+                .{ "proto_version", "2" },
+                .{ "publication_names", PUB_NAME },
+                .{ "streaming", "on" },
+                .{ "messages", "true" },
+            },
+        },
+        .dest = destConnConfig(),
+        .source_id = SOURCE_ID,
+    }) catch |err| {
+        std.debug.print("FAIL (init ingestor: {})\n", .{err});
+        runPsql(allocator, SOURCE_DB, "ALTER SYSTEM RESET logical_decoding_work_mem") catch {};
+        runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+        return err;
+    };
+    defer ingestor.deinit();
+
+    ingestor.run() catch |err| {
+        std.debug.print("FAIL (ingestor run: {})\n", .{err});
+        runPsql(allocator, SOURCE_DB, "ALTER SYSTEM RESET logical_decoding_work_mem") catch {};
+        runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+        return err;
+    };
+
+    // Process with metadata prefix
+    var processor = pgzr.Processor.init(allocator, .{
+        .dest = destConnConfig(),
+        .source_id = SOURCE_ID,
+        .metadata_message_prefix = "test_metadata",
+    }) catch |err| {
+        std.debug.print("FAIL (init processor: {})\n", .{err});
+        runPsql(allocator, SOURCE_DB, "ALTER SYSTEM RESET logical_decoding_work_mem") catch {};
+        runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+        return err;
+    };
+    defer processor.deinit();
+
+    var batch_count: u32 = 0;
+    while (true) {
+        const processed = processor.processOne() catch |err| {
+            std.debug.print("FAIL (processOne: {})\n", .{err});
+            runPsql(allocator, SOURCE_DB, "ALTER SYSTEM RESET logical_decoding_work_mem") catch {};
+            runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+            return err;
+        };
+        if (!processed) break;
+        batch_count += 1;
+        if (batch_count > 100) break;
+    }
+
+    // Reset work_mem
+    runPsql(allocator, SOURCE_DB, "ALTER SYSTEM RESET logical_decoding_work_mem") catch {};
+    runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+
+    // Verify metadata
+    const meta_count = try queryCount(
+        allocator,
+        DEST_DB,
+        "SELECT count(*) FROM transactions WHERE metadata IS NOT NULL",
+    );
+    if (meta_count == 0) {
+        std.debug.print("FAIL (no transactions with metadata)\n", .{});
+        return error.ServerError;
+    }
+
+    const user_meta = try queryCount(
+        allocator,
+        DEST_DB,
+        "SELECT count(*) FROM transactions WHERE metadata->'user'->>'id' = '99'",
+    );
+    if (user_meta == 0) {
+        std.debug.print("FAIL (metadata missing user.id=99)\n", .{});
+        return error.ServerError;
+    }
+
+    // Verify events
+    const event_count = try queryCount(
+        allocator,
+        DEST_DB,
+        "SELECT count(*) FROM events WHERE type='I'",
+    );
+    if (event_count < 100) {
+        std.debug.print("FAIL (expected >= 100 insert events, got {d})\n", .{event_count});
+        return error.ServerError;
+    }
+
+    std.debug.print("OK ({d} txn with metadata, {d} events, {d} batches)\n", .{ meta_count, event_count, batch_count });
+}
+
+// =========================================================================
+// Test 10: Proto v4 — metadata via pg_logical_emit_message
+// =========================================================================
+fn testProtoV4MetadataViaMessage(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: proto v4 with metadata via message... ", .{});
+
+    // Clear dest
+    runPsql(
+        allocator,
+        DEST_DB,
+        "TRUNCATE events, relation_snapshots, transactions, wal_batches CASCADE",
+    ) catch {};
+    runPsql(allocator, SOURCE_DB, "TRUNCATE items RESTART IDENTITY") catch {};
+
+    // Insert with metadata
+    try runPsql(allocator, SOURCE_DB,
+        \\BEGIN;
+        \\SELECT pg_logical_emit_message(true, 'test_metadata', '{"proto":"v4","version":4}');
+        \\INSERT INTO items (name, quantity) VALUES ('v4_test', 44);
+        \\COMMIT;
+    );
+
+    const end_lsn = getCurrentWalLsn(allocator) catch |err| {
+        std.debug.print("FAIL (get LSN: {})\n", .{err});
+        return err;
+    };
+
+    // Ingest with proto v4 + messages
+    var ingestor = pgzr.Ingestor.init(allocator, .{
+        .source = .{
+            .conn = sourceConnConfig(),
+            .slot_name = SLOT_NAME,
+            .end_position = end_lsn,
+            .options = &.{
+                .{ "proto_version", "4" },
+                .{ "publication_names", PUB_NAME },
+                .{ "messages", "true" },
+            },
+        },
+        .dest = destConnConfig(),
+        .source_id = SOURCE_ID,
+    }) catch |err| {
+        std.debug.print("FAIL (init ingestor: {})\n", .{err});
+        return err;
+    };
+    defer ingestor.deinit();
+
+    ingestor.run() catch |err| {
+        std.debug.print("FAIL (ingestor run: {})\n", .{err});
+        return err;
+    };
+
+    // Process with metadata prefix
+    var processor = pgzr.Processor.init(allocator, .{
+        .dest = destConnConfig(),
+        .source_id = SOURCE_ID,
+        .metadata_message_prefix = "test_metadata",
+    }) catch |err| {
+        std.debug.print("FAIL (init processor: {})\n", .{err});
+        return err;
+    };
+    defer processor.deinit();
+
+    var batch_count: u32 = 0;
+    while (true) {
+        const processed = processor.processOne() catch |err| {
+            std.debug.print("FAIL (processOne: {})\n", .{err});
+            return err;
+        };
+        if (!processed) break;
+        batch_count += 1;
+        if (batch_count > 100) break;
+    }
+
+    // Verify metadata
+    const meta_count = try queryCount(
+        allocator,
+        DEST_DB,
+        "SELECT count(*) FROM transactions WHERE metadata IS NOT NULL AND metadata->>'proto' = 'v4'",
+    );
+    if (meta_count == 0) {
+        std.debug.print("FAIL (no transactions with v4 metadata)\n", .{});
+        return error.ServerError;
+    }
+
+    // Verify events
+    const event_count = try queryCount(
+        allocator,
+        DEST_DB,
+        "SELECT count(*) FROM events WHERE type='I'",
+    );
+    if (event_count == 0) {
+        std.debug.print("FAIL (no insert events)\n", .{});
+        return error.ServerError;
+    }
+
+    std.debug.print("OK ({d} txn with metadata, {d} events)\n", .{ meta_count, event_count });
+}
+
+// =========================================================================
 // Main
 // =========================================================================
 pub fn main() !void {
@@ -828,6 +1167,18 @@ pub fn main() !void {
     };
 
     testMetadataViaTable(allocator) catch {
+        failures += 1;
+    };
+
+    testStreamingEvents(allocator) catch {
+        failures += 1;
+    };
+
+    testStreamingMetadataViaMessage(allocator) catch {
+        failures += 1;
+    };
+
+    testProtoV4MetadataViaMessage(allocator) catch {
         failures += 1;
     };
 
