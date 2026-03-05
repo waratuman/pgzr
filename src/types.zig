@@ -70,6 +70,10 @@ pub const ProcessorConfig = struct {
     batch_limit: u32 = 10,
     /// Polling interval in milliseconds when no pending batches are found.
     poll_interval_ms: u64 = 1_000,
+    /// Prefix for pg_logical_emit_message metadata. null = disabled.
+    metadata_message_prefix: ?[]const u8 = null,
+    /// Source table name for metadata upserts. null = disabled.
+    metadata_table: ?[]const u8 = null,
 };
 
 pub const RelationColumnInfo = struct {

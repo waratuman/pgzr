@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     lsn             BIGINT NOT NULL,
     xid             INTEGER NOT NULL,
     committed_at    TIMESTAMPTZ NOT NULL,
+    metadata        JSONB,
     PRIMARY KEY (id, committed_at),
     UNIQUE (source_id, lsn, committed_at)
 ) PARTITION BY RANGE (committed_at);
@@ -61,6 +62,7 @@ CREATE TABLE IF NOT EXISTS transactions_default
 | `lsn`         | Commit LSN of the transaction on the source |
 | `xid`         | Transaction ID (XID) on the source |
 | `committed_at`| Commit timestamp from the source WAL (partition key) |
+| `metadata`    | Application-provided JSONB metadata attached to the transaction (see [Metadata](#metadata)) |
 
 ## relation_snapshots
 
@@ -187,6 +189,65 @@ JOIN LATERAL (
     ORDER BY lsn DESC LIMIT 1
 ) rs ON true
 WHERE e.transaction_id = $1;
+```
+
+## Metadata
+
+Applications can attach arbitrary JSON metadata to transactions (e.g., the
+user who made the change, a request ID). The Processor supports two
+mechanisms for capturing metadata; both are opt-in via `ProcessorConfig`.
+
+### Via `pg_logical_emit_message`
+
+Set `metadata_message_prefix` in the Processor config. The application calls
+`pg_logical_emit_message` within a transaction on the source database:
+
+```sql
+BEGIN;
+SELECT pg_logical_emit_message(true, 'my_prefix', '{"user":{"id":1,"name":"Alice"}}');
+INSERT INTO orders (item, qty) VALUES ('widget', 10);
+COMMIT;
+```
+
+The Processor matches the message prefix and stores the JSON content in
+`transactions.metadata`.
+
+### Via metadata table
+
+Set `metadata_table` in the Processor config. The application creates a table
+on the source (included in the publication) and upserts metadata within
+transactions:
+
+```sql
+CREATE TABLE my_metadata (version int PRIMARY KEY, data jsonb DEFAULT '{}');
+
+BEGIN;
+INSERT INTO orders (item, qty) VALUES ('widget', 10);
+INSERT INTO my_metadata (version, data)
+    VALUES (1, '{"user":{"id":1,"name":"Alice"}}')
+    ON CONFLICT (version) DO UPDATE SET data = EXCLUDED.data;
+COMMIT;
+```
+
+The Processor recognizes writes to this table, extracts the `data` column,
+and stores it in `transactions.metadata`. Writes to the metadata table are
+**not** stored as events.
+
+### Merging
+
+If both mechanisms are used in the same transaction (or multiple metadata
+sources appear), the JSON objects are merged using PostgreSQL's `||` operator
+(shallow merge, later values win).
+
+### Querying metadata
+
+```sql
+-- Find events where the transaction has user metadata
+SELECT e.*, t.metadata
+FROM events e
+JOIN transactions t ON t.id = e.transaction_id AND t.committed_at = e.committed_at
+WHERE t.metadata IS NOT NULL
+  AND t.metadata->'user'->>'id' = '1';
 ```
 
 ## Partitioning

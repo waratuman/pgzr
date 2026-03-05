@@ -179,6 +179,8 @@ pub const PgzrProcessorConfig = extern struct {
     dest_tls_mode: u8,
     source_id: ?[*:0]const u8,
     poll_interval_ms: u32,
+    metadata_message_prefix: ?[*:0]const u8,
+    metadata_table: ?[*:0]const u8,
 };
 
 export fn pgzr_processor_new(config: *const PgzrProcessorConfig) ?*Processor {
@@ -195,10 +197,15 @@ export fn pgzr_processor_new(config: *const PgzrProcessorConfig) ?*Processor {
     );
     dest_conn.replication = false;
 
+    const msg_prefix = sliceFromCStr(config.metadata_message_prefix);
+    const meta_table = sliceFromCStr(config.metadata_table);
+
     const processor_config = types.ProcessorConfig{
         .dest = dest_conn,
         .source_id = sliceFromCStr(config.source_id),
         .poll_interval_ms = if (config.poll_interval_ms > 0) config.poll_interval_ms else 1_000,
+        .metadata_message_prefix = if (msg_prefix.len > 0) msg_prefix else null,
+        .metadata_table = if (meta_table.len > 0) meta_table else null,
     };
 
     const processor = allocator.create(Processor) catch {

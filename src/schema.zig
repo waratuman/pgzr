@@ -22,6 +22,7 @@ pub const create_transactions =
     \\    lsn             BIGINT NOT NULL,
     \\    xid             INTEGER NOT NULL,
     \\    committed_at    TIMESTAMPTZ NOT NULL,
+    \\    metadata        JSONB,
     \\    PRIMARY KEY (id, committed_at),
     \\    UNIQUE (source_id, lsn, committed_at)
     \\) PARTITION BY RANGE (committed_at)

@@ -96,23 +96,33 @@ fn setup(allocator: std.mem.Allocator) !void {
     runCmd(allocator, &.{ "createdb", DEST_DB });
 
     // Create test table in source
-    runPsql(allocator, SOURCE_DB,
+    runPsql(
+        allocator,
+        SOURCE_DB,
         "CREATE TABLE IF NOT EXISTS items (id serial PRIMARY KEY, name text NOT NULL, quantity int NOT NULL DEFAULT 0)",
     ) catch {};
 
     // Create publication (drop first if exists)
-    runPsql(allocator, SOURCE_DB,
+    runPsql(
+        allocator,
+        SOURCE_DB,
         "DROP PUBLICATION IF EXISTS " ++ PUB_NAME,
     ) catch {};
-    try runPsql(allocator, SOURCE_DB,
+    try runPsql(
+        allocator,
+        SOURCE_DB,
         "CREATE PUBLICATION " ++ PUB_NAME ++ " FOR TABLE items",
     );
 
     // Drop slot if it exists, then create it
-    runPsql(allocator, SOURCE_DB,
+    runPsql(
+        allocator,
+        SOURCE_DB,
         "SELECT pg_drop_replication_slot('" ++ SLOT_NAME ++ "')",
     ) catch {};
-    try runPsql(allocator, SOURCE_DB,
+    try runPsql(
+        allocator,
+        SOURCE_DB,
         "SELECT pg_create_logical_replication_slot('" ++ SLOT_NAME ++ "', 'pgoutput')",
     );
 
@@ -136,10 +146,14 @@ fn setup(allocator: std.mem.Allocator) !void {
 
 fn teardown(allocator: std.mem.Allocator) void {
     std.Thread.sleep(200 * std.time.ns_per_ms);
-    runPsql(allocator, SOURCE_DB,
+    runPsql(
+        allocator,
+        SOURCE_DB,
         "SELECT pg_drop_replication_slot('" ++ SLOT_NAME ++ "')",
     ) catch {};
-    runPsql(allocator, SOURCE_DB,
+    runPsql(
+        allocator,
+        SOURCE_DB,
         "DROP PUBLICATION IF EXISTS " ++ PUB_NAME,
     ) catch {};
     runCmd(allocator, &.{ "dropdb", "--if-exists", "--force", SOURCE_DB });
@@ -153,7 +167,9 @@ fn testIngestStoresBatches(allocator: std.mem.Allocator) !void {
     std.debug.print("  Test: ingest stores WAL batches... ", .{});
 
     // Insert data into source
-    try runPsql(allocator, SOURCE_DB,
+    try runPsql(
+        allocator,
+        SOURCE_DB,
         "INSERT INTO items (name, quantity) VALUES ('widget', 10), ('gadget', 5)",
     );
 
@@ -188,7 +204,9 @@ fn testIngestStoresBatches(allocator: std.mem.Allocator) !void {
     };
 
     // Verify batches were stored in dest
-    const count = try queryCount(allocator, DEST_DB,
+    const count = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM wal_batches WHERE source_id='" ++ SOURCE_ID ++ "'",
     );
     if (count == 0) {
@@ -197,7 +215,9 @@ fn testIngestStoresBatches(allocator: std.mem.Allocator) !void {
     }
 
     // Verify all batches are complete
-    const incomplete_count = try queryCount(allocator, DEST_DB,
+    const incomplete_count = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM wal_batches WHERE source_id='" ++ SOURCE_ID ++ "' AND complete = false",
     );
     if (incomplete_count > 0) {
@@ -245,7 +265,9 @@ fn testProcessorParsesBatches(allocator: std.mem.Allocator) !void {
     }
 
     // Verify transactions were created
-    const txn_count = try queryCount(allocator, DEST_DB,
+    const txn_count = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM transactions WHERE source_id='" ++ SOURCE_ID ++ "'",
     );
     if (txn_count == 0) {
@@ -254,7 +276,9 @@ fn testProcessorParsesBatches(allocator: std.mem.Allocator) !void {
     }
 
     // Verify events were created (2 inserts)
-    const event_count = try queryCount(allocator, DEST_DB,
+    const event_count = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM events WHERE type='I'",
     );
     if (event_count != 2) {
@@ -263,7 +287,9 @@ fn testProcessorParsesBatches(allocator: std.mem.Allocator) !void {
     }
 
     // Verify events have JSONB data
-    const data_count = try queryCount(allocator, DEST_DB,
+    const data_count = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM events WHERE data IS NOT NULL AND data != 'null'::jsonb",
     );
     if (data_count != 2) {
@@ -272,7 +298,9 @@ fn testProcessorParsesBatches(allocator: std.mem.Allocator) !void {
     }
 
     // Verify relation_snapshots were created
-    const snapshot_count = try queryCount(allocator, DEST_DB,
+    const snapshot_count = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM relation_snapshots WHERE source_id='" ++ SOURCE_ID ++ "'",
     );
     if (snapshot_count == 0) {
@@ -281,7 +309,9 @@ fn testProcessorParsesBatches(allocator: std.mem.Allocator) !void {
     }
 
     // Verify batches were cleaned up (deleted after processing)
-    const remaining_count = try queryCount(allocator, DEST_DB,
+    const remaining_count = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM wal_batches WHERE source_id='" ++ SOURCE_ID ++ "'",
     );
     if (remaining_count > 0) {
@@ -302,13 +332,19 @@ fn testUpdateAndDelete(allocator: std.mem.Allocator) !void {
     runPsql(allocator, SOURCE_DB, "ALTER TABLE items REPLICA IDENTITY FULL") catch {};
 
     // Insert, update, delete
-    try runPsql(allocator, SOURCE_DB,
+    try runPsql(
+        allocator,
+        SOURCE_DB,
         "INSERT INTO items (name, quantity) VALUES ('tempitem', 1)",
     );
-    try runPsql(allocator, SOURCE_DB,
+    try runPsql(
+        allocator,
+        SOURCE_DB,
         "UPDATE items SET quantity = 99 WHERE name = 'tempitem'",
     );
-    try runPsql(allocator, SOURCE_DB,
+    try runPsql(
+        allocator,
+        SOURCE_DB,
         "DELETE FROM items WHERE name = 'tempitem'",
     );
 
@@ -364,7 +400,9 @@ fn testUpdateAndDelete(allocator: std.mem.Allocator) !void {
     }
 
     // Verify events: inserts, updates, deletes
-    const insert_count = try queryCount(allocator, DEST_DB,
+    const insert_count = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM events WHERE type='I'",
     );
     // Previous test created 2 inserts, this test adds 1 more
@@ -373,7 +411,9 @@ fn testUpdateAndDelete(allocator: std.mem.Allocator) !void {
         return error.ServerError;
     }
 
-    const update_count = try queryCount(allocator, DEST_DB,
+    const update_count = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM events WHERE type='U'",
     );
     if (update_count < 1) {
@@ -381,7 +421,9 @@ fn testUpdateAndDelete(allocator: std.mem.Allocator) !void {
         return error.ServerError;
     }
 
-    const delete_count = try queryCount(allocator, DEST_DB,
+    const delete_count = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM events WHERE type='D'",
     );
     if (delete_count < 1) {
@@ -401,7 +443,9 @@ fn testJsonbValues(allocator: std.mem.Allocator) !void {
     std.debug.print("  Test: JSONB data values stored correctly... ", .{});
 
     // Check that update events have old_data set
-    const old_data_count = try queryCount(allocator, DEST_DB,
+    const old_data_count = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM events WHERE type='U' AND old_data IS NOT NULL AND old_data != 'null'::jsonb",
     );
     if (old_data_count == 0) {
@@ -410,7 +454,9 @@ fn testJsonbValues(allocator: std.mem.Allocator) !void {
     }
 
     // Verify data contains expected column names
-    const name_col_count = try queryCount(allocator, DEST_DB,
+    const name_col_count = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM events WHERE data ? 'name'",
     );
     if (name_col_count == 0) {
@@ -419,7 +465,9 @@ fn testJsonbValues(allocator: std.mem.Allocator) !void {
     }
 
     // Verify data contains expected column names
-    const quantity_col_count = try queryCount(allocator, DEST_DB,
+    const quantity_col_count = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM events WHERE data ? 'quantity'",
     );
     if (quantity_col_count == 0) {
@@ -428,7 +476,9 @@ fn testJsonbValues(allocator: std.mem.Allocator) !void {
     }
 
     // Verify delete events have old_data but no data
-    const delete_data_count = try queryCount(allocator, DEST_DB,
+    const delete_data_count = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM events WHERE type='D' AND old_data IS NOT NULL AND (data IS NULL)",
     );
     if (delete_data_count == 0) {
@@ -446,7 +496,9 @@ fn testRelationSnapshots(allocator: std.mem.Allocator) !void {
     std.debug.print("  Test: relation snapshots... ", .{});
 
     // Verify snapshot has columns JSONB
-    const snapshot_with_cols = try queryCount(allocator, DEST_DB,
+    const snapshot_with_cols = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM relation_snapshots WHERE jsonb_array_length(columns) > 0",
     );
     if (snapshot_with_cols == 0) {
@@ -465,7 +517,9 @@ fn testRelationSnapshots(allocator: std.mem.Allocator) !void {
     }
 
     // Verify snapshot table_name is 'items'
-    const items_snap = try queryCount(allocator, DEST_DB,
+    const items_snap = try queryCount(
+        allocator,
+        DEST_DB,
         "SELECT count(*) FROM relation_snapshots WHERE table_name = 'items'",
     );
     if (items_snap == 0) {
@@ -474,6 +528,259 @@ fn testRelationSnapshots(allocator: std.mem.Allocator) !void {
     }
 
     std.debug.print("OK ({d} snapshots with columns)\n", .{snapshot_with_cols});
+}
+
+// =========================================================================
+// Test 6: Metadata via pg_logical_emit_message
+// =========================================================================
+fn testMetadataViaMessage(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: metadata via pg_logical_emit_message... ", .{});
+
+    // Clear dest tables for a clean test
+    runPsql(
+        allocator,
+        DEST_DB,
+        "TRUNCATE events, relation_snapshots, transactions, wal_batches CASCADE",
+    ) catch {};
+
+    // Truncate items so we get a clean count
+    runPsql(allocator, SOURCE_DB, "TRUNCATE items RESTART IDENTITY") catch {};
+
+    // Insert data with a logical message in the same transaction
+    try runPsql(allocator, SOURCE_DB,
+        \\BEGIN;
+        \\SELECT pg_logical_emit_message(true, 'test_metadata', '{"user":{"id":42,"name":"Alice"}}');
+        \\INSERT INTO items (name, quantity) VALUES ('meta_widget', 7);
+        \\COMMIT;
+    );
+
+    // Get end LSN
+    const end_lsn = getCurrentWalLsn(allocator) catch |err| {
+        std.debug.print("FAIL (get LSN: {})\n", .{err});
+        return err;
+    };
+
+    // Ingest with messages=true to receive pg_logical_emit_message
+    var ingestor = pgzr.Ingestor.init(allocator, .{
+        .source = .{
+            .conn = sourceConnConfig(),
+            .slot_name = SLOT_NAME,
+            .end_position = end_lsn,
+            .options = &.{
+                .{ "proto_version", "1" },
+                .{ "publication_names", PUB_NAME },
+                .{ "messages", "true" },
+            },
+        },
+        .dest = destConnConfig(),
+        .source_id = SOURCE_ID,
+    }) catch |err| {
+        std.debug.print("FAIL (init ingestor: {})\n", .{err});
+        return err;
+    };
+    defer ingestor.deinit();
+
+    ingestor.run() catch |err| {
+        std.debug.print("FAIL (ingestor run: {})\n", .{err});
+        return err;
+    };
+
+    // Process with metadata_message_prefix configured
+    var processor = pgzr.Processor.init(allocator, .{
+        .dest = destConnConfig(),
+        .source_id = SOURCE_ID,
+        .metadata_message_prefix = "test_metadata",
+    }) catch |err| {
+        std.debug.print("FAIL (init processor: {})\n", .{err});
+        return err;
+    };
+    defer processor.deinit();
+
+    var batch_count: u32 = 0;
+    while (true) {
+        const processed = processor.processOne() catch |err| {
+            std.debug.print("FAIL (processOne: {})\n", .{err});
+            return err;
+        };
+        if (!processed) break;
+        batch_count += 1;
+        if (batch_count > 100) break;
+    }
+
+    // Verify transaction has metadata
+    const meta_count = try queryCount(
+        allocator,
+        DEST_DB,
+        "SELECT count(*) FROM transactions WHERE metadata IS NOT NULL",
+    );
+    if (meta_count == 0) {
+        std.debug.print("FAIL (no transactions with metadata)\n", .{});
+        return error.ServerError;
+    }
+
+    // Verify metadata content
+    const user_meta = try queryCount(
+        allocator,
+        DEST_DB,
+        "SELECT count(*) FROM transactions WHERE metadata->'user'->>'id' = '42'",
+    );
+    if (user_meta == 0) {
+        std.debug.print("FAIL (metadata missing user.id=42)\n", .{});
+        return error.ServerError;
+    }
+
+    // Verify the insert event was still created
+    const event_count = try queryCount(
+        allocator,
+        DEST_DB,
+        "SELECT count(*) FROM events WHERE type='I'",
+    );
+    if (event_count == 0) {
+        std.debug.print("FAIL (no insert events)\n", .{});
+        return error.ServerError;
+    }
+
+    std.debug.print("OK ({d} txn with metadata, {d} events)\n", .{ meta_count, event_count });
+}
+
+// =========================================================================
+// Test 7: Metadata via metadata table
+// =========================================================================
+fn testMetadataViaTable(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: metadata via metadata table... ", .{});
+
+    // Clear dest tables
+    runPsql(
+        allocator,
+        DEST_DB,
+        "TRUNCATE events, relation_snapshots, transactions, wal_batches CASCADE",
+    ) catch {};
+
+    // Truncate items
+    runPsql(allocator, SOURCE_DB, "TRUNCATE items RESTART IDENTITY") catch {};
+
+    // Create metadata table on source
+    runPsql(
+        allocator,
+        SOURCE_DB,
+        "CREATE TABLE IF NOT EXISTS test_metadata_table (version int PRIMARY KEY, data jsonb DEFAULT '{}')",
+    ) catch {};
+
+    // Add to publication
+    runPsql(
+        allocator,
+        SOURCE_DB,
+        "ALTER PUBLICATION " ++ PUB_NAME ++ " ADD TABLE test_metadata_table",
+    ) catch {};
+
+    // Insert data with metadata table upsert in same transaction
+    try runPsql(allocator, SOURCE_DB,
+        \\BEGIN;
+        \\INSERT INTO items (name, quantity) VALUES ('table_meta_widget', 3);
+        \\INSERT INTO test_metadata_table (version, data)
+        \\    VALUES (1, '{"request_id":"abc-123","actor":"Bob"}')
+        \\    ON CONFLICT (version) DO UPDATE SET data = EXCLUDED.data;
+        \\COMMIT;
+    );
+
+    // Get end LSN
+    const end_lsn = getCurrentWalLsn(allocator) catch |err| {
+        std.debug.print("FAIL (get LSN: {})\n", .{err});
+        return err;
+    };
+
+    // Ingest
+    var ingestor = pgzr.Ingestor.init(allocator, .{
+        .source = .{
+            .conn = sourceConnConfig(),
+            .slot_name = SLOT_NAME,
+            .end_position = end_lsn,
+            .options = &.{
+                .{ "proto_version", "1" },
+                .{ "publication_names", PUB_NAME },
+            },
+        },
+        .dest = destConnConfig(),
+        .source_id = SOURCE_ID,
+    }) catch |err| {
+        std.debug.print("FAIL (init ingestor: {})\n", .{err});
+        return err;
+    };
+    defer ingestor.deinit();
+
+    ingestor.run() catch |err| {
+        std.debug.print("FAIL (ingestor run: {})\n", .{err});
+        return err;
+    };
+
+    // Process with metadata_table configured
+    var processor = pgzr.Processor.init(allocator, .{
+        .dest = destConnConfig(),
+        .source_id = SOURCE_ID,
+        .metadata_table = "test_metadata_table",
+    }) catch |err| {
+        std.debug.print("FAIL (init processor: {})\n", .{err});
+        return err;
+    };
+    defer processor.deinit();
+
+    var batch_count: u32 = 0;
+    while (true) {
+        const processed = processor.processOne() catch |err| {
+            std.debug.print("FAIL (processOne: {})\n", .{err});
+            return err;
+        };
+        if (!processed) break;
+        batch_count += 1;
+        if (batch_count > 100) break;
+    }
+
+    // Verify transaction has metadata
+    const meta_count = try queryCount(
+        allocator,
+        DEST_DB,
+        "SELECT count(*) FROM transactions WHERE metadata IS NOT NULL",
+    );
+    if (meta_count == 0) {
+        std.debug.print("FAIL (no transactions with metadata)\n", .{});
+        return error.ServerError;
+    }
+
+    // Verify metadata content
+    const actor_meta = try queryCount(
+        allocator,
+        DEST_DB,
+        "SELECT count(*) FROM transactions WHERE metadata->>'actor' = 'Bob'",
+    );
+    if (actor_meta == 0) {
+        std.debug.print("FAIL (metadata missing actor=Bob)\n", .{});
+        return error.ServerError;
+    }
+
+    // Verify the metadata table write was NOT stored as an event
+    const meta_event_count = try queryCount(allocator, DEST_DB,
+        \\SELECT count(*) FROM events e
+        \\ JOIN relation_snapshots rs ON rs.source_id = '00000000-0000-0000-0000-000000000001'
+        \\   AND rs.table_name = 'test_metadata_table'
+        \\   AND rs.rel_oid = e.rel_oid
+    );
+    if (meta_event_count > 0) {
+        std.debug.print("FAIL (metadata table writes should not be stored as events, got {d})\n", .{meta_event_count});
+        return error.ServerError;
+    }
+
+    // Verify the items insert event WAS stored
+    const item_event_count = try queryCount(
+        allocator,
+        DEST_DB,
+        "SELECT count(*) FROM events WHERE type='I'",
+    );
+    if (item_event_count == 0) {
+        std.debug.print("FAIL (no insert events for items)\n", .{});
+        return error.ServerError;
+    }
+
+    std.debug.print("OK ({d} txn with metadata, {d} item events, 0 metadata table events)\n", .{ meta_count, item_event_count });
 }
 
 // =========================================================================
@@ -513,6 +820,14 @@ pub fn main() !void {
     };
 
     testRelationSnapshots(allocator) catch {
+        failures += 1;
+    };
+
+    testMetadataViaMessage(allocator) catch {
+        failures += 1;
+    };
+
+    testMetadataViaTable(allocator) catch {
         failures += 1;
     };
 

@@ -35,6 +35,10 @@ pub const Processor = struct {
     pending_data: std.ArrayListUnmanaged(u8),
     pending_batch_ids: std.ArrayListUnmanaged([]u8),
 
+    // Metadata accumulation (per-transaction)
+    metadata_chunks: std.ArrayListUnmanaged([]u8),
+    metadata_table_oid: ?u32,
+
     // Stop flag for graceful shutdown
     stop_flag: std.atomic.Value(bool),
 
@@ -89,6 +93,8 @@ pub const Processor = struct {
             .current_stream_xid = null,
             .pending_data = .{},
             .pending_batch_ids = .{},
+            .metadata_chunks = .{},
+            .metadata_table_oid = null,
             .stop_flag = std.atomic.Value(bool).init(false),
         };
     }
@@ -220,24 +226,41 @@ pub const Processor = struct {
                     self.current_txn_xid = begin.xid;
                     self.current_txn_timestamp = begin.timestamp;
                     self.in_transaction = true;
+                    self.clearMetadataChunks();
                     self.current_txn_id = try self.insertTransaction(begin.final_lsn);
                 },
                 .commit => {
+                    try self.flushMetadata();
                     self.in_transaction = false;
                     self.current_txn_id = null;
                 },
                 .relation => |rel| {
                     try self.updateRelationCache(rel);
                     try self.insertRelationSnapshot(rel);
+                    if (self.config.metadata_table) |mt| {
+                        if (std.mem.eql(u8, rel.name, mt)) {
+                            self.metadata_table_oid = rel.oid;
+                        }
+                    }
                 },
                 .insert => |ins| {
-                    try self.insertEvent(ins.relation_oid, 'I', ins.new_tuple, null);
+                    if (self.isMetadataTable(ins.relation_oid)) {
+                        try self.extractMetadataFromTuple(ins.relation_oid, ins.new_tuple);
+                    } else {
+                        try self.insertEvent(ins.relation_oid, 'I', ins.new_tuple, null);
+                    }
                 },
                 .update => |upd| {
-                    try self.insertEvent(upd.relation_oid, 'U', upd.new_tuple, upd.old_tuple);
+                    if (self.isMetadataTable(upd.relation_oid)) {
+                        try self.extractMetadataFromTuple(upd.relation_oid, upd.new_tuple);
+                    } else {
+                        try self.insertEvent(upd.relation_oid, 'U', upd.new_tuple, upd.old_tuple);
+                    }
                 },
                 .delete => |del| {
-                    try self.insertEvent(del.relation_oid, 'D', null, del.old_tuple);
+                    if (!self.isMetadataTable(del.relation_oid)) {
+                        try self.insertEvent(del.relation_oid, 'D', null, del.old_tuple);
+                    }
                 },
                 .truncate => {
                     try self.insertTruncateEvent();
@@ -250,6 +273,7 @@ pub const Processor = struct {
                     self.current_stream_xid = null;
                 },
                 .stream_commit => {
+                    try self.flushMetadata();
                     self.current_stream_xid = null;
                     self.in_transaction = false;
                     self.current_txn_id = null;
@@ -265,12 +289,14 @@ pub const Processor = struct {
                     self.current_txn_xid = bp.xid;
                     self.current_txn_timestamp = bp.timestamp;
                     self.in_transaction = true;
+                    self.clearMetadataChunks();
                     self.current_txn_id = try self.insertTransaction(bp.lsn);
                 },
                 .prepare => {
                     // Prepared but not yet committed — keep txn state
                 },
                 .commit_prepared => {
+                    try self.flushMetadata();
                     self.in_transaction = false;
                     self.current_txn_id = null;
                 },
@@ -280,6 +306,13 @@ pub const Processor = struct {
                 },
                 .stream_prepare => {
                     // Prepared within streaming — keep txn state
+                },
+                .message => |logical_msg| {
+                    if (self.config.metadata_message_prefix) |prefix| {
+                        if (std.mem.eql(u8, logical_msg.prefix, prefix)) {
+                            try self.addMetadataChunk(logical_msg.content);
+                        }
+                    }
                 },
                 else => {},
             }
@@ -637,6 +670,75 @@ pub const Processor = struct {
         });
     }
 
+    fn isMetadataTable(self: *Processor, relation_oid: u32) bool {
+        const mt_oid = self.metadata_table_oid orelse return false;
+        return relation_oid == mt_oid;
+    }
+
+    fn addMetadataChunk(self: *Processor, content: []const u8) !void {
+        const copy = try self.allocator.alloc(u8, content.len);
+        @memcpy(copy, content);
+        try self.metadata_chunks.append(self.allocator, copy);
+    }
+
+    fn extractMetadataFromTuple(self: *Processor, relation_oid: u32, tuple: ?[]const pgoutput.ColumnData) !void {
+        const t = tuple orelse return;
+        const rel = self.relations.get(relation_oid) orelse return;
+
+        // Find the "data" column and extract its value
+        for (rel.columns, 0..) |col, i| {
+            if (std.mem.eql(u8, col.name, "data") and i < t.len) {
+                switch (t[i]) {
+                    .text => |v| try self.addMetadataChunk(v),
+                    .binary => |v| try self.addMetadataChunk(v),
+                    else => {},
+                }
+                return;
+            }
+        }
+    }
+
+    fn clearMetadataChunks(self: *Processor) void {
+        for (self.metadata_chunks.items) |chunk| {
+            self.allocator.free(chunk);
+        }
+        self.metadata_chunks.clearRetainingCapacity();
+    }
+
+    fn flushMetadata(self: *Processor) !void {
+        if (self.metadata_chunks.items.len == 0) return;
+
+        var sql: std.ArrayListUnmanaged(u8) = .{};
+        defer sql.deinit(self.allocator);
+
+        try sql.appendSlice(self.allocator, "UPDATE transactions SET metadata = ");
+
+        // Build merged JSONB expression: 'chunk1'::jsonb || 'chunk2'::jsonb
+        for (self.metadata_chunks.items, 0..) |chunk, i| {
+            if (i > 0) try sql.appendSlice(self.allocator, " || ");
+            try query_mod.appendEscapedString(&sql, self.allocator, chunk);
+            try sql.appendSlice(self.allocator, "::jsonb");
+        }
+
+        try sql.appendSlice(self.allocator, " WHERE id = ");
+        if (self.current_txn_id) |txn_id| {
+            try query_mod.appendIntValue(&sql, self.allocator, txn_id);
+        } else {
+            try sql.appendSlice(self.allocator, "(SELECT id FROM transactions WHERE source_id=");
+            try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
+            try sql.appendSlice(self.allocator, " AND lsn=");
+            try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
+            try sql.appendSlice(self.allocator, " AND committed_at=");
+            try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
+            try sql.append(self.allocator, ')');
+        }
+        try sql.appendSlice(self.allocator, " AND committed_at=");
+        try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
+
+        try self.dest.execLarge(self.allocator, sql.items);
+        self.clearMetadataChunks();
+    }
+
     fn decodeBytea(self: *Processor, hex_data: []const u8) ![]u8 {
         if (hex_data.len < 2 or hex_data[0] != '\\' or hex_data[1] != 'x') {
             const copy = try self.allocator.alloc(u8, hex_data.len);
@@ -702,6 +804,8 @@ pub const Processor = struct {
         self.clearPending();
         self.pending_data.deinit(self.allocator);
         self.pending_batch_ids.deinit(self.allocator);
+        self.clearMetadataChunks();
+        self.metadata_chunks.deinit(self.allocator);
         self.dest.close();
     }
 };

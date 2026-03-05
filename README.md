@@ -12,6 +12,7 @@ dependencies.
 - WAL ingest and processing pipeline (store and replay WAL as an audit trail)
 - Batch splitting for large transactions
 - Auto-reconnection with exponential backoff
+- Transaction metadata via `pg_logical_emit_message` or metadata table
 
 ## Architecture
 
@@ -151,11 +152,56 @@ var processor = try pgzr.Processor.init(allocator, .{
         .replication = false,
     },
     .source_id = "00000000-0000-0000-0000-000000000001",
+    // Optional: capture metadata from pg_logical_emit_message
+    .metadata_message_prefix = "my_prefix",
+    // Optional: capture metadata from a table
+    .metadata_table = "my_metadata",
 });
 defer processor.deinit();
 
 try processor.run();
 ```
+
+### Transaction Metadata
+
+Applications can attach arbitrary JSON metadata to transactions (e.g. the user
+who made the change, a request ID). The Processor supports two opt-in
+mechanisms configured via `ProcessorConfig`:
+
+**Via `pg_logical_emit_message`** — set `metadata_message_prefix`. The
+application calls `pg_logical_emit_message` within a transaction on the source:
+
+```sql
+BEGIN;
+SELECT pg_logical_emit_message(true, 'my_prefix', '{"user":{"id":1,"name":"Alice"}}');
+INSERT INTO orders (item, qty) VALUES ('widget', 10);
+COMMIT;
+```
+
+The Ingestor must include `"messages", "true"` in its pgoutput options for
+logical messages to appear in the WAL stream.
+
+**Via metadata table** — set `metadata_table`. The application creates a table
+on the source (included in the publication) and upserts metadata within
+transactions:
+
+```sql
+CREATE TABLE my_metadata (version int PRIMARY KEY, data jsonb DEFAULT '{}');
+
+BEGIN;
+INSERT INTO orders (item, qty) VALUES ('widget', 10);
+INSERT INTO my_metadata (version, data)
+    VALUES (1, '{"user":{"id":1,"name":"Alice"}}')
+    ON CONFLICT (version) DO UPDATE SET data = EXCLUDED.data;
+COMMIT;
+```
+
+Writes to the metadata table are not stored as events — the `data` column is
+extracted and stored in `transactions.metadata`. If both mechanisms are used in
+the same transaction, their JSON objects are merged with PostgreSQL's `||`
+operator.
+
+See [docs/schema.md](docs/schema.md) for the full schema and query examples.
 
 ## Prerequisites
 
@@ -262,10 +308,9 @@ benchmark/
   query protocol, issuing one round-trip per SQL statement. PostgreSQL's
   extended query protocol supports pipeline mode (Parse/Bind/Execute/Sync)
   which allows sending an entire batch of queries without waiting for
-  individual responses. This would collapse all event and column INSERTs for a
-  batch into a single network round-trip. Requires implementing the extended
-  query protocol, client-side UUID generation (to remove the `RETURNING id`
-  dependency between event and column INSERTs), and pipeline error handling.
+  individual responses. This would collapse all event INSERTs for a batch into
+  a single network round-trip. Requires implementing the extended query
+  protocol and pipeline error handling.
 
 - **io_uring / kqueue** — The transport layer currently uses blocking I/O.
   Using io_uring (Linux) or kqueue (macOS) would allow non-blocking,
