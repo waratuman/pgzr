@@ -75,10 +75,10 @@ pub const TlsState = struct {
     tls_client: tls.Client,
     stream_reader: std.net.Stream.Reader,
     stream_writer: std.net.Stream.Writer,
-    stream_read_buf: [16384]u8,
-    stream_write_buf: [16384]u8,
+    stream_read_buf: [tls.Client.min_buffer_len]u8,
+    stream_write_buf: [tls.Client.min_buffer_len]u8,
     tls_read_buf: [tls.Client.min_buffer_len]u8,
-    tls_write_buf: [16384]u8,
+    tls_write_buf: [tls.Client.min_buffer_len]u8,
 
     pub const UpgradeError = error{
         TlsNotSupported,

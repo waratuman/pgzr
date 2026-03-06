@@ -47,10 +47,10 @@ pub const Connection = struct {
         errdefer stream.close();
 
         // Set up transport (plain initially, may upgrade to TLS)
-        var plain_state = try allocator.create(PlainState);
-        errdefer allocator.destroy(plain_state);
-        plain_state.* = .{ .stream = stream };
-        var transport = Transport.plain(plain_state);
+        var plain_state: ?*PlainState = try allocator.create(PlainState);
+        errdefer if (plain_state) |ps| allocator.destroy(ps);
+        plain_state.?.* = .{ .stream = stream };
+        var transport = Transport.plain(plain_state.?);
 
         var tls_state: ?*TlsState = null;
 
@@ -72,8 +72,8 @@ pub const Connection = struct {
                 tls_state = ts;
                 transport = Transport.tlsClient(ts);
                 // Free the plain state since we're now using TLS
-                allocator.destroy(plain_state);
-                plain_state = undefined;
+                allocator.destroy(plain_state.?);
+                plain_state = null;
             } else if (config.tls == .require or config.tls == .verify_full) {
                 return error.TlsNotSupported;
             }
@@ -83,6 +83,7 @@ pub const Connection = struct {
         var send_buf: [4096]u8 = undefined;
 
         // Send StartupMessage
+
         const startup = protocol.encodeStartup(&send_buf, config.user, config.database, config.replication);
         try transport.writeAll(startup);
 
