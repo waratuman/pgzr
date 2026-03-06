@@ -75,8 +75,10 @@ pub const TlsState = struct {
     tls_client: tls.Client,
     stream_reader: std.net.Stream.Reader,
     stream_writer: std.net.Stream.Writer,
-    read_buf: [tls.Client.min_buffer_len]u8,
-    write_buf: [16384]u8,
+    stream_read_buf: [16384]u8,
+    stream_write_buf: [16384]u8,
+    tls_read_buf: [tls.Client.min_buffer_len]u8,
+    tls_write_buf: [16384]u8,
 
     pub const UpgradeError = error{
         TlsNotSupported,
@@ -144,10 +146,12 @@ pub const TlsState = struct {
         errdefer allocator.destroy(state);
 
         state.stream = stream;
-        state.read_buf = undefined;
-        state.write_buf = undefined;
-        state.stream_reader = stream.reader(&state.read_buf);
-        state.stream_writer = stream.writer(&state.write_buf);
+        state.stream_read_buf = undefined;
+        state.stream_write_buf = undefined;
+        state.tls_read_buf = undefined;
+        state.tls_write_buf = undefined;
+        state.stream_reader = stream.reader(&state.stream_read_buf);
+        state.stream_writer = stream.writer(&state.stream_write_buf);
 
         if (verify) {
             // Load system CA certificates for verification
@@ -162,8 +166,8 @@ pub const TlsState = struct {
                 .{
                     .host = .{ .explicit = host },
                     .ca = if (ca_bundle.map.count() > 0) .{ .bundle = ca_bundle } else .no_verification,
-                    .read_buffer = &state.read_buf,
-                    .write_buffer = &state.write_buf,
+                    .read_buffer = &state.tls_read_buf,
+                    .write_buffer = &state.tls_write_buf,
                 },
             ) catch |err| {
                 ca_bundle.deinit(allocator);
@@ -177,8 +181,8 @@ pub const TlsState = struct {
                 .{
                     .host = .no_verification,
                     .ca = .no_verification,
-                    .read_buffer = &state.read_buf,
-                    .write_buffer = &state.write_buf,
+                    .read_buffer = &state.tls_read_buf,
+                    .write_buffer = &state.tls_write_buf,
                 },
             ) catch |err| {
                 return err;
@@ -219,4 +223,27 @@ pub const TlsState = struct {
 
 test "PlainState size" {
     try std.testing.expect(@sizeOf(PlainState) <= 16);
+}
+
+test "TlsState buffers do not alias" {
+    // The stream reader/writer and TLS client must use separate buffers.
+    // Previously they shared the same buffers, causing data corruption
+    // during the TLS handshake.
+    const stream_read_off = @offsetOf(TlsState, "stream_read_buf");
+    const stream_write_off = @offsetOf(TlsState, "stream_write_buf");
+    const tls_read_off = @offsetOf(TlsState, "tls_read_buf");
+    const tls_write_off = @offsetOf(TlsState, "tls_write_buf");
+
+    const stream_read_end = stream_read_off + @sizeOf(@TypeOf(@as(TlsState, undefined).stream_read_buf));
+    const stream_write_end = stream_write_off + @sizeOf(@TypeOf(@as(TlsState, undefined).stream_write_buf));
+    const tls_read_end = tls_read_off + @sizeOf(@TypeOf(@as(TlsState, undefined).tls_read_buf));
+    const tls_write_end = tls_write_off + @sizeOf(@TypeOf(@as(TlsState, undefined).tls_write_buf));
+
+    // No pair of buffers should overlap
+    try std.testing.expect(stream_read_end <= stream_write_off or stream_write_end <= stream_read_off);
+    try std.testing.expect(stream_read_end <= tls_read_off or tls_read_end <= stream_read_off);
+    try std.testing.expect(stream_read_end <= tls_write_off or tls_write_end <= stream_read_off);
+    try std.testing.expect(stream_write_end <= tls_read_off or tls_read_end <= stream_write_off);
+    try std.testing.expect(stream_write_end <= tls_write_off or tls_write_end <= stream_write_off);
+    try std.testing.expect(tls_read_end <= tls_write_off or tls_write_end <= tls_read_off);
 }
