@@ -208,6 +208,10 @@ pub const TlsState = struct {
         const self: *TlsState = @ptrCast(@alignCast(ctx));
         self.tls_client.writer.writeAll(data) catch return error.WriteFailed;
         self.tls_client.writer.flush() catch return error.WriteFailed;
+        // Flush the underlying stream writer so encrypted data reaches the socket.
+        // Without this, encrypted data stays in the output buffer and the server
+        // never receives it, causing a deadlock.
+        self.tls_client.output.flush() catch return error.WriteFailed;
     }
 
     fn closeFn(ctx: *anyopaque) void {
