@@ -278,6 +278,11 @@ and `on_flush_context` pointer. When set, the callback fires after each
 successful batch flush with the batch LSN range, message count, and whether
 the batch is complete.
 
+`pgzr_ingestor_run` and `pgzr_processor_run` install SIGINT/SIGTERM handlers
+that call `stop()` on the active instance. This allows clean shutdown from FFI
+hosts (Ruby, Python) where the language's signal handlers can't execute during
+a blocking C call. Previous signal handlers are restored when `run` returns.
+
 ## Manual Example
 
 ```bash

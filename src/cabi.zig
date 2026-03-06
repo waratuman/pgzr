@@ -31,6 +31,44 @@ export fn pgzr_last_error(out_len: *usize) [*]const u8 {
     return &last_error_buf;
 }
 
+// ── Signal handling ───────────────────────────────────────────────────
+//
+// When pgzr is called via FFI (Ruby, Python), the host language's signal
+// handlers can't execute during a blocking C call. We install our own
+// SIGINT/SIGTERM handler that calls stop() on the active ingestor and/or
+// processor, allowing the blocking run() call to return cleanly.
+
+const posix = std.posix;
+
+var active_ingestor = std.atomic.Value(?*Ingestor).init(null);
+var active_processor = std.atomic.Value(?*Processor).init(null);
+
+fn signalHandler(_: c_int) callconv(.c) void {
+    if (active_ingestor.load(.monotonic)) |ing| ing.stop();
+    if (active_processor.load(.monotonic)) |proc| proc.stop();
+}
+
+fn installSignalHandlers(
+    prev_int: *posix.Sigaction,
+    prev_term: *posix.Sigaction,
+) void {
+    const sa = posix.Sigaction{
+        .handler = .{ .handler = signalHandler },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.INT, &sa, prev_int);
+    posix.sigaction(posix.SIG.TERM, &sa, prev_term);
+}
+
+fn restoreSignalHandlers(
+    prev_int: *const posix.Sigaction,
+    prev_term: *const posix.Sigaction,
+) void {
+    posix.sigaction(posix.SIG.INT, prev_int, null);
+    posix.sigaction(posix.SIG.TERM, prev_term, null);
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────
 
 fn sliceFromCStr(ptr: ?[*:0]const u8) []const u8 {
@@ -199,7 +237,18 @@ export fn pgzr_ingestor_new(config: *const PgzrIngestConfig) ?*Ingestor {
 }
 
 export fn pgzr_ingestor_run(ingestor: *Ingestor) c_int {
+    active_ingestor.store(ingestor, .release);
+    var prev_int: posix.Sigaction = undefined;
+    var prev_term: posix.Sigaction = undefined;
+    installSignalHandlers(&prev_int, &prev_term);
+
+    defer {
+        active_ingestor.store(null, .release);
+        restoreSignalHandlers(&prev_int, &prev_term);
+    }
+
     ingestor.run() catch |err| {
+        if (ingestor.isStopRequested()) return 0;
         setError("ingestor run failed: {s}", .{@errorName(err)});
         return -1;
     };
@@ -278,7 +327,18 @@ export fn pgzr_processor_new(config: *const PgzrProcessorConfig) ?*Processor {
 }
 
 export fn pgzr_processor_run(processor: *Processor) c_int {
+    active_processor.store(processor, .release);
+    var prev_int: posix.Sigaction = undefined;
+    var prev_term: posix.Sigaction = undefined;
+    installSignalHandlers(&prev_int, &prev_term);
+
+    defer {
+        active_processor.store(null, .release);
+        restoreSignalHandlers(&prev_int, &prev_term);
+    }
+
     processor.run() catch |err| {
+        if (processor.stop_flag.load(.acquire)) return 0;
         setError("processor run failed: {s}", .{@errorName(err)});
         return -1;
     };
