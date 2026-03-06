@@ -331,8 +331,6 @@ fn testStartPosition(allocator: std.mem.Allocator) !void {
         return error.ServerError;
     }
 
-
-
     std.debug.print("OK\n", .{});
 }
 
@@ -432,8 +430,6 @@ fn testEndPosition(allocator: std.mem.Allocator) !void {
         }
     }
 
-
-
     std.debug.print("OK\n", .{});
 }
 
@@ -494,8 +490,6 @@ fn testLastServerLsn(allocator: std.mem.Allocator) !void {
         std.debug.print("FAIL (last_processed_lsn still zero after ack)\n", .{});
         return error.ServerError;
     }
-
-
 
     std.debug.print("OK\n", .{});
 }
@@ -664,8 +658,6 @@ fn testFeedback(allocator: std.mem.Allocator) !void {
         return err;
     };
 
-
-
     std.debug.print("OK\n", .{});
 }
 
@@ -728,8 +720,6 @@ fn testStop(allocator: std.mem.Allocator) !void {
         std.debug.print("FAIL (next returned non-null after stop)\n", .{});
         return error.ServerError;
     }
-
-
 
     std.debug.print("OK\n", .{});
 }
@@ -794,9 +784,86 @@ fn testReplicateAsync(allocator: std.mem.Allocator) !void {
 
     repl.deinit();
 
+    std.debug.print("OK\n", .{});
+}
 
+// =========================================================================
+// Test 10: TLS prefer mode (falls back to plain if SSL off, succeeds if on)
+// =========================================================================
+fn testTlsPrefer(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: TLS prefer mode... ", .{});
+
+    var config = connConfig();
+    config.tls = .prefer;
+
+    // prefer mode should always succeed: TLS if server supports it, plain otherwise
+    var repl = pgzr.Replicator.init(allocator, .{
+        .conn = config,
+        .slot_name = SLOT_NAME,
+        .options = &.{
+            .{ "include-timestamp", "on" },
+        },
+    }) catch |err| {
+        std.debug.print("FAIL (connect: {})\n", .{err});
+        return err;
+    };
+    defer repl.deinit();
 
     std.debug.print("OK\n", .{});
+}
+
+// =========================================================================
+// Test 11: TLS require mode
+// =========================================================================
+fn testTlsRequire(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: TLS require mode... ", .{});
+
+    // Check if PostgreSQL has SSL enabled
+    const ssl_output = runPsqlCapture(allocator, DB_NAME, "SHOW ssl") catch {
+        std.debug.print("SKIP (cannot query ssl setting)\n", .{});
+        return;
+    };
+    defer allocator.free(ssl_output);
+
+    const ssl_enabled = std.mem.eql(u8, ssl_output, "on");
+
+    var config = connConfig();
+    config.tls = .require;
+
+    const result = pgzr.Replicator.init(allocator, .{
+        .conn = config,
+        .slot_name = SLOT_NAME,
+        .options = &.{
+            .{ "include-timestamp", "on" },
+        },
+    });
+
+    if (ssl_enabled) {
+        // SSL is on — require mode should succeed
+        if (result) |*repl| {
+            var r = repl.*;
+            r.deinit();
+            std.debug.print("OK (connected with TLS)\n", .{});
+        } else |err| {
+            std.debug.print("FAIL (SSL enabled but got: {})\n", .{err});
+            return err;
+        }
+    } else {
+        // SSL is off — require mode should fail with TlsNotSupported
+        if (result) |*repl| {
+            var r = repl.*;
+            r.deinit();
+            std.debug.print("FAIL (expected TlsNotSupported, got success)\n", .{});
+            return error.ServerError;
+        } else |err| {
+            if (err == error.TlsNotSupported) {
+                std.debug.print("OK (correctly rejected: TlsNotSupported)\n", .{});
+            } else {
+                std.debug.print("FAIL (expected TlsNotSupported, got {})\n", .{err});
+                return err;
+            }
+        }
+    }
 }
 
 // =========================================================================
@@ -871,6 +938,16 @@ pub fn main() !void {
     // testReplicateAsync(allocator) catch {
     //     failures += 1;
     // };
+
+    testTlsPrefer(allocator) catch {
+        failures += 1;
+    };
+    resetSlot(allocator);
+
+    testTlsRequire(allocator) catch {
+        failures += 1;
+    };
+    resetSlot(allocator);
 
     // Teardown
     std.debug.print("Cleaning up...\n", .{});
