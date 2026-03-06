@@ -6,7 +6,7 @@ dependencies.
 ## Features
 
 - Pure Zig, zero C dependencies
-- TCP, Unix socket, and TLS connections
+- TCP, Unix socket, and TLS connections (require, verify-full)
 - SCRAM-SHA-256, MD5, and cleartext authentication
 - pgoutput protocol versions 1-4 (streaming, two-phase commit)
 - WAL ingest and processing pipeline (store and replay WAL as an audit trail)
@@ -202,6 +202,30 @@ the same transaction, their JSON objects are merged with PostgreSQL's `||`
 operator.
 
 See [docs/schema.md](docs/schema.md) for the full schema and query examples.
+
+### TLS
+
+Connections support four TLS modes via the `tls` field on `ConnConfig`:
+
+| Mode | Behavior |
+|------|----------|
+| `.disable` | No TLS (default) |
+| `.prefer` | Try TLS, fall back to plaintext if server doesn't support it |
+| `.require` | Require TLS; encrypt only, no certificate or hostname verification (matches PostgreSQL `sslmode=require`) |
+| `.verify_full` | Require TLS with full certificate chain and hostname verification against system CAs (matches PostgreSQL `sslmode=verify-full`) |
+
+```zig
+.conn = .{
+    .host = "db.example.com",
+    .port = 5432,
+    .user = "postgres",
+    .database = "mydb",
+    .tls = .require,  // encrypt without verification
+},
+```
+
+For the C ABI, the `tls_mode` integer maps as: 0 = disable, 1 = prefer,
+2 = require, 3 = verify-full.
 
 ## Prerequisites
 

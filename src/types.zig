@@ -6,7 +6,12 @@ pub const TlsMode = enum {
     /// Try TLS, fall back to plaintext if server doesn't support it.
     prefer,
     /// Require TLS; fail if server doesn't support it.
+    /// Encrypts the connection but does NOT verify the server certificate
+    /// or hostname (matches PostgreSQL sslmode=require).
     require,
+    /// Require TLS with full certificate and hostname verification
+    /// (matches PostgreSQL sslmode=verify-full).
+    verify_full,
 };
 
 pub const ConnConfig = struct {

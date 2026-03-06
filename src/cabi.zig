@@ -56,6 +56,7 @@ fn buildConnConfig(
         .tls = switch (tls_mode) {
             1 => .prefer,
             2 => .require,
+            3 => .verify_full,
             else => .disable,
         },
         .replication = true,

@@ -68,13 +68,13 @@ pub const Connection = struct {
 
             if (resp[0] == 'S') {
                 // Server accepts TLS — perform handshake
-                const ts = try TlsState.upgrade(allocator, stream, config.host);
+                const ts = try TlsState.upgrade(allocator, stream, config.host, config.tls == .verify_full);
                 tls_state = ts;
                 transport = Transport.tlsClient(ts);
                 // Free the plain state since we're now using TLS
                 allocator.destroy(plain_state);
                 plain_state = undefined;
-            } else if (config.tls == .require) {
+            } else if (config.tls == .require or config.tls == .verify_full) {
                 return error.TlsNotSupported;
             }
             // else: .prefer mode, server said 'N', continue with plain

@@ -130,10 +130,15 @@ pub const TlsState = struct {
 
     /// Upgrade an existing plain TCP connection to TLS.
     /// Sends the SSLRequest, reads the server response, and performs the TLS handshake.
+    /// When `verify` is true, the server certificate and hostname are validated
+    /// against system CA certificates (equivalent to PostgreSQL sslmode=verify-full).
+    /// When `verify` is false, the connection is encrypted but the certificate
+    /// is not checked (equivalent to PostgreSQL sslmode=require).
     pub fn upgrade(
         allocator: std.mem.Allocator,
         stream: std.net.Stream,
         host: []const u8,
+        verify: bool,
     ) UpgradeError!*TlsState {
         const state = allocator.create(TlsState) catch return error.BufferTooSmall;
         errdefer allocator.destroy(state);
@@ -144,26 +149,41 @@ pub const TlsState = struct {
         state.stream_reader = stream.reader(&state.read_buf);
         state.stream_writer = stream.writer(&state.write_buf);
 
-        // Load system CA certificates
-        var ca_bundle: Certificate.Bundle = .{};
-        ca_bundle.rescan(allocator) catch {
-            // If we can't load system CAs, proceed without verification
-            ca_bundle = .{};
-        };
+        if (verify) {
+            // Load system CA certificates for verification
+            var ca_bundle: Certificate.Bundle = .{};
+            ca_bundle.rescan(allocator) catch {
+                ca_bundle = .{};
+            };
 
-        state.tls_client = tls.Client.init(
-            state.stream_reader.interface(),
-            &state.stream_writer.interface,
-            .{
-                .host = .{ .explicit = host },
-                .ca = if (ca_bundle.map.count() > 0) .{ .bundle = ca_bundle } else .no_verification,
-                .read_buffer = &state.read_buf,
-                .write_buffer = &state.write_buf,
-            },
-        ) catch |err| {
-            ca_bundle.deinit(allocator);
-            return err;
-        };
+            state.tls_client = tls.Client.init(
+                state.stream_reader.interface(),
+                &state.stream_writer.interface,
+                .{
+                    .host = .{ .explicit = host },
+                    .ca = if (ca_bundle.map.count() > 0) .{ .bundle = ca_bundle } else .no_verification,
+                    .read_buffer = &state.read_buf,
+                    .write_buffer = &state.write_buf,
+                },
+            ) catch |err| {
+                ca_bundle.deinit(allocator);
+                return err;
+            };
+        } else {
+            // Encrypt only — no certificate or hostname verification
+            state.tls_client = tls.Client.init(
+                state.stream_reader.interface(),
+                &state.stream_writer.interface,
+                .{
+                    .host = .no_verification,
+                    .ca = .no_verification,
+                    .read_buffer = &state.read_buf,
+                    .write_buffer = &state.write_buf,
+                },
+            ) catch |err| {
+                return err;
+            };
+        }
 
         return state;
     }
