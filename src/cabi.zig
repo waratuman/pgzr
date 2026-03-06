@@ -2,6 +2,7 @@ const std = @import("std");
 const Ingestor = @import("ingest.zig").Ingestor;
 const Processor = @import("processor.zig").Processor;
 const types = @import("types.zig");
+const Lsn = @import("lsn.zig").Lsn;
 const query_mod = @import("query.zig");
 
 // ── Error handling ────────────────────────────────────────────────────
@@ -65,6 +66,27 @@ fn buildConnConfig(
 
 // ── Ingestor ──────────────────────────────────────────────────────────
 
+/// C-compatible on_flush callback type.
+/// LSN values are passed as raw u64 (Lsn.value).
+pub const PgzrOnFlushFn = *const fn (
+    context: ?*anyopaque,
+    batch_start_lsn: u64,
+    batch_end_lsn: u64,
+    msg_count: usize,
+    is_complete: bool,
+) callconv(.c) void;
+
+/// Bridge between C-calling-convention callbacks and Zig's OnFlushFn.
+const CFlushBridge = struct {
+    c_callback: PgzrOnFlushFn,
+    c_context: ?*anyopaque,
+
+    fn zigCallback(context: ?*anyopaque, batch_start_lsn: Lsn, batch_end_lsn: Lsn, msg_count: usize, is_complete: bool) void {
+        const self: *CFlushBridge = @ptrCast(@alignCast(context));
+        self.c_callback(self.c_context, batch_start_lsn.value, batch_end_lsn.value, msg_count, is_complete);
+    }
+};
+
 pub const PgzrIngestConfig = extern struct {
     source_host: ?[*:0]const u8,
     source_port: u16,
@@ -85,6 +107,8 @@ pub const PgzrIngestConfig = extern struct {
     dest_tls_mode: u8,
     source_id: ?[*:0]const u8,
     max_batch_size: u32,
+    on_flush: ?PgzrOnFlushFn,
+    on_flush_context: ?*anyopaque,
 };
 
 export fn pgzr_ingestor_new(config: *const PgzrIngestConfig) ?*Ingestor {
@@ -130,6 +154,22 @@ export fn pgzr_ingestor_new(config: *const PgzrIngestConfig) ?*Ingestor {
     options[opt_count] = .{ "messages", "true" };
     opt_count += 1;
 
+    // Set up on_flush callback bridge if provided
+    var on_flush: ?types.OnFlushFn = null;
+    var on_flush_context: ?*anyopaque = null;
+    var flush_bridge: ?*CFlushBridge = null;
+
+    if (config.on_flush) |c_cb| {
+        const bridge = allocator.create(CFlushBridge) catch {
+            setErrorStr("out of memory");
+            return null;
+        };
+        bridge.* = .{ .c_callback = c_cb, .c_context = config.on_flush_context };
+        on_flush = CFlushBridge.zigCallback;
+        on_flush_context = @ptrCast(bridge);
+        flush_bridge = bridge;
+    }
+
     const ingest_config = types.IngestConfig{
         .source = .{
             .conn = source_conn,
@@ -139,6 +179,8 @@ export fn pgzr_ingestor_new(config: *const PgzrIngestConfig) ?*Ingestor {
         .dest = dest_conn,
         .source_id = sliceFromCStr(config.source_id),
         .max_batch_size = if (config.max_batch_size > 0) config.max_batch_size else 4 * 1024 * 1024,
+        .on_flush = on_flush,
+        .on_flush_context = on_flush_context,
     };
 
     const ingestor = allocator.create(Ingestor) catch {
@@ -149,6 +191,7 @@ export fn pgzr_ingestor_new(config: *const PgzrIngestConfig) ?*Ingestor {
     ingestor.* = Ingestor.init(allocator, ingest_config) catch |err| {
         setError("ingestor init failed: {s}", .{@errorName(err)});
         allocator.destroy(ingestor);
+        if (flush_bridge) |b| allocator.destroy(b);
         return null;
     };
 
@@ -168,6 +211,13 @@ export fn pgzr_ingestor_stop(ingestor: *Ingestor) void {
 }
 
 export fn pgzr_ingestor_free(ingestor: *Ingestor) void {
+    // Free the C flush bridge if one was allocated
+    if (ingestor.config.on_flush != null) {
+        if (ingestor.config.on_flush_context) |ctx| {
+            const bridge: *CFlushBridge = @ptrCast(@alignCast(ctx));
+            std.heap.page_allocator.destroy(bridge);
+        }
+    }
     ingestor.deinit();
     std.heap.page_allocator.destroy(ingestor);
 }

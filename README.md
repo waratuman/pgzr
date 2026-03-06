@@ -272,6 +272,12 @@ pgzr_processor_free(ptr)         → void
 pgzr_last_error(out_len)    → pointer to error message
 ```
 
+The `PgzrIngestConfig` struct accepts an optional `on_flush` callback
+(`void (*)(void *context, uint64_t start_lsn, uint64_t end_lsn, size_t msg_count, bool is_complete)`)
+and `on_flush_context` pointer. When set, the callback fires after each
+successful batch flush with the batch LSN range, message count, and whether
+the batch is complete.
+
 ## Manual Example
 
 ```bash

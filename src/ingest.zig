@@ -217,6 +217,11 @@ pub const Ingestor = struct {
 
         try self.dest.execLarge(self.allocator, sql.items);
 
+        // Notify caller of successful flush
+        if (self.config.on_flush) |cb| {
+            cb(self.config.on_flush_context, self.batch_start_lsn, self.batch_end_lsn, self.batch_msg_count, complete);
+        }
+
         // Reset batch
         self.batch_buf.clearRetainingCapacity();
         self.batch_msg_count = 0;

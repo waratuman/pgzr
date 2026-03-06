@@ -60,12 +60,24 @@ pub const ReplicatorConfig = struct {
     expected_systemid: ?[]const u8 = null,
 };
 
+pub const OnFlushFn = *const fn (
+    context: ?*anyopaque,
+    batch_start_lsn: Lsn,
+    batch_end_lsn: Lsn,
+    msg_count: usize,
+    is_complete: bool,
+) void;
+
 pub const IngestConfig = struct {
     source: ReplicatorConfig,
     dest: ConnConfig,
     source_id: []const u8,
     /// Maximum batch size in bytes before flushing (default 4 MiB).
     max_batch_size: usize = 4 * 1024 * 1024,
+    /// Called after each successful batch flush. null = disabled.
+    on_flush: ?OnFlushFn = null,
+    /// Opaque context pointer passed to `on_flush`.
+    on_flush_context: ?*anyopaque = null,
 };
 
 pub const ProcessorConfig = struct {
