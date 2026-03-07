@@ -131,6 +131,23 @@ pub fn build(b: *std.Build) void {
     const pipeline_bench_step = b.step("pipeline-bench", "Run pipeline benchmark (requires PostgreSQL)");
     pipeline_bench_step.dependOn(&run_pipeline_bench.step);
 
+    // SSL ingest test
+    const ssl_ingest_test = b.addExecutable(.{
+        .name = "ssl-ingest-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/ssl_ingest_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pgzr", .module = mod },
+            },
+        }),
+    });
+
+    const run_ssl_ingest = b.addRunArtifact(ssl_ingest_test);
+    const ssl_ingest_step = b.step("ssl-ingest-test", "Run SSL ingest test (requires PostgreSQL with SSL)");
+    ssl_ingest_step.dependOn(&run_ssl_ingest.step);
+
     // Pipeline integration tests (requires a running PostgreSQL instance)
     const pipeline_tests = b.addExecutable(.{
         .name = "pipeline-tests",
