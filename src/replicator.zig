@@ -47,6 +47,11 @@ pub const Replicator = struct {
         try repl.identifySystem();
         try repl.startReplication();
 
+        std.log.info("Replicator connected: slot={s} start_lsn={f}", .{
+            config.slot_name,
+            config.start_position orelse Lsn.zero,
+        });
+
         return repl;
     }
 
@@ -187,7 +192,10 @@ pub const Replicator = struct {
             }};
 
             const ready = std.posix.poll(&fds, timeout) catch 0;
-            if (ready == 0) continue;
+            if (ready == 0) {
+                std.log.debug("poll timeout, sending status", .{});
+                continue;
+            }
 
             const header = try protocol.readHeader(self.conn.transport);
 
@@ -347,6 +355,7 @@ pub const Replicator = struct {
         if (server_lsn.value != 0) self.last_server_lsn = server_lsn;
 
         if (reply_requested == 1) {
+            std.log.debug("keepalive reply_requested=1, sending status", .{});
             try self.sendStatus();
         }
     }
@@ -390,6 +399,10 @@ pub const Replicator = struct {
 
     /// Send a standby status update to the server.
     pub fn sendStatus(self: *Replicator) NextError!void {
+        std.log.debug("sending status: processed_lsn={f} server_lsn={f}", .{
+            self.last_processed_lsn,
+            self.last_server_lsn,
+        });
         self.last_status_time_ms = std.time.milliTimestamp();
 
         const lsn_location = if (self.last_processed_lsn.value == 0)

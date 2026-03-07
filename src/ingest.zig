@@ -92,6 +92,7 @@ pub const Ingestor = struct {
     /// `max_batch_size`, the batch is split mid-transaction with
     /// `complete=false`. The processor reassembles partial batches.
     pub fn run(self: *Ingestor) RunError!void {
+        std.log.info("Ingestor started: source_id={s}", .{self.config.source_id});
         while (try self.replicator.next()) |wal_msg| {
             const data = wal_msg.data;
             if (data.len == 0) continue;
@@ -143,6 +144,8 @@ pub const Ingestor = struct {
         if (self.batch_msg_count > 0) {
             try self.flushBatch(!self.in_transaction);
         }
+
+        std.log.info("Ingestor stopped", .{});
     }
 
     fn updateRelationCache(self: *Ingestor, data: []const u8) !void {
@@ -216,6 +219,14 @@ pub const Ingestor = struct {
         try sql.appendSlice(self.allocator, ") ON CONFLICT (source_id, start_lsn) DO NOTHING");
 
         try self.dest.execLarge(self.allocator, sql.items);
+
+        std.log.info("batch flushed: start_lsn={f} end_lsn={f} msgs={d} bytes={d} complete={}", .{
+            self.batch_start_lsn,
+            self.batch_end_lsn,
+            self.batch_msg_count,
+            self.batch_buf.items.len,
+            complete,
+        });
 
         // Notify caller of successful flush
         if (self.config.on_flush) |cb| {
