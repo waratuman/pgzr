@@ -428,6 +428,13 @@ pub const Connection = struct {
         }
     }
 
+    /// Return the underlying socket file descriptor.
+    pub fn getStreamHandle(self: *const Connection) std.posix.fd_t {
+        if (self.tls_state) |ts| return ts.stream.handle;
+        if (self.plain_state) |ps| return ps.stream.handle;
+        unreachable;
+    }
+
     pub fn close(self: *Connection) void {
         self.transport.close();
         self.send_buf.deinit(self.allocator);
