@@ -12,10 +12,12 @@ const ReproConfig = struct {
     source_host: []const u8,
     source_port: u16,
     source_user: []const u8,
+    source_password: []const u8,
     source_db: []const u8,
     dest_host: []const u8,
     dest_port: u16,
     dest_user: []const u8,
+    dest_password: []const u8,
     dest_db: []const u8,
     slot_name: []const u8,
     publication_name: []const u8,
@@ -45,6 +47,9 @@ fn envBool(name: []const u8, default: bool) bool {
 
 fn loadConfig() ReproConfig {
     const user = envOrDefault("PGZR_TLS_REPRO_USER", envOrDefault("PGUSER", envOrDefault("USER", "postgres")));
+    const source_user = envOrDefault("PGZR_TLS_REPRO_SOURCE_USER", user);
+    const dest_user = envOrDefault("PGZR_TLS_REPRO_DEST_USER", user);
+    const shared_password = envOrDefault("PGZR_TLS_REPRO_PASSWORD", envOrDefault("PGPASSWORD", ""));
     const source_host = envOrDefault("PGZR_TLS_REPRO_SOURCE_HOST", envOrDefault("PGHOST", "127.0.0.1"));
     const dest_host = envOrDefault("PGZR_TLS_REPRO_DEST_HOST", source_host);
     const source_port = envU16("PGZR_TLS_REPRO_SOURCE_PORT", envU16("PGPORT", 5432));
@@ -53,11 +58,13 @@ fn loadConfig() ReproConfig {
     return .{
         .source_host = source_host,
         .source_port = source_port,
-        .source_user = user,
+        .source_user = source_user,
+        .source_password = envOrDefault("PGZR_TLS_REPRO_SOURCE_PASSWORD", shared_password),
         .source_db = envOrDefault("PGZR_TLS_REPRO_SOURCE_DB", "pgzr_tls_repro_source"),
         .dest_host = dest_host,
         .dest_port = dest_port,
-        .dest_user = user,
+        .dest_user = dest_user,
+        .dest_password = envOrDefault("PGZR_TLS_REPRO_DEST_PASSWORD", shared_password),
         .dest_db = envOrDefault("PGZR_TLS_REPRO_DEST_DB", "pgzr_tls_repro_dest"),
         .slot_name = envOrDefault("PGZR_TLS_REPRO_SLOT", "pgzr_tls_repro_slot"),
         .publication_name = envOrDefault("PGZR_TLS_REPRO_PUBLICATION", "pgzr_tls_repro_pub"),
@@ -110,6 +117,7 @@ fn setup(allocator: std.mem.Allocator, cfg: ReproConfig) !void {
         .host = cfg.dest_host,
         .port = cfg.dest_port,
         .user = cfg.dest_user,
+        .password = cfg.dest_password,
         .database = cfg.dest_db,
         .replication = false,
         .tls = .disable,
@@ -141,6 +149,7 @@ fn runCase(allocator: std.mem.Allocator, cfg: ReproConfig, c: Case) void {
                 .host = cfg.source_host,
                 .port = cfg.source_port,
                 .user = cfg.source_user,
+                .password = cfg.source_password,
                 .database = cfg.source_db,
                 .tls = c.source_tls,
             },
@@ -154,6 +163,7 @@ fn runCase(allocator: std.mem.Allocator, cfg: ReproConfig, c: Case) void {
             .host = cfg.dest_host,
             .port = cfg.dest_port,
             .user = cfg.dest_user,
+            .password = cfg.dest_password,
             .database = cfg.dest_db,
             .replication = false,
             .tls = c.dest_tls,
