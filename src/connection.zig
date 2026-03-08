@@ -245,18 +245,22 @@ pub const Connection = struct {
     /// Execute a simple query that may be larger than the stack buffer.
     /// Uses a reusable send buffer to avoid per-call allocations.
     /// Does not return result rows — use for INSERT/UPDATE/DELETE/DDL.
-    pub fn execLarge(self: *Connection, allocator: std.mem.Allocator, query: []const u8) QueryError!void {
+    pub fn execLarge(self: *Connection, allocator: std.mem.Allocator, sql: []const u8) QueryError!void {
         // Query message: 'Q' (1) + int32 len (4) + query + '\0' (1)
-        const msg_len = 1 + 4 + query.len + 1;
+        const msg_len = 1 + 4 + sql.len + 1;
         self.send_buf.clearRetainingCapacity();
         self.send_buf.ensureTotalCapacity(allocator, msg_len) catch return error.OutOfMemory;
         const buf = self.send_buf.allocatedSlice()[0..msg_len];
 
-        const msg = protocol.encodeQuery(buf, query);
+        const msg = protocol.encodeQuery(buf, sql);
+        std.log.debug("execLarge: sending query msg_len={d}", .{msg.len});
         try self.transport.writeAll(msg);
+        std.log.debug("execLarge: query sent, waiting for response", .{});
 
         while (true) {
+            std.log.debug("execLarge: reading response header...", .{});
             const header = try protocol.readHeader(self.transport);
+            std.log.debug("execLarge: response type='{c}' len={d}", .{ header.msg_type, header.length });
 
             switch (header.msg_type) {
                 protocol.MSG_ROW_DESC,

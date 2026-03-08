@@ -247,12 +247,23 @@ pub const TlsState = struct {
 
     fn writeFn(ctx: *anyopaque, data: []const u8) Transport.WriteError!void {
         const self: *TlsState = @ptrCast(@alignCast(ctx));
-        self.tls_client.writer.writeAll(data) catch return error.WriteFailed;
-        self.tls_client.writer.flush() catch return error.WriteFailed;
-        // Flush the underlying stream writer so encrypted data reaches the socket.
-        // Without this, encrypted data stays in the output buffer and the server
-        // never receives it, causing a deadlock.
-        self.tls_client.output.flush() catch return error.WriteFailed;
+        // Write in chunks that fit within a single TLS record to avoid
+        // data loss. The TLS Client.flush() calls prepareCiphertextRecord
+        // which loops creating records, but is bounded by the output
+        // buffer size (~16645 bytes). If the plaintext exceeds what can
+        // be encrypted into the output buffer, flush() silently drops the
+        // remainder (sets w.end=0). Writing in chunks <=16383 bytes
+        // (max TLS record plaintext) ensures each flush fully drains.
+        const max_chunk = tls.max_ciphertext_inner_record_len;
+        var offset: usize = 0;
+        while (offset < data.len) {
+            const end = @min(offset + max_chunk, data.len);
+            const chunk = data[offset..end];
+            self.tls_client.writer.writeAll(chunk) catch return error.WriteFailed;
+            self.tls_client.writer.flush() catch return error.WriteFailed;
+            self.tls_client.output.flush() catch return error.WriteFailed;
+            offset = end;
+        }
     }
 
     fn closeFn(ctx: *anyopaque) void {
@@ -263,11 +274,12 @@ pub const TlsState = struct {
 
     fn hasPendingFn(ctx: *anyopaque) bool {
         const self: *TlsState = @ptrCast(@alignCast(ctx));
-        // Check if the TLS decrypted reader has buffered data
-        if (self.tls_client.reader.seek < self.tls_client.reader.end) return true;
-        // Check if the encrypted input stream has buffered data awaiting decryption
-        if (self.tls_client.input.seek < self.tls_client.input.end) return true;
-        return false;
+        // Only check the decrypted reader buffer. Buffered encrypted data
+        // in the input stream may not form a complete TLS record — if we
+        // skip poll() based on partial encrypted data, readHeader will
+        // block indefinitely waiting for more socket data, preventing
+        // status updates and causing connection timeouts.
+        return self.tls_client.reader.seek < self.tls_client.reader.end;
     }
 };
 

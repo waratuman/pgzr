@@ -93,9 +93,22 @@ pub const Ingestor = struct {
     /// `complete=false`. The processor reassembles partial batches.
     pub fn run(self: *Ingestor) RunError!void {
         std.log.info("Ingestor started: source_id={s}", .{self.config.source_id});
+        var total_msgs: u64 = 0;
         while (try self.replicator.next()) |wal_msg| {
             const data = wal_msg.data;
             if (data.len == 0) continue;
+
+            total_msgs += 1;
+            const msg_type: u8 = data[0];
+            std.log.debug("ingest: msg #{d} type='{c}' lsn={f} len={d} in_tx={} batch_msgs={d} batch_bytes={d}", .{
+                total_msgs,
+                msg_type,
+                wal_msg.wal_start,
+                data.len,
+                self.in_transaction,
+                self.batch_msg_count,
+                self.batch_buf.items.len,
+            });
 
             // Track batch LSN boundaries
             if (self.batch_msg_count == 0) {
@@ -104,12 +117,12 @@ pub const Ingestor = struct {
             self.batch_end_lsn = wal_msg.wal_start;
 
             // Track transaction boundaries (Begin or StreamStart)
-            if (data[0] == 'B' or data[0] == 'S') {
+            if (msg_type == 'B' or msg_type == 'S') {
                 self.in_transaction = true;
             }
 
             // Parse relation messages to maintain the cache
-            if (data[0] == 'R') {
+            if (msg_type == 'R') {
                 try self.updateRelationCache(data);
             }
 
@@ -120,15 +133,25 @@ pub const Ingestor = struct {
             self.batch_msg_count += 1;
 
             // Flush on COMMIT or StreamCommit boundaries
-            if (data[0] == 'C' or data[0] == 'c') {
+            if (msg_type == 'C' or msg_type == 'c') {
                 self.in_transaction = false;
+                std.log.debug("ingest: flushing batch on commit, msgs={d} bytes={d}", .{
+                    self.batch_msg_count,
+                    self.batch_buf.items.len,
+                });
                 try self.flushBatch(true);
+                std.log.debug("ingest: flush complete, calling ack lsn={f}", .{wal_msg.wal_start});
                 self.replicator.ack(wal_msg.wal_start);
+                std.log.debug("ingest: ack done, continuing to next message", .{});
                 continue;
             }
 
             // Flush mid-transaction when batch size limit is exceeded
             if (self.batch_buf.items.len >= self.config.max_batch_size) {
+                std.log.debug("ingest: batch size limit reached ({d} >= {d})", .{
+                    self.batch_buf.items.len,
+                    self.config.max_batch_size,
+                });
                 if (self.in_transaction) {
                     // Partial batch — processor will reassemble
                     try self.flushBatch(false);
@@ -218,7 +241,12 @@ pub const Ingestor = struct {
         }
         try sql.appendSlice(self.allocator, ") ON CONFLICT (source_id, start_lsn) DO NOTHING");
 
+        std.log.debug("flushBatch: sending INSERT sql_len={d} data_bytes={d}", .{
+            sql.items.len,
+            self.batch_buf.items.len,
+        });
         try self.dest.execLarge(self.allocator, sql.items);
+        std.log.debug("flushBatch: execLarge complete", .{});
 
         std.log.info("batch flushed: start_lsn={f} end_lsn={f} msgs={d} bytes={d} complete={}", .{
             self.batch_start_lsn,

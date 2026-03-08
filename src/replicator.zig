@@ -180,12 +180,15 @@ pub const Replicator = struct {
             // Poll with timeout so we can periodically send status updates
             // and check the stop flag even when no WAL data arrives.
             // Skip poll if the transport (TLS) has buffered data ready to read.
-            if (!self.conn.transport.hasPending()) {
+            const has_pending = self.conn.transport.hasPending();
+            if (!has_pending) {
                 const now_ms = std.time.milliTimestamp();
                 const interval: i64 = @intCast(self.config.status_interval_ms);
                 const elapsed = now_ms - self.last_status_time_ms;
                 const remaining = @max(100, interval - elapsed);
                 const timeout: i32 = @intCast(@min(remaining, std.math.maxInt(i32)));
+
+                std.log.debug("poll: waiting timeout={d}ms elapsed={d}ms", .{ timeout, elapsed });
 
                 var fds = [_]std.posix.pollfd{.{
                     .fd = self.conn.getStreamHandle(),
@@ -198,9 +201,14 @@ pub const Replicator = struct {
                     std.log.debug("poll timeout, sending status", .{});
                     continue;
                 }
+                std.log.debug("poll: ready revents=0x{x}", .{fds[0].revents});
+            } else {
+                std.log.debug("skipping poll: transport has pending data", .{});
             }
 
+            std.log.debug("reading header...", .{});
             const header = try protocol.readHeader(self.conn.transport);
+            std.log.debug("header: type='{c}' len={d}", .{ header.msg_type, header.length });
 
             switch (header.msg_type) {
                 protocol.MSG_COPY_DATA => {
@@ -209,7 +217,16 @@ pub const Replicator = struct {
 
                     switch (body[0]) {
                         protocol.XLOG_DATA => {
-                            return self.handleXLogData(body);
+                            const wal = self.handleXLogData(body);
+                            if (wal) |w| {
+                                std.log.debug("xlog: wal_start={f} wal_end={f} data_len={d} msg_type='{c}'", .{
+                                    w.wal_start,
+                                    w.wal_end,
+                                    w.data.len,
+                                    if (w.data.len > 0) w.data[0] else @as(u8, '?'),
+                                });
+                            }
+                            return wal;
                         },
                         protocol.KEEPALIVE => {
                             try self.handleKeepalive(body);
