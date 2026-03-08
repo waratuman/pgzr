@@ -50,6 +50,12 @@ pub fn performScramAuth(
     // Step 2: Receive AuthenticationSASLContinue
     var recv_buf: [4096]u8 = undefined;
     const cont_header = try protocol.readHeader(transport);
+    if (cont_header.msg_type == protocol.MSG_ERROR) {
+        const err_body = try protocol.readBody(transport, cont_header, &recv_buf);
+        const err = protocol.parseError(err_body);
+        std.log.err("SCRAM auth error (step 2): {s}: {s}", .{ err.code, err.message });
+        return error.AuthenticationFailed;
+    }
     if (cont_header.msg_type != protocol.MSG_AUTH) return error.InvalidServerResponse;
     const cont_body = try protocol.readBody(transport, cont_header, &recv_buf);
     const cont_auth_type = std.mem.readInt(u32, cont_body[0..4], .big);
@@ -135,6 +141,12 @@ pub fn performScramAuth(
 
     // Step 4: Receive AuthenticationSASLFinal, verify server signature
     const final_header = try protocol.readHeader(transport);
+    if (final_header.msg_type == protocol.MSG_ERROR) {
+        const err_body = try protocol.readBody(transport, final_header, &recv_buf);
+        const err = protocol.parseError(err_body);
+        std.log.err("SCRAM auth error (step 4): {s}: {s}", .{ err.code, err.message });
+        return error.AuthenticationFailed;
+    }
     if (final_header.msg_type != protocol.MSG_AUTH) return error.InvalidServerResponse;
     const final_body = try protocol.readBody(transport, final_header, &recv_buf);
     const final_auth_type = std.mem.readInt(u32, final_body[0..4], .big);
@@ -158,6 +170,13 @@ pub fn performScramAuth(
 
     // Step 5: Receive AuthenticationOk
     const ok_header = try protocol.readHeader(transport);
+    if (ok_header.msg_type == protocol.MSG_ERROR) {
+        var ok_err_buf: [4096]u8 = undefined;
+        const err_body = try protocol.readBody(transport, ok_header, &ok_err_buf);
+        const err = protocol.parseError(err_body);
+        std.log.err("SCRAM auth error (step 5): {s}: {s}", .{ err.code, err.message });
+        return error.AuthenticationFailed;
+    }
     if (ok_header.msg_type != protocol.MSG_AUTH) return error.InvalidServerResponse;
     var ok_buf: [16]u8 = undefined;
     const ok_body = try protocol.readBody(transport, ok_header, &ok_buf);

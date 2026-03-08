@@ -2,6 +2,16 @@ const std = @import("std");
 const tls = std.crypto.tls;
 const Certificate = std.crypto.Certificate;
 
+fn tlsDebugEnabled() bool {
+    const value = std.posix.getenv("PGZR_TLS_DEBUG") orelse return false;
+    return value.len > 0 and !std.mem.eql(u8, value, "0");
+}
+
+fn tlsDebug(comptime fmt: []const u8, args: anytype) void {
+    if (!tlsDebugEnabled()) return;
+    std.debug.print("[pgzr tls/transport] " ++ fmt ++ "\n", args);
+}
+
 /// A transport abstraction over plain TCP/Unix sockets and TLS connections.
 /// Provides a unified read/write interface used by the protocol layer.
 pub const Transport = struct {
@@ -215,15 +225,23 @@ pub const TlsState = struct {
         // the byte count, but readSliceShort interprets that as bytes written
         // to the caller's buffer, causing data corruption and hangs.
         const available = self.tls_client.reader.peekGreedy(1) catch |err| switch (err) {
-            error.EndOfStream => return 0,
+            error.EndOfStream => {
+                tlsDebug("tls read EndOfStream", .{});
+                return 0;
+            },
             error.ReadFailed => {
-                if (self.tls_client.read_err) |tls_err| return tls_err;
+                if (self.tls_client.read_err) |tls_err| {
+                    tlsDebug("tls read failed tls_err={}", .{tls_err});
+                    return tls_err;
+                }
+                tlsDebug("tls read failed with ConnectionClosed fallback", .{});
                 return error.ConnectionClosed;
             },
         };
         const n = @min(buf.len, available.len);
         @memcpy(buf[0..n], available[0..n]);
         self.tls_client.reader.toss(n);
+        tlsDebug("tls read bytes={d}", .{n});
         return n;
     }
 

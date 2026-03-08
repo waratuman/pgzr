@@ -70,6 +70,7 @@ pub const Connection = struct {
                 // Server accepts TLS — perform handshake
                 const ts = try TlsState.upgrade(allocator, stream, config.host, config.tls == .verify_full);
                 tls_state = ts;
+                errdefer if (tls_state) |ts2| allocator.destroy(ts2);
                 transport = Transport.tlsClient(ts);
                 // Free the plain state since we're now using TLS
                 allocator.destroy(plain_state.?);
