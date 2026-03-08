@@ -9,6 +9,7 @@ pub const Transport = struct {
     read_fn: *const fn (ctx: *anyopaque, buf: []u8) ReadError!usize,
     write_fn: *const fn (ctx: *anyopaque, data: []const u8) WriteError!void,
     close_fn: *const fn (ctx: *anyopaque) void,
+    has_pending_fn: *const fn (ctx: *anyopaque) bool,
 
     pub const ReadError = std.net.Stream.ReadError || tls.Client.ReadError || error{ConnectionClosed};
     pub const WriteError = std.net.Stream.WriteError || error{WriteFailed};
@@ -25,6 +26,12 @@ pub const Transport = struct {
         self.close_fn(self.context);
     }
 
+    /// Returns true if the transport has buffered data ready to read
+    /// without needing to wait on the underlying socket.
+    pub fn hasPending(self: Transport) bool {
+        return self.has_pending_fn(self.context);
+    }
+
     /// Create a Transport backed by a plain std.net.Stream (TCP or Unix socket).
     pub fn plain(state: *PlainState) Transport {
         return .{
@@ -32,6 +39,7 @@ pub const Transport = struct {
             .read_fn = PlainState.readFn,
             .write_fn = PlainState.writeFn,
             .close_fn = PlainState.closeFn,
+            .has_pending_fn = PlainState.hasPendingFn,
         };
     }
 
@@ -42,6 +50,7 @@ pub const Transport = struct {
             .read_fn = TlsState.readFn,
             .write_fn = TlsState.writeFn,
             .close_fn = TlsState.closeFn,
+            .has_pending_fn = TlsState.hasPendingFn,
         };
     }
 };
@@ -67,6 +76,10 @@ pub const PlainState = struct {
     fn closeFn(ctx: *anyopaque) void {
         const self: *PlainState = @ptrCast(@alignCast(ctx));
         self.stream.close();
+    }
+
+    fn hasPendingFn(_: *anyopaque) bool {
+        return false;
     }
 };
 
@@ -194,14 +207,24 @@ pub const TlsState = struct {
 
     fn readFn(ctx: *anyopaque, buf: []u8) Transport.ReadError!usize {
         const self: *TlsState = @ptrCast(@alignCast(ctx));
-        self.tls_client.reader.readSliceAll(buf) catch |err| switch (err) {
+        if (buf.len == 0) return 0;
+
+        // Use peek/toss to correctly interact with the TLS reader's internal
+        // buffer. The previous readSliceAll approach was broken: the TLS
+        // vtable readVec writes exclusively to its internal buffer and returns
+        // the byte count, but readSliceShort interprets that as bytes written
+        // to the caller's buffer, causing data corruption and hangs.
+        const available = self.tls_client.reader.peekGreedy(1) catch |err| switch (err) {
             error.EndOfStream => return 0,
             error.ReadFailed => {
                 if (self.tls_client.read_err) |tls_err| return tls_err;
                 return error.ConnectionClosed;
             },
         };
-        return buf.len;
+        const n = @min(buf.len, available.len);
+        @memcpy(buf[0..n], available[0..n]);
+        self.tls_client.reader.toss(n);
+        return n;
     }
 
     fn writeFn(ctx: *anyopaque, data: []const u8) Transport.WriteError!void {
@@ -218,6 +241,15 @@ pub const TlsState = struct {
         const self: *TlsState = @ptrCast(@alignCast(ctx));
         self.tls_client.end() catch {};
         self.stream.close();
+    }
+
+    fn hasPendingFn(ctx: *anyopaque) bool {
+        const self: *TlsState = @ptrCast(@alignCast(ctx));
+        // Check if the TLS decrypted reader has buffered data
+        if (self.tls_client.reader.seek < self.tls_client.reader.end) return true;
+        // Check if the encrypted input stream has buffered data awaiting decryption
+        if (self.tls_client.input.seek < self.tls_client.input.end) return true;
+        return false;
     }
 };
 

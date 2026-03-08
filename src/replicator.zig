@@ -179,22 +179,25 @@ pub const Replicator = struct {
 
             // Poll with timeout so we can periodically send status updates
             // and check the stop flag even when no WAL data arrives.
-            const now_ms = std.time.milliTimestamp();
-            const interval: i64 = @intCast(self.config.status_interval_ms);
-            const elapsed = now_ms - self.last_status_time_ms;
-            const remaining = @max(100, interval - elapsed);
-            const timeout: i32 = @intCast(@min(remaining, std.math.maxInt(i32)));
+            // Skip poll if the transport (TLS) has buffered data ready to read.
+            if (!self.conn.transport.hasPending()) {
+                const now_ms = std.time.milliTimestamp();
+                const interval: i64 = @intCast(self.config.status_interval_ms);
+                const elapsed = now_ms - self.last_status_time_ms;
+                const remaining = @max(100, interval - elapsed);
+                const timeout: i32 = @intCast(@min(remaining, std.math.maxInt(i32)));
 
-            var fds = [_]std.posix.pollfd{.{
-                .fd = self.conn.getStreamHandle(),
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
+                var fds = [_]std.posix.pollfd{.{
+                    .fd = self.conn.getStreamHandle(),
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
 
-            const ready = std.posix.poll(&fds, timeout) catch 0;
-            if (ready == 0) {
-                std.log.debug("poll timeout, sending status", .{});
-                continue;
+                const ready = std.posix.poll(&fds, timeout) catch 0;
+                if (ready == 0) {
+                    std.log.debug("poll timeout, sending status", .{});
+                    continue;
+                }
             }
 
             const header = try protocol.readHeader(self.conn.transport);
