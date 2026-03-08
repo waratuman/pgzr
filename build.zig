@@ -148,6 +148,25 @@ pub fn build(b: *std.Build) void {
     const ssl_ingest_step = b.step("ssl-ingest-test", "Run SSL ingest test (requires PostgreSQL with SSL)");
     ssl_ingest_step.dependOn(&run_ssl_ingest.step);
 
+    // TLS destination-path repro
+    const tls_repro = b.addExecutable(.{
+        .name = "tls-repro",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/tls_repro.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pgzr", .module = mod },
+            },
+        }),
+    });
+    const run_tls_repro = b.addRunArtifact(tls_repro);
+    if (b.args) |args| {
+        run_tls_repro.addArgs(args);
+    }
+    const tls_repro_step = b.step("tls-repro", "Run local TLS repro matrix for Ingestor.init");
+    tls_repro_step.dependOn(&run_tls_repro.step);
+
     // Pipeline integration tests (requires a running PostgreSQL instance)
     const pipeline_tests = b.addExecutable(.{
         .name = "pipeline-tests",

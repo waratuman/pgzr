@@ -2,6 +2,16 @@ const std = @import("std");
 const tls = std.crypto.tls;
 const Certificate = std.crypto.Certificate;
 
+fn tlsDebugEnabled() bool {
+    const value = std.posix.getenv("PGZR_TLS_DEBUG") orelse return false;
+    return value.len > 0 and !std.mem.eql(u8, value, "0");
+}
+
+fn tlsDebug(comptime fmt: []const u8, args: anytype) void {
+    if (!tlsDebugEnabled()) return;
+    std.debug.print("[pgzr tls/transport] " ++ fmt ++ "\n", args);
+}
+
 /// A transport abstraction over plain TCP/Unix sockets and TLS connections.
 /// Provides a unified read/write interface used by the protocol layer.
 pub const Transport = struct {
@@ -142,6 +152,7 @@ pub const TlsState = struct {
         host: []const u8,
         verify: bool,
     ) UpgradeError!*TlsState {
+        tlsDebug("TlsState.upgrade begin fd={d} host={s} verify={}", .{ stream.handle, host, verify });
         const state = allocator.create(TlsState) catch return error.BufferTooSmall;
         errdefer allocator.destroy(state);
 
@@ -159,6 +170,7 @@ pub const TlsState = struct {
             ca_bundle.rescan(allocator) catch {
                 ca_bundle = .{};
             };
+            tlsDebug("CA bundle entries={d}", .{ca_bundle.map.count()});
 
             state.tls_client = tls.Client.init(
                 state.stream_reader.interface(),
@@ -171,6 +183,7 @@ pub const TlsState = struct {
                 },
             ) catch |err| {
                 ca_bundle.deinit(allocator);
+                tlsDebug("tls.Client.init (verify) failed: {}", .{err});
                 return err;
             };
         } else {
@@ -185,10 +198,12 @@ pub const TlsState = struct {
                     .write_buffer = &state.tls_write_buf,
                 },
             ) catch |err| {
+                tlsDebug("tls.Client.init (no verify) failed: {}", .{err});
                 return err;
             };
         }
 
+        tlsDebug("TlsState.upgrade complete", .{});
         return state;
     }
 
@@ -198,6 +213,7 @@ pub const TlsState = struct {
             error.EndOfStream => return 0,
             error.ReadFailed => {
                 if (self.tls_client.read_err) |tls_err| return tls_err;
+                tlsDebug("tls read failed with ConnectionClosed fallback", .{});
                 return error.ConnectionClosed;
             },
         };
@@ -206,6 +222,7 @@ pub const TlsState = struct {
 
     fn writeFn(ctx: *anyopaque, data: []const u8) Transport.WriteError!void {
         const self: *TlsState = @ptrCast(@alignCast(ctx));
+        tlsDebug("tls write bytes={d}", .{data.len});
         self.tls_client.writer.writeAll(data) catch return error.WriteFailed;
         self.tls_client.writer.flush() catch return error.WriteFailed;
         // Flush the underlying stream writer so encrypted data reaches the socket.

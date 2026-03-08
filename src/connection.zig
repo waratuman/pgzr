@@ -8,6 +8,16 @@ const Transport = transport_mod.Transport;
 const PlainState = transport_mod.PlainState;
 const TlsState = transport_mod.TlsState;
 
+fn tlsDebugEnabled() bool {
+    const value = std.posix.getenv("PGZR_TLS_DEBUG") orelse return false;
+    return value.len > 0 and !std.mem.eql(u8, value, "0");
+}
+
+fn tlsDebug(comptime fmt: []const u8, args: anytype) void {
+    if (!tlsDebugEnabled()) return;
+    std.debug.print("[pgzr tls] " ++ fmt ++ "\n", args);
+}
+
 pub const Connection = struct {
     transport: Transport,
     allocator: std.mem.Allocator,
@@ -28,6 +38,10 @@ pub const Connection = struct {
     };
 
     pub fn connect(allocator: std.mem.Allocator, config: types.ConnConfig) ConnectError!Connection {
+        tlsDebug(
+            "connect start host={s} port={d} db={s} user={s} tls={s} replication={}",
+            .{ config.host, config.port, config.database, config.user, @tagName(config.tls), config.replication },
+        );
         const stream = if (config.socket_path) |path| blk: {
             // Build socket path: if it doesn't end with a port suffix,
             // append "/.s.PGSQL.<port>"
@@ -51,11 +65,13 @@ pub const Connection = struct {
         errdefer if (plain_state) |ps| allocator.destroy(ps);
         plain_state.?.* = .{ .stream = stream };
         var transport = Transport.plain(plain_state.?);
+        tlsDebug("socket connected fd={d}", .{stream.handle});
 
         var tls_state: ?*TlsState = null;
 
         // TLS negotiation (only for TCP connections, not Unix sockets)
         if (config.tls != .disable and config.socket_path == null) {
+            tlsDebug("sending SSLRequest", .{});
             // Send SSLRequest
             var ssl_buf: [8]u8 = undefined;
             std.mem.writeInt(u32, ssl_buf[0..4], 8, .big);
@@ -65,16 +81,20 @@ pub const Connection = struct {
             // Read 1-byte response
             var resp: [1]u8 = undefined;
             _ = stream.read(&resp) catch return error.ConnectionClosed;
+            tlsDebug("SSLRequest response={c}", .{resp[0]});
 
             if (resp[0] == 'S') {
                 // Server accepts TLS — perform handshake
+                tlsDebug("upgrading to TLS verify_full={}", .{config.tls == .verify_full});
                 const ts = try TlsState.upgrade(allocator, stream, config.host, config.tls == .verify_full);
                 tls_state = ts;
                 transport = Transport.tlsClient(ts);
+                tlsDebug("TLS upgrade complete", .{});
                 // Free the plain state since we're now using TLS
                 allocator.destroy(plain_state.?);
                 plain_state = null;
             } else if (config.tls == .require or config.tls == .verify_full) {
+                tlsDebug("TLS required but server refused", .{});
                 return error.TlsNotSupported;
             }
             // else: .prefer mode, server said 'N', continue with plain
@@ -85,10 +105,13 @@ pub const Connection = struct {
         // Send StartupMessage
 
         const startup = protocol.encodeStartup(&send_buf, config.user, config.database, config.replication);
+        tlsDebug("writing startup message bytes={d}", .{startup.len});
         try transport.writeAll(startup);
 
         // Authenticate
+        tlsDebug("starting authentication", .{});
         try auth_mod.authenticate(transport, config.user, config.password);
+        tlsDebug("authentication complete", .{});
 
         // Allocate receive buffer (1 MiB)
         const recv_buf = try allocator.alloc(u8, 1024 * 1024);
@@ -103,7 +126,9 @@ pub const Connection = struct {
         };
 
         // Process post-auth messages until ReadyForQuery
+        tlsDebug("processing post-auth messages", .{});
         try conn.processPostAuth();
+        tlsDebug("connection ready", .{});
 
         return conn;
     }
