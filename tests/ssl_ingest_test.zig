@@ -3,7 +3,12 @@ const pgzr = @import("pgzr");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer {
+        if (gpa.deinit() == .leak) {
+            std.debug.print("\nMemory leak detected!\n", .{});
+            std.process.exit(1);
+        }
+    }
     const allocator = gpa.allocator();
 
     const user = std.posix.getenv("PGUSER") orelse std.posix.getenv("USER") orelse "postgres";

@@ -1127,7 +1127,12 @@ fn testProtoV4MetadataViaMessage(allocator: std.mem.Allocator) !void {
 // =========================================================================
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer {
+        if (gpa.deinit() == .leak) {
+            std.debug.print("\nMemory leak detected!\n", .{});
+            std.process.exit(1);
+        }
+    }
     const allocator = gpa.allocator();
 
     std.debug.print("PGZR Pipeline Integration Tests\n", .{});
