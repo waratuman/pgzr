@@ -327,18 +327,7 @@ pub const Replicator = struct {
     }
 
     fn readCopyBody(self: *Replicator, header: protocol.MessageHeader) NextError![]u8 {
-        const body_len = header.bodyLen();
-
-        // Grow buffer if needed
-        if (body_len > self.conn.recv_buf.len) {
-            const new_buf = self.allocator.realloc(self.conn.recv_buf, body_len) catch {
-                return error.ProtocolError;
-            };
-            self.conn.recv_buf = new_buf;
-        }
-
-        try protocol.readExact(self.conn.transport, self.conn.recv_buf[0..body_len]);
-        return self.conn.recv_buf[0..body_len];
+        return self.conn.readBodyGrowing(header) catch return error.ProtocolError;
     }
 
     fn handleXLogData(self: *Replicator, body: []const u8) ?types.WalMessage {

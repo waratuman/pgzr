@@ -8,6 +8,8 @@ const Transport = transport_mod.Transport;
 const PlainState = transport_mod.PlainState;
 const TlsState = transport_mod.TlsState;
 
+pub const default_recv_buf_size: usize = 1024 * 1024;
+
 pub const Connection = struct {
     transport: Transport,
     allocator: std.mem.Allocator,
@@ -91,8 +93,7 @@ pub const Connection = struct {
         // Authenticate
         try auth_mod.authenticate(transport, config.user, config.password);
 
-        // Allocate receive buffer (1 MiB)
-        const recv_buf = try allocator.alloc(u8, 1024 * 1024);
+        const recv_buf = try allocator.alloc(u8, default_recv_buf_size);
         errdefer allocator.free(recv_buf);
 
         var conn = Connection{
@@ -107,6 +108,28 @@ pub const Connection = struct {
         try conn.processPostAuth();
 
         return conn;
+    }
+
+    /// Read a message body, growing recv_buf if the body exceeds current capacity.
+    /// Allocates 2x the body size to preserve the split-buffer strategy used by
+    /// simpleQuery and execLargeWithResult (first half for reads, second half
+    /// for stable column data copies).
+    pub fn readBodyGrowing(self: *Connection, header: protocol.MessageHeader) ![]u8 {
+        const body_len = header.bodyLen();
+        if (body_len > self.recv_buf.len) {
+            const new_size = @max(body_len * 2, default_recv_buf_size);
+            self.recv_buf = self.allocator.realloc(self.recv_buf, new_size) catch
+                return error.OutOfMemory;
+        }
+        return try protocol.readBody(self.transport, header, self.recv_buf);
+    }
+
+    /// Shrink recv_buf back to default size if it was grown.
+    fn resetRecvBuf(self: *Connection) void {
+        if (self.recv_buf.len <= default_recv_buf_size) return;
+        if (self.allocator.resize(self.recv_buf, default_recv_buf_size)) {
+            self.recv_buf.len = default_recv_buf_size;
+        }
     }
 
     fn processPostAuth(self: *Connection) ConnectError!void {
@@ -164,6 +187,8 @@ pub const Connection = struct {
     /// survives subsequent protocol reads within this call.
     /// For CopyBothResponse (START_REPLICATION), returns with in_copy_mode=true.
     pub fn simpleQuery(self: *Connection, query: []const u8) QueryError!QueryResult {
+        self.resetRecvBuf();
+
         var send_buf: [4096]u8 = undefined;
         const msg = protocol.encodeQuery(&send_buf, query);
         try self.transport.writeAll(msg);
@@ -174,8 +199,9 @@ pub const Connection = struct {
             .in_copy_mode = false,
         };
 
-        // Reserve second half of recv_buf for stable column data copies
-        const stable_base = self.recv_buf.len / 2;
+        // Reserve second half of recv_buf for stable column data copies.
+        // Recomputed after readBodyGrowing since the buffer may grow.
+        var stable_base = self.recv_buf.len / 2;
         var stable_pos: usize = 0;
 
         while (true) {
@@ -183,10 +209,12 @@ pub const Connection = struct {
 
             switch (header.msg_type) {
                 protocol.MSG_ROW_DESC => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try self.readBodyGrowing(header);
                 },
                 protocol.MSG_DATA_ROW => {
-                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
+                    const body = try self.readBodyGrowing(header);
+                    // Recompute stable_base in case the buffer grew
+                    stable_base = self.recv_buf.len / 2;
                     if (result.column_count == 0) {
                         const raw_col_count = std.mem.readInt(u16, body[0..2], .big);
                         const col_count = @min(raw_col_count, result.columns.len);
@@ -228,7 +256,7 @@ pub const Connection = struct {
                     return error.ServerError;
                 },
                 protocol.MSG_COPY_BOTH => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try self.readBodyGrowing(header);
                     result.in_copy_mode = true;
                     return result;
                 },
@@ -246,6 +274,8 @@ pub const Connection = struct {
     /// Uses a reusable send buffer to avoid per-call allocations.
     /// Does not return result rows — use for INSERT/UPDATE/DELETE/DDL.
     pub fn execLarge(self: *Connection, allocator: std.mem.Allocator, sql: []const u8) QueryError!void {
+        self.resetRecvBuf();
+
         // Query message: 'Q' (1) + int32 len (4) + query + '\0' (1)
         const msg_len = 1 + 4 + sql.len + 1;
         self.send_buf.clearRetainingCapacity();
@@ -268,20 +298,20 @@ pub const Connection = struct {
                 protocol.MSG_CMD_COMPLETE,
                 protocol.MSG_NOTICE,
                 => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try self.readBodyGrowing(header);
                 },
                 protocol.MSG_READY => {
                     _ = try protocol.readBody(self.transport, header, self.recv_buf);
                     return;
                 },
                 protocol.MSG_ERROR => {
-                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
+                    const body = try self.readBodyGrowing(header);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
                     return error.ServerError;
                 },
                 else => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try self.readBodyGrowing(header);
                 },
             }
         }
@@ -292,6 +322,8 @@ pub const Connection = struct {
     /// Column data is copied into the second half of recv_buf so it
     /// survives subsequent protocol reads.
     pub fn execLargeWithResult(self: *Connection, allocator: std.mem.Allocator, query: []const u8) QueryError!QueryResult {
+        self.resetRecvBuf();
+
         const msg_len = 1 + 4 + query.len + 1;
         self.send_buf.clearRetainingCapacity();
         self.send_buf.ensureTotalCapacity(allocator, msg_len) catch return error.OutOfMemory;
@@ -306,8 +338,9 @@ pub const Connection = struct {
             .in_copy_mode = false,
         };
 
-        // Reserve second half of recv_buf for stable column data copies
-        const stable_base = self.recv_buf.len / 2;
+        // Reserve second half of recv_buf for stable column data copies.
+        // Recomputed after readBodyGrowing since the buffer may grow.
+        var stable_base = self.recv_buf.len / 2;
         var stable_pos: usize = 0;
 
         while (true) {
@@ -315,10 +348,11 @@ pub const Connection = struct {
 
             switch (header.msg_type) {
                 protocol.MSG_ROW_DESC => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try self.readBodyGrowing(header);
                 },
                 protocol.MSG_DATA_ROW => {
-                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
+                    const body = try self.readBodyGrowing(header);
+                    stable_base = self.recv_buf.len / 2;
                     if (result.column_count == 0) {
                         const raw_col_count = std.mem.readInt(u16, body[0..2], .big);
                         const col_count = @min(raw_col_count, result.columns.len);
@@ -378,6 +412,8 @@ pub const Connection = struct {
         context: anytype,
         callback: fn (@TypeOf(context), []const QueryColumn) void,
     ) QueryError!usize {
+        self.resetRecvBuf();
+
         var send_buf: [4096]u8 = undefined;
         const msg = protocol.encodeQuery(&send_buf, query);
         try self.transport.writeAll(msg);
@@ -389,10 +425,10 @@ pub const Connection = struct {
 
             switch (header.msg_type) {
                 protocol.MSG_ROW_DESC => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try self.readBodyGrowing(header);
                 },
                 protocol.MSG_DATA_ROW => {
-                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
+                    const body = try self.readBodyGrowing(header);
                     const col_count = std.mem.readInt(u16, body[0..2], .big);
                     var cols: [16]QueryColumn = undefined;
                     var pos: usize = 2;
@@ -411,23 +447,23 @@ pub const Connection = struct {
                     row_count += 1;
                 },
                 protocol.MSG_CMD_COMPLETE => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try self.readBodyGrowing(header);
                 },
                 protocol.MSG_READY => {
                     _ = try protocol.readBody(self.transport, header, self.recv_buf);
                     return row_count;
                 },
                 protocol.MSG_ERROR => {
-                    const body = try protocol.readBody(self.transport, header, self.recv_buf);
+                    const body = try self.readBodyGrowing(header);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
                     return error.ServerError;
                 },
                 protocol.MSG_NOTICE => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try self.readBodyGrowing(header);
                 },
                 else => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try self.readBodyGrowing(header);
                 },
             }
         }
