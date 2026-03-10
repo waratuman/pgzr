@@ -339,17 +339,37 @@ benchmark/
 
 ## Future Work
 
-- **Pipeline mode for dest queries** — Currently the processor uses the simple
-  query protocol, issuing one round-trip per SQL statement. PostgreSQL's
-  extended query protocol supports pipeline mode (Parse/Bind/Execute/Sync)
-  which allows sending an entire batch of queries without waiting for
-  individual responses. This would collapse all event INSERTs for a batch into
-  a single network round-trip. Requires implementing the extended query
-  protocol and pipeline error handling.
+- **UUIDv7 transaction IDs** — Replace `transactions.id` (BIGSERIAL) with a
+  client-generated UUIDv7. This eliminates the `INSERT RETURNING id`
+  round-trip when creating a transaction, since the ID is known before the
+  INSERT. The transaction INSERT can then be combined with the events
+  multi-row INSERT into a single SQL statement, reducing the per-transaction
+  round-trips from 2 to 1. Requires a schema migration:
+  `transactions.id` from `BIGSERIAL` to `UUID`, `events.transaction_id` from
+  `BIGINT` to `UUID`, and updating the composite foreign key and primary keys.
+  UUIDv7's time-ordered prefix preserves index locality on the partitioned
+  tables. Zig's `std.crypto.random` provides the entropy source; the
+  timestamp prefix comes from `std.time.milliTimestamp()`.
+
+- **Extended query protocol** — The processor currently uses the simple query
+  protocol. PostgreSQL's extended query protocol (Parse/Bind/Execute/Sync)
+  enables parameterized queries with plan caching and pipeline mode for
+  further reducing round-trips. Requires implementing Parse, Bind, Execute,
+  Describe, and Sync message encoding in `protocol.zig`, a new pipelined
+  execution path in `connection.zig`, and response handling that matches
+  multiple result sequences to their corresponding requests. Event INSERTs
+  are already batched into a single multi-row INSERT per transaction.
 
 - **io_uring / kqueue** — The transport layer currently uses blocking I/O.
   Using io_uring (Linux) or kqueue (macOS) would allow non-blocking,
   event-driven I/O — enabling a single thread to manage multiple replication
   connections and reduce syscall overhead. Zig's `std.posix` provides the
   building blocks for both.
+
+- **Store source system identifier, database, and timeline** — The Replicator
+  already fetches system_id, timeline, and database name via IDENTIFY_SYSTEM.
+  Storing these in the destination (e.g. on a sources table or in
+  wal_batches/transactions metadata) would allow the pipeline to detect when
+  a source has been rebuilt, failed over to a different timeline, or when
+  batches from different clusters are accidentally mixed.
 

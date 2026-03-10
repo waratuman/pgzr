@@ -39,13 +39,16 @@ pub const Processor = struct {
     metadata_chunks: std.ArrayListUnmanaged([]u8),
     metadata_table_oid: ?u32,
 
-    // Streaming event buffer (proto v2+): events are deferred until
-    // stream_commit when the commit timestamp becomes available.
-    is_streaming_txn: bool,
-    pending_stream_events: std.ArrayListUnmanaged([]u8),
+    // Buffered events: accumulated during a transaction and flushed as a
+    // single multi-row INSERT at commit time (or in chunks when the buffer
+    // exceeds flush_threshold to bound memory for large transactions).
+    pending_events: std.ArrayListUnmanaged([]u8),
 
     // Stop flag for graceful shutdown
     stop_flag: std.atomic.Value(bool),
+
+    // Maximum number of buffered events before an intermediate flush.
+    const flush_threshold: usize = 1000;
 
     const OwnedRelation = struct {
         oid: u32,
@@ -100,8 +103,7 @@ pub const Processor = struct {
             .pending_batch_ids = .{},
             .metadata_chunks = .{},
             .metadata_table_oid = null,
-            .is_streaming_txn = false,
-            .pending_stream_events = .{},
+            .pending_events = .{},
             .stop_flag = std.atomic.Value(bool).init(false),
         };
     }
@@ -237,6 +239,7 @@ pub const Processor = struct {
                     self.current_txn_id = try self.insertTransaction(begin.final_lsn);
                 },
                 .commit => {
+                    try self.flushPendingEvents();
                     try self.flushMetadata();
                     self.in_transaction = false;
                     self.current_txn_id = null;
@@ -253,36 +256,24 @@ pub const Processor = struct {
                 .insert => |ins| {
                     if (self.isMetadataTable(ins.relation_oid)) {
                         try self.extractMetadataFromTuple(ins.relation_oid, ins.new_tuple);
-                    } else if (self.is_streaming_txn) {
-                        try self.bufferStreamEvent(ins.relation_oid, 'I', ins.new_tuple, null);
                     } else {
-                        try self.insertEvent(ins.relation_oid, 'I', ins.new_tuple, null);
+                        try self.bufferEvent(ins.relation_oid, 'I', ins.new_tuple, null);
                     }
                 },
                 .update => |upd| {
                     if (self.isMetadataTable(upd.relation_oid)) {
                         try self.extractMetadataFromTuple(upd.relation_oid, upd.new_tuple);
-                    } else if (self.is_streaming_txn) {
-                        try self.bufferStreamEvent(upd.relation_oid, 'U', upd.new_tuple, upd.old_tuple);
                     } else {
-                        try self.insertEvent(upd.relation_oid, 'U', upd.new_tuple, upd.old_tuple);
+                        try self.bufferEvent(upd.relation_oid, 'U', upd.new_tuple, upd.old_tuple);
                     }
                 },
                 .delete => |del| {
                     if (!self.isMetadataTable(del.relation_oid)) {
-                        if (self.is_streaming_txn) {
-                            try self.bufferStreamEvent(del.relation_oid, 'D', null, del.old_tuple);
-                        } else {
-                            try self.insertEvent(del.relation_oid, 'D', null, del.old_tuple);
-                        }
+                        try self.bufferEvent(del.relation_oid, 'D', null, del.old_tuple);
                     }
                 },
                 .truncate => {
-                    if (self.is_streaming_txn) {
-                        try self.bufferStreamEvent(0, 'T', null, null);
-                    } else {
-                        try self.insertTruncateEvent();
-                    }
+                    try self.bufferEvent(0, 'T', null, null);
                 },
                 // Proto v2: streaming — events and metadata are buffered
                 // during stream chunks and flushed at commit time when
@@ -292,9 +283,8 @@ pub const Processor = struct {
                     if (ss.first_segment) {
                         self.current_txn_xid = ss.xid;
                         self.in_transaction = true;
-                        self.is_streaming_txn = true;
                         self.clearMetadataChunks();
-                        self.clearPendingStreamEvents();
+                        self.clearPendingEvents();
                     }
                 },
                 .stream_stop => {
@@ -304,19 +294,17 @@ pub const Processor = struct {
                     self.current_txn_lsn = sc.lsn;
                     self.current_txn_timestamp = sc.timestamp;
                     self.current_txn_id = try self.insertTransaction(sc.lsn);
-                    try self.flushStreamEvents();
+                    try self.flushPendingEvents();
                     try self.flushMetadata();
                     self.current_stream_xid = null;
                     self.in_transaction = false;
-                    self.is_streaming_txn = false;
                     self.current_txn_id = null;
                 },
                 .stream_abort => {
                     self.clearMetadataChunks();
-                    self.clearPendingStreamEvents();
+                    self.clearPendingEvents();
                     self.current_stream_xid = null;
                     self.in_transaction = false;
-                    self.is_streaming_txn = false;
                     self.current_txn_id = null;
                 },
                 // Proto v3: two-phase commit
@@ -332,11 +320,13 @@ pub const Processor = struct {
                     // Prepared but not yet committed — keep txn state
                 },
                 .commit_prepared => {
+                    try self.flushPendingEvents();
                     try self.flushMetadata();
                     self.in_transaction = false;
                     self.current_txn_id = null;
                 },
                 .rollback_prepared => {
+                    self.clearPendingEvents();
                     self.in_transaction = false;
                     self.current_txn_id = null;
                 },
@@ -451,120 +441,6 @@ pub const Processor = struct {
         if (self.relations.getPtr(rel.oid)) |owned| {
             owned.snapshot_lsn = self.current_txn_lsn;
         }
-    }
-
-    fn insertEvent(
-        self: *Processor,
-        relation_oid: u32,
-        event_type: u8,
-        tuple: ?[]const pgoutput.ColumnData,
-        old_tuple: ?[]const pgoutput.ColumnData,
-    ) !void {
-        const rel = self.relations.get(relation_oid) orelse return;
-
-        // Compute identity digests
-        const identity_digest = if (tuple) |t|
-            try self.computeIdentityDigest(rel, t)
-        else if (old_tuple) |ot|
-            try self.computeIdentityDigest(rel, ot)
-        else
-            null;
-        defer if (identity_digest) |d| self.allocator.free(d);
-
-        const prev_identity_digest = if (old_tuple) |ot|
-            try self.computeIdentityDigest(rel, ot)
-        else
-            null;
-        defer if (prev_identity_digest) |d| self.allocator.free(d);
-
-        var sql: std.ArrayListUnmanaged(u8) = .{};
-        defer sql.deinit(self.allocator);
-
-        try sql.appendSlice(
-            self.allocator,
-            "INSERT INTO events (transaction_id, committed_at, rel_oid, type, " ++
-                "identity_digest, previous_identity_digest, data, old_data) VALUES (",
-        );
-
-        // transaction_id
-        if (self.current_txn_id) |txn_id| {
-            try query_mod.appendIntValue(&sql, self.allocator, txn_id);
-        } else {
-            try sql.appendSlice(self.allocator, "(SELECT id FROM transactions WHERE source_id=");
-            try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
-            try sql.appendSlice(self.allocator, " AND lsn=");
-            try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
-            try sql.appendSlice(self.allocator, " AND committed_at=");
-            try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
-            try sql.append(self.allocator, ')');
-        }
-        try sql.appendSlice(self.allocator, ", ");
-
-        // committed_at
-        try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
-        try sql.appendSlice(self.allocator, ", ");
-
-        // rel_oid
-        try query_mod.appendIntValue(&sql, self.allocator, relation_oid);
-        try sql.appendSlice(self.allocator, ", '");
-        try sql.append(self.allocator, event_type);
-        try sql.appendSlice(self.allocator, "', ");
-
-        // identity_digest
-        try query_mod.appendByteaOrNull(&sql, self.allocator, identity_digest);
-        try sql.appendSlice(self.allocator, ", ");
-
-        // previous_identity_digest
-        try query_mod.appendByteaOrNull(&sql, self.allocator, prev_identity_digest);
-        try sql.appendSlice(self.allocator, ", ");
-
-        // data JSONB — build from tuple
-        if (tuple) |t| {
-            try self.appendTupleAsJsonb(&sql, rel, t);
-        } else {
-            try sql.appendSlice(self.allocator, "NULL");
-        }
-        try sql.appendSlice(self.allocator, ", ");
-
-        // old_data JSONB — build from old_tuple
-        if (old_tuple) |ot| {
-            try self.appendTupleAsJsonb(&sql, rel, ot);
-        } else {
-            try sql.appendSlice(self.allocator, "NULL");
-        }
-
-        try sql.append(self.allocator, ')');
-
-        try self.dest.execLarge(self.allocator, sql.items);
-    }
-
-    fn insertTruncateEvent(self: *Processor) !void {
-        var sql: std.ArrayListUnmanaged(u8) = .{};
-        defer sql.deinit(self.allocator);
-
-        try sql.appendSlice(
-            self.allocator,
-            "INSERT INTO events (transaction_id, committed_at, rel_oid, type, data, old_data) VALUES (",
-        );
-
-        // transaction_id
-        if (self.current_txn_id) |txn_id| {
-            try query_mod.appendIntValue(&sql, self.allocator, txn_id);
-        } else {
-            try sql.appendSlice(self.allocator, "(SELECT id FROM transactions WHERE source_id=");
-            try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
-            try sql.appendSlice(self.allocator, " AND lsn=");
-            try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
-            try sql.appendSlice(self.allocator, " AND committed_at=");
-            try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
-            try sql.append(self.allocator, ')');
-        }
-
-        try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
-        try sql.appendSlice(self.allocator, ", 0, 'T', NULL, NULL)");
-
-        try self.dest.execLarge(self.allocator, sql.items);
     }
 
     /// Append a pgoutput tuple as a JSONB literal ('{"col":"val",...}')
@@ -775,10 +651,10 @@ pub const Processor = struct {
         self.clearMetadataChunks();
     }
 
-    /// Buffer an event's value fragment during a streaming transaction.
+    /// Buffer an event's value fragment for later batch insertion.
     /// The fragment contains everything except transaction_id and committed_at,
-    /// which are filled in at stream_commit time by flushStreamEvents.
-    fn bufferStreamEvent(
+    /// which are filled in at flush time by flushPendingEvents.
+    fn bufferEvent(
         self: *Processor,
         relation_oid: u32,
         event_type: u8,
@@ -847,13 +723,19 @@ pub const Processor = struct {
         }
 
         const owned = try frag.toOwnedSlice(self.allocator);
-        try self.pending_stream_events.append(self.allocator, owned);
+        try self.pending_events.append(self.allocator, owned);
+
+        // Flush in chunks to bound memory for large transactions.
+        // Only possible when current_txn_id is known (non-streaming path).
+        if (self.pending_events.items.len >= flush_threshold and self.current_txn_id != null) {
+            try self.flushPendingEvents();
+        }
     }
 
-    /// Insert all buffered streaming events with the now-known transaction_id
-    /// and committed_at timestamp.
-    fn flushStreamEvents(self: *Processor) !void {
-        if (self.pending_stream_events.items.len == 0) return;
+    /// Insert all buffered events as a single multi-row INSERT with the
+    /// transaction_id and committed_at timestamp.
+    fn flushPendingEvents(self: *Processor) !void {
+        if (self.pending_events.items.len == 0) return;
 
         var sql: std.ArrayListUnmanaged(u8) = .{};
         defer sql.deinit(self.allocator);
@@ -864,7 +746,7 @@ pub const Processor = struct {
                 "identity_digest, previous_identity_digest, data, old_data) VALUES ",
         );
 
-        for (self.pending_stream_events.items, 0..) |frag, i| {
+        for (self.pending_events.items, 0..) |frag, i| {
             if (i > 0) try sql.appendSlice(self.allocator, ", ");
             try sql.append(self.allocator, '(');
 
@@ -892,14 +774,14 @@ pub const Processor = struct {
         }
 
         try self.dest.execLarge(self.allocator, sql.items);
-        self.clearPendingStreamEvents();
+        self.clearPendingEvents();
     }
 
-    fn clearPendingStreamEvents(self: *Processor) void {
-        for (self.pending_stream_events.items) |frag| {
+    fn clearPendingEvents(self: *Processor) void {
+        for (self.pending_events.items) |frag| {
             self.allocator.free(frag);
         }
-        self.pending_stream_events.clearRetainingCapacity();
+        self.pending_events.clearRetainingCapacity();
     }
 
     fn decodeBytea(self: *Processor, hex_data: []const u8) ![]u8 {
@@ -969,8 +851,8 @@ pub const Processor = struct {
         self.pending_batch_ids.deinit(self.allocator);
         self.clearMetadataChunks();
         self.metadata_chunks.deinit(self.allocator);
-        self.clearPendingStreamEvents();
-        self.pending_stream_events.deinit(self.allocator);
+        self.clearPendingEvents();
+        self.pending_events.deinit(self.allocator);
         self.dest.close();
     }
 };
