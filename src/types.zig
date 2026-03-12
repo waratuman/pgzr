@@ -82,7 +82,6 @@ pub const IngestConfig = struct {
 
 pub const ProcessorConfig = struct {
     dest: ConnConfig,
-    source_id: []const u8,
     /// Maximum number of batches to claim per processing cycle.
     batch_limit: u32 = 10,
     /// Polling interval in milliseconds when no pending batches are found.

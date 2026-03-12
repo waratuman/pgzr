@@ -237,7 +237,6 @@ fn testProcessorParsesBatches(allocator: std.mem.Allocator) !void {
     // Process the batches stored by the previous test
     var processor = pgzr.Processor.init(allocator, .{
         .dest = destConnConfig(),
-        .source_id = SOURCE_ID,
     }) catch |err| {
         std.debug.print("FAIL (init processor: {})\n", .{err});
         return err;
@@ -381,7 +380,6 @@ fn testUpdateAndDelete(allocator: std.mem.Allocator) !void {
     // Process
     var processor = pgzr.Processor.init(allocator, .{
         .dest = destConnConfig(),
-        .source_id = SOURCE_ID,
     }) catch |err| {
         std.debug.print("FAIL (init processor: {})\n", .{err});
         return err;
@@ -588,7 +586,6 @@ fn testMetadataViaMessage(allocator: std.mem.Allocator) !void {
     // Process with metadata_message_prefix configured
     var processor = pgzr.Processor.init(allocator, .{
         .dest = destConnConfig(),
-        .source_id = SOURCE_ID,
         .metadata_message_prefix = "test_metadata",
     }) catch |err| {
         std.debug.print("FAIL (init processor: {})\n", .{err});
@@ -716,7 +713,6 @@ fn testMetadataViaTable(allocator: std.mem.Allocator) !void {
     // Process with metadata_table configured
     var processor = pgzr.Processor.init(allocator, .{
         .dest = destConnConfig(),
-        .source_id = SOURCE_ID,
         .metadata_table = "test_metadata_table",
     }) catch |err| {
         std.debug.print("FAIL (init processor: {})\n", .{err});
@@ -846,7 +842,6 @@ fn testStreamingEvents(allocator: std.mem.Allocator) !void {
     // Process
     var processor = pgzr.Processor.init(allocator, .{
         .dest = destConnConfig(),
-        .source_id = SOURCE_ID,
     }) catch |err| {
         std.debug.print("FAIL (init processor: {})\n", .{err});
         runPsql(allocator, SOURCE_DB, "ALTER SYSTEM RESET logical_decoding_work_mem") catch {};
@@ -961,7 +956,6 @@ fn testStreamingMetadataViaMessage(allocator: std.mem.Allocator) !void {
     // Process with metadata prefix
     var processor = pgzr.Processor.init(allocator, .{
         .dest = destConnConfig(),
-        .source_id = SOURCE_ID,
         .metadata_message_prefix = "test_metadata",
     }) catch |err| {
         std.debug.print("FAIL (init processor: {})\n", .{err});
@@ -1078,7 +1072,6 @@ fn testProtoV4MetadataViaMessage(allocator: std.mem.Allocator) !void {
     // Process with metadata prefix
     var processor = pgzr.Processor.init(allocator, .{
         .dest = destConnConfig(),
-        .source_id = SOURCE_ID,
         .metadata_message_prefix = "test_metadata",
     }) catch |err| {
         std.debug.print("FAIL (init processor: {})\n", .{err});

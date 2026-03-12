@@ -151,7 +151,6 @@ var processor = try pgzr.Processor.init(allocator, .{
         .database = "dest_db",
         .replication = false,
     },
-    .source_id = "00000000-0000-0000-0000-000000000001",
     // Optional: capture metadata from pg_logical_emit_message
     .metadata_message_prefix = "my_prefix",
     // Optional: capture metadata from a table

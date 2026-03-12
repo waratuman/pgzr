@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-03-12
+
+### Breaking Changes
+
+- **`ProcessorConfig.source_id` removed.** Processors are now source-agnostic
+  workers that derive `source_id` from each claimed batch. Remove the
+  `source_id` field from any `ProcessorConfig` initialization.
+
+- **`wal_batches` schema change: new `begin_lsn` column.** The column groups
+  partial batches belonging to the same transaction. Existing databases require
+  a migration:
+
+  ```sql
+  ALTER TABLE wal_batches ADD COLUMN begin_lsn BIGINT;
+  UPDATE wal_batches SET begin_lsn = start_lsn WHERE begin_lsn IS NULL;
+  ALTER TABLE wal_batches ALTER COLUMN begin_lsn SET NOT NULL;
+  ```
+
+- **C ABI: `source_id` removed from `PgzrProcessorConfig`.** The field is no
+  longer present in the extern struct.
+
+### Added
+
+- Processors can now safely run concurrently. Multiple processor instances
+  drain a shared `wal_batches` queue ordered by `created_at` (FIFO across all
+  sources). Partial batch chains are claimed atomically by `(source_id,
+  begin_lsn)` grouping.
+
+- Relation metadata is now loaded from the `relations` JSONB column stored in
+  each batch, making batches self-contained and order-independent.
+
+### Fixed
+
+- Single quotes in text values are now escaped in JSONB output, fixing SQL
+  syntax errors for values like `O'Brien` (#7).
+
 ## [0.3.5] - 2026-03-12
 
 ### Fixed
