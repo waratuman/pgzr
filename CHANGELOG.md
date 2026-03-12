@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.4] - 2026-03-12
+
+### Fixed
+- Single quotes in text values are now escaped in JSONB output, fixing SQL
+  syntax errors for values like `O'Brien` (#7).
+
 ## [0.3.3] - 2026-03-10
 
 ### Changed

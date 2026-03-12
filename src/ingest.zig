@@ -345,6 +345,7 @@ pub const Ingestor = struct {
         for (s) |c| {
             switch (c) {
                 '"' => try list.appendSlice(allocator, "\\\""),
+                '\'' => try list.appendSlice(allocator, "''"),
                 '\\' => try list.appendSlice(allocator, "\\\\"),
                 '\n' => try list.appendSlice(allocator, "\\n"),
                 '\r' => try list.appendSlice(allocator, "\\r"),

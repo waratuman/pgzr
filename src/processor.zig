@@ -863,6 +863,7 @@ fn appendJsonString(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Alloca
     for (value) |c| {
         switch (c) {
             '"' => try list.appendSlice(allocator, "\\\""),
+            '\'' => try list.appendSlice(allocator, "''"),
             '\\' => try list.appendSlice(allocator, "\\\\"),
             '\n' => try list.appendSlice(allocator, "\\n"),
             '\r' => try list.appendSlice(allocator, "\\r"),
