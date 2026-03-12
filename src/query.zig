@@ -2,6 +2,8 @@ const std = @import("std");
 
 /// Escape a text value for use in a SQL string literal.
 /// Doubles any single quotes and wraps in single quotes: 'value'
+/// Assumes standard_conforming_strings=on (PostgreSQL default since 9.1).
+/// Does not validate multibyte sequences; callers must ensure valid UTF-8.
 /// Caller owns the returned slice.
 pub fn escapeString(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     // Count single quotes to determine output size
@@ -145,6 +147,8 @@ fn isValidUuid(s: []const u8) bool {
 // ── Append helpers (zero-alloc, write directly into SQL builder) ───────
 
 /// Append a SQL string literal to the list, escaping single quotes.
+/// Assumes standard_conforming_strings=on (PostgreSQL default since 9.1).
+/// Does not validate multibyte sequences; callers must ensure valid UTF-8.
 pub fn appendEscapedString(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: []const u8) !void {
     try list.append(alloc, '\'');
     for (value) |c| {
@@ -465,7 +469,7 @@ test "appendTimestamp: pg epoch" {
 test "appendByteaOrNull: with data" {
     var list: std.ArrayListUnmanaged(u8) = .{};
     defer list.deinit(std.testing.allocator);
-    try appendByteaOrNull(&list, std.testing.allocator, &[_]u8{ 0xab });
+    try appendByteaOrNull(&list, std.testing.allocator, &[_]u8{0xab});
     try std.testing.expectEqualStrings("'\\xab'", list.items);
 }
 

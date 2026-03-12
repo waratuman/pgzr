@@ -350,6 +350,11 @@ pub const Ingestor = struct {
                 '\n' => try list.appendSlice(allocator, "\\n"),
                 '\r' => try list.appendSlice(allocator, "\\r"),
                 '\t' => try list.appendSlice(allocator, "\\t"),
+                0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
+                    var buf: [6]u8 = undefined;
+                    _ = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
+                    try list.appendSlice(allocator, &buf);
+                },
                 else => try list.append(allocator, c),
             }
         }

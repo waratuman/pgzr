@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.5] - 2026-03-12
+
+### Fixed
+- Escape JSON control characters (0x00-0x1f) in ingestor relation
+  serialization, matching the processor's escaping behavior.
+- Document `standard_conforming_strings=on` assumption and UTF-8 requirement
+  on SQL string escaping functions.
+
 ## [0.3.4] - 2026-03-12
 
 ### Fixed
