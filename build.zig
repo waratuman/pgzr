@@ -148,6 +148,23 @@ pub fn build(b: *std.Build) void {
     const ssl_ingest_step = b.step("ssl-ingest-test", "Run SSL ingest test (requires PostgreSQL with SSL)");
     ssl_ingest_step.dependOn(&run_ssl_ingest.step);
 
+    // Concurrent processor stress test (requires a running PostgreSQL instance)
+    const concurrent_stress = b.addExecutable(.{
+        .name = "concurrent-stress-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/concurrent_stress.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pgzr", .module = mod },
+            },
+        }),
+    });
+
+    const run_concurrent_stress = b.addRunArtifact(concurrent_stress);
+    const concurrent_stress_step = b.step("concurrent-stress-test", "Run concurrent processor stress test (requires PostgreSQL)");
+    concurrent_stress_step.dependOn(&run_concurrent_stress.step);
+
     // Pipeline integration tests (requires a running PostgreSQL instance)
     const pipeline_tests = b.addExecutable(.{
         .name = "pipeline-tests",

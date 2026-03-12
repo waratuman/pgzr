@@ -1116,6 +1116,172 @@ fn testProtoV4MetadataViaMessage(allocator: std.mem.Allocator) !void {
 }
 
 // =========================================================================
+// Test 11: Concurrent processors — two processors drain the queue safely
+// =========================================================================
+fn testConcurrentProcessors(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: concurrent processors... ", .{});
+
+    // Clear dest
+    try runPsql(
+        allocator,
+        DEST_DB,
+        "TRUNCATE events, relation_snapshots, transactions, wal_batches CASCADE",
+    );
+    runPsql(allocator, SOURCE_DB, "TRUNCATE items RESTART IDENTITY") catch {};
+
+    // Verify clean slate
+    const pre_events = try queryCount(allocator, DEST_DB, "SELECT count(*) FROM events");
+    if (pre_events > 0) {
+        std.debug.print("FAIL (truncate did not clear events, {d} remaining)\n", .{pre_events});
+        return error.ServerError;
+    }
+
+    // Insert 10 separate transactions so there are multiple batches to claim
+    for (0..10) |i| {
+        var buf: [256]u8 = undefined;
+        const sql = std.fmt.bufPrint(&buf, "INSERT INTO items (name, quantity) VALUES ('concurrent_{d}', {d})", .{ i, i }) catch unreachable;
+        runPsql(allocator, SOURCE_DB, sql) catch {};
+    }
+
+    // Get end LSN
+    const end_lsn = getCurrentWalLsn(allocator) catch |err| {
+        std.debug.print("FAIL (get LSN: {})\n", .{err});
+        return err;
+    };
+
+    // Ingest all batches
+    var ingestor = pgzr.Ingestor.init(allocator, .{
+        .source = .{
+            .conn = sourceConnConfig(),
+            .slot_name = SLOT_NAME,
+            .end_position = end_lsn,
+            .options = &.{
+                .{ "proto_version", "1" },
+                .{ "publication_names", PUB_NAME },
+            },
+        },
+        .dest = destConnConfig(),
+        .source_id = SOURCE_ID,
+    }) catch |err| {
+        std.debug.print("FAIL (init ingestor: {})\n", .{err});
+        return err;
+    };
+    defer ingestor.deinit();
+
+    ingestor.run() catch |err| {
+        std.debug.print("FAIL (ingestor run: {})\n", .{err});
+        return err;
+    };
+
+    // Verify we have batches to process
+    const batch_count = try queryCount(allocator, DEST_DB, "SELECT count(*) FROM wal_batches WHERE state='pending'");
+    if (batch_count == 0) {
+        std.debug.print("FAIL (no batches to process)\n", .{});
+        return error.ServerError;
+    }
+
+    // Run two processors concurrently in separate threads
+    const SharedResult = struct {
+        batches: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        errors: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    };
+
+    var r1 = SharedResult{};
+    var r2 = SharedResult{};
+
+    const worker = struct {
+        fn run(result: *SharedResult, alloc: std.mem.Allocator) void {
+            var processor = pgzr.Processor.init(alloc, .{
+                .dest = destConnConfig(),
+            }) catch {
+                _ = result.errors.fetchAdd(1, .monotonic);
+                return;
+            };
+            defer processor.deinit();
+
+            while (true) {
+                const processed = processor.processOne() catch {
+                    _ = result.errors.fetchAdd(1, .monotonic);
+                    return;
+                };
+                if (!processed) break;
+                _ = result.batches.fetchAdd(1, .monotonic);
+            }
+        }
+    }.run;
+
+    const t1 = std.Thread.spawn(.{}, worker, .{ &r1, allocator }) catch |err| {
+        std.debug.print("FAIL (spawn thread 1: {})\n", .{err});
+        return err;
+    };
+    const t2 = std.Thread.spawn(.{}, worker, .{ &r2, allocator }) catch |err| {
+        std.debug.print("FAIL (spawn thread 2: {})\n", .{err});
+        t1.join();
+        return err;
+    };
+
+    t1.join();
+    t2.join();
+
+    const p1_batches = r1.batches.load(.monotonic);
+    const p2_batches = r2.batches.load(.monotonic);
+    const p1_errors = r1.errors.load(.monotonic);
+    const p2_errors = r2.errors.load(.monotonic);
+
+    if (p1_errors > 0 or p2_errors > 0) {
+        std.debug.print("FAIL (processor errors: p1={d} p2={d})\n", .{ p1_errors, p2_errors });
+        return error.ServerError;
+    }
+
+    const total_batches = p1_batches + p2_batches;
+    if (total_batches != batch_count) {
+        std.debug.print("FAIL (expected {d} batches processed, got {d} (p1={d} p2={d}))\n", .{
+            batch_count, total_batches, p1_batches, p2_batches,
+        });
+        return error.ServerError;
+    }
+
+    // Verify no batches remain
+    const remaining = try queryCount(allocator, DEST_DB, "SELECT count(*) FROM wal_batches");
+    if (remaining > 0) {
+        std.debug.print("FAIL ({d} batches not cleaned up)\n", .{remaining});
+        return error.ServerError;
+    }
+
+    // Verify all 10 insert events were created (no duplicates, no misses)
+    // Filter by data containing 'concurrent_' to exclude events from WAL
+    // that the replication slot replays from prior tests
+    const event_count = try queryCount(allocator, DEST_DB,
+        \\SELECT count(*) FROM events
+        \\ WHERE type='I' AND data::text LIKE '%concurrent_%'
+    );
+    if (event_count != 10) {
+        std.debug.print("FAIL (expected 10 insert events, got {d})\n", .{event_count});
+        return error.ServerError;
+    }
+
+    // Verify no duplicate transactions
+    const dup_txns = try queryCount(allocator, DEST_DB,
+        \\SELECT count(*) FROM (
+        \\  SELECT source_id, lsn FROM transactions
+        \\  GROUP BY source_id, lsn HAVING count(*) > 1
+        \\) dupes
+    );
+    if (dup_txns > 0) {
+        std.debug.print("FAIL ({d} duplicate transactions)\n", .{dup_txns});
+        return error.ServerError;
+    }
+
+    std.debug.print("OK ({d} batches: p1={d} p2={d}, {d} events, no duplicates)\n", .{
+        total_batches, p1_batches, p2_batches, event_count,
+    });
+}
+
+// (stress test moved to tests/concurrent_stress.zig — run via `zig build concurrent-stress-test`)
+
+// (stress test moved to tests/concurrent_stress.zig — run via `zig build concurrent-stress-test`)
+
+// =========================================================================
 // Main
 // =========================================================================
 pub fn main() !void {
@@ -1177,6 +1343,10 @@ pub fn main() !void {
     };
 
     testProtoV4MetadataViaMessage(allocator) catch {
+        failures += 1;
+    };
+
+    testConcurrentProcessors(allocator) catch {
         failures += 1;
     };
 
