@@ -1,4 +1,5 @@
 const std = @import("std");
+const json = std.json;
 const Connection = @import("connection.zig").Connection;
 const pgoutput = @import("pgoutput.zig");
 const types = @import("types.zig");
@@ -20,6 +21,9 @@ pub const Processor = struct {
     col_buf: [256]pgoutput.Column,
     tuple_buf: [256]pgoutput.ColumnData,
     tuple_buf2: [256]pgoutput.ColumnData,
+
+    // Current batch context
+    current_source_id: ?[]u8,
 
     // Current transaction state
     current_txn_lsn: u64,
@@ -93,6 +97,7 @@ pub const Processor = struct {
             .col_buf = undefined,
             .tuple_buf = undefined,
             .tuple_buf2 = undefined,
+            .current_source_id = null,
             .current_txn_lsn = 0,
             .current_txn_xid = 0,
             .current_txn_timestamp = 0,
@@ -110,68 +115,101 @@ pub const Processor = struct {
 
     pub const ProcessError = Connection.QueryError || std.mem.Allocator.Error || pgoutput.DecodeError || error{InvalidUuid};
 
-    /// Process one pending batch. Returns true if a batch was claimed,
+    /// Process one pending batch group. Returns true if a batch was claimed,
     /// false if no pending batches were found.
     ///
-    /// Partial batches (complete=false) are accumulated in memory until
-    /// a complete batch arrives, then all accumulated data is processed
-    /// as one logical unit.
+    /// Claims all batches belonging to a single transaction (grouped by
+    /// source_id + begin_lsn). Partial batches are fetched alongside their
+    /// completing batch and processed as one logical unit.
     pub fn processOne(self: *Processor) ProcessError!bool {
-        // Claim a batch
-        var claim_sql: std.ArrayListUnmanaged(u8) = .{};
-        defer claim_sql.deinit(self.allocator);
+        // Step 1: Claim a complete batch (identifies the group)
+        const claim_complete =
+            "UPDATE wal_batches SET state='processing'" ++
+            " WHERE id = (" ++
+            " SELECT id FROM wal_batches" ++
+            " WHERE state='pending' AND complete=true" ++
+            " ORDER BY created_at LIMIT 1" ++
+            " FOR UPDATE SKIP LOCKED" ++
+            ") RETURNING id, source_id, begin_lsn, data, relations";
 
-        try claim_sql.appendSlice(
+        const result = try self.dest.simpleQuery(claim_complete);
+        if (result.column_count == 0) return false;
+
+        const batch_id = result.columns[0].data;
+        const source_id = result.columns[1].data;
+        const begin_lsn_str = result.columns[2].data;
+        const raw_data = result.columns[3].data;
+        const relations_json = result.columns[4].data;
+
+        // Copy batch_id (borrowed from recv_buf)
+        const batch_id_copy = try self.allocator.alloc(u8, batch_id.len);
+        @memcpy(batch_id_copy, batch_id);
+        try self.pending_batch_ids.append(self.allocator, batch_id_copy);
+
+        // Set current source_id from batch
+        if (self.current_source_id) |old| self.allocator.free(old);
+        const source_id_copy = try self.allocator.alloc(u8, source_id.len);
+        @memcpy(source_id_copy, source_id);
+        self.current_source_id = source_id_copy;
+
+        // Load relations from JSONB snapshot
+        try self.loadRelationsFromJson(relations_json);
+
+        // Decode complete batch data
+        const complete_data = try self.decodeBytea(raw_data);
+        defer self.allocator.free(complete_data);
+
+        // Step 2: Claim all partial batches for this group
+        var partial_sql: std.ArrayListUnmanaged(u8) = .{};
+        defer partial_sql.deinit(self.allocator);
+
+        try partial_sql.appendSlice(
             self.allocator,
             "UPDATE wal_batches SET state='processing'" ++
                 " WHERE id = (" ++
                 " SELECT id FROM wal_batches" ++
                 " WHERE source_id=",
         );
-        try query_mod.appendEscapedUuid(&claim_sql, self.allocator, self.config.source_id);
-        try claim_sql.appendSlice(
+        try query_mod.appendEscapedUuid(&partial_sql, self.allocator, source_id);
+        try partial_sql.appendSlice(self.allocator, " AND begin_lsn=");
+        try partial_sql.appendSlice(self.allocator, begin_lsn_str);
+        try partial_sql.appendSlice(
             self.allocator,
-            " AND state='pending'" ++
+            " AND state='pending' AND complete=false" ++
                 " ORDER BY start_lsn LIMIT 1" ++
-                " FOR UPDATE SKIP LOCKED" ++
-                ") RETURNING id, data, complete",
+                " FOR UPDATE" ++
+                ") RETURNING id, data",
         );
 
-        const result = try self.dest.simpleQuery(claim_sql.items);
-        if (result.column_count == 0) return false;
+        // Loop to claim all partials (simpleQuery returns one row at a time)
+        while (true) {
+            const partial_result = try self.dest.simpleQuery(partial_sql.items);
+            if (partial_result.column_count == 0) break;
 
-        const batch_id = result.columns[0].data;
-        const raw_data = result.columns[1].data;
-        const complete_str = result.columns[2].data;
-        const is_complete = complete_str.len > 0 and complete_str[0] == 't';
+            const p_id = partial_result.columns[0].data;
+            const p_data = partial_result.columns[1].data;
 
-        // Copy batch_id (borrowed from recv_buf)
-        const batch_id_copy = try self.allocator.alloc(u8, batch_id.len);
-        @memcpy(batch_id_copy, batch_id);
+            const p_id_copy = try self.allocator.alloc(u8, p_id.len);
+            @memcpy(p_id_copy, p_id);
+            try self.pending_batch_ids.append(self.allocator, p_id_copy);
 
-        // Decode hex bytea to binary
-        const batch_data = try self.decodeBytea(raw_data);
-
-        // Accumulate data and batch ID
-        try self.pending_data.appendSlice(self.allocator, batch_data);
-        self.allocator.free(batch_data);
-        try self.pending_batch_ids.append(self.allocator, batch_id_copy);
-
-        if (!is_complete) {
-            // Partial batch — wait for the complete one
-            return true;
+            const decoded = try self.decodeBytea(p_data);
+            try self.pending_data.appendSlice(self.allocator, decoded);
+            self.allocator.free(decoded);
         }
 
-        // Complete batch — process all accumulated data
-        const all_data = self.pending_data.items;
-        self.processBatch(all_data) catch |err| {
-            // On error, mark all accumulated batches as error
+        // Append complete batch data after partials (partials contain the
+        // beginning of the transaction, complete batch contains the end)
+        try self.pending_data.appendSlice(self.allocator, complete_data);
+
+        // Step 3: Process all accumulated data
+        self.processBatch(self.pending_data.items) catch |err| {
             self.markBatchesError();
             self.clearPending();
             return err;
         };
 
-        // On success, delete all accumulated batches
+        // Step 4: Delete all claimed batches
         self.deleteBatches() catch {};
         self.clearPending();
 
@@ -350,7 +388,7 @@ pub const Processor = struct {
         defer sql.deinit(self.allocator);
 
         try sql.appendSlice(self.allocator, "INSERT INTO transactions (source_id, lsn, xid, committed_at) VALUES (");
-        try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
+        try query_mod.appendEscapedUuid(&sql, self.allocator, self.sourceId());
         try sql.appendSlice(self.allocator, ", ");
         try query_mod.appendIntValue(&sql, self.allocator, lsn);
         try sql.appendSlice(self.allocator, ", ");
@@ -368,7 +406,7 @@ pub const Processor = struct {
         defer lookup_sql.deinit(self.allocator);
 
         try lookup_sql.appendSlice(self.allocator, "SELECT id FROM transactions WHERE source_id=");
-        try query_mod.appendEscapedUuid(&lookup_sql, self.allocator, self.config.source_id);
+        try query_mod.appendEscapedUuid(&lookup_sql, self.allocator, self.sourceId());
         try lookup_sql.appendSlice(self.allocator, " AND lsn=");
         try query_mod.appendIntValue(&lookup_sql, self.allocator, lsn);
         try lookup_sql.appendSlice(self.allocator, " AND committed_at=");
@@ -396,7 +434,7 @@ pub const Processor = struct {
             self.allocator,
             "INSERT INTO relation_snapshots (source_id, lsn, rel_oid, schema_name, table_name, replica_identity, columns) VALUES (",
         );
-        try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
+        try query_mod.appendEscapedUuid(&sql, self.allocator, self.sourceId());
         try sql.appendSlice(self.allocator, ", ");
         try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
         try sql.appendSlice(self.allocator, ", ");
@@ -545,6 +583,126 @@ pub const Processor = struct {
         return digest;
     }
 
+    fn sourceId(self: *Processor) []const u8 {
+        return self.current_source_id orelse "";
+    }
+
+    /// Load the relation cache from a JSONB relations snapshot stored in
+    /// the wal_batches row.  This makes each batch self-contained so that
+    /// batches can be processed in any order.
+    fn loadRelationsFromJson(self: *Processor, raw: []const u8) !void {
+        if (raw.len == 0) return;
+
+        const parsed = json.parseFromSlice(json.Value, self.allocator, raw, .{}) catch return;
+        defer parsed.deinit();
+
+        const root = switch (parsed.value) {
+            .object => |o| o,
+            else => return,
+        };
+
+        var it = root.iterator();
+        while (it.next()) |entry| {
+            const oid = std.fmt.parseInt(u32, entry.key_ptr.*, 10) catch continue;
+            const obj = switch (entry.value_ptr.*) {
+                .object => |o| o,
+                else => continue,
+            };
+
+            const schema_val = obj.get("schema") orelse continue;
+            const table_val = obj.get("table") orelse continue;
+            const ri_val = obj.get("relreplident") orelse continue;
+            const cols_val = obj.get("columns") orelse continue;
+
+            const namespace_str = switch (schema_val) {
+                .string => |s| s,
+                else => continue,
+            };
+            const table_str = switch (table_val) {
+                .string => |s| s,
+                else => continue,
+            };
+            const replica_identity: u8 = switch (ri_val) {
+                .integer => |i| @intCast(i),
+                else => continue,
+            };
+            const cols_arr = switch (cols_val) {
+                .array => |a| a,
+                else => continue,
+            };
+
+            // Skip if we already have this relation cached (from a prior batch
+            // in the same processor lifetime) — the JSONB snapshot from the
+            // current batch is authoritative, so replace it.
+            if (self.relations.fetchRemove(oid)) |removed| {
+                var old = removed.value;
+                old.deinit(self.allocator);
+            }
+
+            const namespace = try self.allocator.alloc(u8, namespace_str.len);
+            @memcpy(namespace, namespace_str);
+
+            const name = try self.allocator.alloc(u8, table_str.len);
+            @memcpy(name, table_str);
+
+            const columns = try self.allocator.alloc(OwnedColumn, cols_arr.items.len);
+            for (cols_arr.items, 0..) |col_val, ci| {
+                const col_obj = switch (col_val) {
+                    .object => |o| o,
+                    else => {
+                        columns[ci] = .{ .flags = 0, .name = &.{}, .type_oid = 0, .type_modifier = -1 };
+                        continue;
+                    },
+                };
+
+                const col_name_val = col_obj.get("name") orelse {
+                    columns[ci] = .{ .flags = 0, .name = &.{}, .type_oid = 0, .type_modifier = -1 };
+                    continue;
+                };
+                const col_name_str = switch (col_name_val) {
+                    .string => |s| s,
+                    else => {
+                        columns[ci] = .{ .flags = 0, .name = &.{}, .type_oid = 0, .type_modifier = -1 };
+                        continue;
+                    },
+                };
+                const col_name = try self.allocator.alloc(u8, col_name_str.len);
+                @memcpy(col_name, col_name_str);
+
+                const flags: u8 = if (col_obj.get("flags")) |f| switch (f) {
+                    .integer => |i| @intCast(i),
+                    else => 0,
+                } else 0;
+
+                const type_oid: u32 = if (col_obj.get("oid")) |o| switch (o) {
+                    .integer => |i| @intCast(i),
+                    else => 0,
+                } else 0;
+
+                const type_modifier: i32 = if (col_obj.get("typmod")) |t| switch (t) {
+                    .integer => |i| @intCast(i),
+                    else => -1,
+                } else -1;
+
+                columns[ci] = .{
+                    .flags = flags,
+                    .name = col_name,
+                    .type_oid = type_oid,
+                    .type_modifier = type_modifier,
+                };
+            }
+
+            try self.relations.put(oid, .{
+                .oid = oid,
+                .namespace = namespace,
+                .name = name,
+                .replica_identity = replica_identity,
+                .columns = columns,
+                .snapshot_lsn = null,
+            });
+        }
+    }
+
     fn updateRelationCache(self: *Processor, rel: pgoutput.Relation) !void {
         // Preserve snapshot_lsn if updating an existing entry
         var prev_snapshot_lsn: ?u64 = null;
@@ -637,7 +795,7 @@ pub const Processor = struct {
             try query_mod.appendIntValue(&sql, self.allocator, txn_id);
         } else {
             try sql.appendSlice(self.allocator, "(SELECT id FROM transactions WHERE source_id=");
-            try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
+            try query_mod.appendEscapedUuid(&sql, self.allocator, self.sourceId());
             try sql.appendSlice(self.allocator, " AND lsn=");
             try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
             try sql.appendSlice(self.allocator, " AND committed_at=");
@@ -755,7 +913,7 @@ pub const Processor = struct {
                 try query_mod.appendIntValue(&sql, self.allocator, txn_id);
             } else {
                 try sql.appendSlice(self.allocator, "(SELECT id FROM transactions WHERE source_id=");
-                try query_mod.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
+                try query_mod.appendEscapedUuid(&sql, self.allocator, self.sourceId());
                 try sql.appendSlice(self.allocator, " AND lsn=");
                 try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
                 try sql.appendSlice(self.allocator, " AND committed_at=");
@@ -840,6 +998,7 @@ pub const Processor = struct {
     }
 
     pub fn deinit(self: *Processor) void {
+        if (self.current_source_id) |sid| self.allocator.free(sid);
         var it = self.relations.iterator();
         while (it.next()) |entry| {
             var rel = entry.value_ptr;

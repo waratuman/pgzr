@@ -4,7 +4,12 @@
       "mcp__acp__Bash",
       "mcp__acp__Write",
       "mcp__acp__Edit",
-      "WebFetch(domain:blog.peerdb.io)"
+      "WebFetch(domain:blog.peerdb.io)",
+      "Bash(grep -v \"^[+-]$\")",
+      "Bash(zig build)",
+      "Bash(zig build test)",
+      "Bash(git add -u)",
+      "Bash(GIT_EDITOR=true git rebase --continue)"
     ]
   }
 }

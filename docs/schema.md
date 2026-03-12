@@ -12,6 +12,7 @@ after processing.
 CREATE TABLE IF NOT EXISTS wal_batches (
     id              BIGSERIAL PRIMARY KEY,
     source_id       UUID NOT NULL,
+    begin_lsn       BIGINT NOT NULL,
     start_lsn       BIGINT NOT NULL,
     end_lsn         BIGINT NOT NULL,
     data            BYTEA NOT NULL,
@@ -27,6 +28,7 @@ CREATE TABLE IF NOT EXISTS wal_batches (
 |--------------|-------------|
 | `id`         | Auto-incrementing primary key |
 | `source_id`  | UUID identifying the source database |
+| `begin_lsn`  | WAL LSN of the BEGIN that started this transaction (groups partial batches) |
 | `start_lsn`  | WAL LSN of the first message in this batch |
 | `end_lsn`    | WAL LSN of the last message in this batch |
 | `data`       | Packed binary pgoutput messages (length-prefixed) |

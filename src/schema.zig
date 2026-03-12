@@ -4,6 +4,7 @@ pub const create_wal_batches =
     \\CREATE TABLE IF NOT EXISTS wal_batches (
     \\    id              BIGSERIAL PRIMARY KEY,
     \\    source_id       UUID NOT NULL,
+    \\    begin_lsn       BIGINT NOT NULL,
     \\    start_lsn       BIGINT NOT NULL,
     \\    end_lsn         BIGINT NOT NULL,
     \\    data            BYTEA NOT NULL,

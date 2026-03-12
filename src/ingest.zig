@@ -19,6 +19,7 @@ pub const Ingestor = struct {
     batch_end_lsn: Lsn,
     batch_msg_count: usize,
     in_transaction: bool,
+    txn_begin_lsn: Lsn,
 
     // Relation cache (owned copies)
     relations: std.AutoHashMap(u32, OwnedRelation),
@@ -75,6 +76,7 @@ pub const Ingestor = struct {
             .batch_end_lsn = Lsn.zero,
             .batch_msg_count = 0,
             .in_transaction = false,
+            .txn_begin_lsn = Lsn.zero,
             .relations = std.AutoHashMap(u32, OwnedRelation).init(allocator),
             .col_buf = undefined,
             .tuple_buf = undefined,
@@ -119,6 +121,7 @@ pub const Ingestor = struct {
             // Track transaction boundaries (Begin or StreamStart)
             if (msg_type == 'B' or msg_type == 'S') {
                 self.in_transaction = true;
+                self.txn_begin_lsn = wal_msg.wal_start;
             }
 
             // Parse relation messages to maintain the cache
@@ -135,6 +138,7 @@ pub const Ingestor = struct {
             // Flush on COMMIT or StreamCommit boundaries
             if (msg_type == 'C' or msg_type == 'c') {
                 self.in_transaction = false;
+                self.txn_begin_lsn = Lsn.zero;
                 std.log.debug("ingest: flushing batch on commit, msgs={d} bytes={d}", .{
                     self.batch_msg_count,
                     self.batch_buf.items.len,
@@ -222,8 +226,12 @@ pub const Ingestor = struct {
         var sql: std.ArrayListUnmanaged(u8) = .{};
         defer sql.deinit(self.allocator);
 
-        try sql.appendSlice(self.allocator, "INSERT INTO wal_batches (source_id, start_lsn, end_lsn, data, relations, complete) VALUES (");
+        const begin_lsn = if (self.txn_begin_lsn.value != 0) self.txn_begin_lsn else self.batch_start_lsn;
+
+        try sql.appendSlice(self.allocator, "INSERT INTO wal_batches (source_id, begin_lsn, start_lsn, end_lsn, data, relations, complete) VALUES (");
         try query.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
+        try sql.appendSlice(self.allocator, ", ");
+        try query.appendIntValue(&sql, self.allocator, begin_lsn.value);
         try sql.appendSlice(self.allocator, ", ");
         try query.appendIntValue(&sql, self.allocator, self.batch_start_lsn.value);
         try sql.appendSlice(self.allocator, ", ");
