@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **`pgzr_abi_version()` C export.** Returns a `u32` ABI version
+  (currently `0x00040000`) that FFI callers can verify at load time to
+  detect struct-layout skew before invoking other entry points. Missing
+  symbol indicates a pre-0.4.0 library. Bump this constant in lockstep
+  with any incompatible change to an exported config struct.
+
 ## [0.4.0] - 2026-03-12
 
 ### Breaking Changes

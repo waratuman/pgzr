@@ -5,6 +5,19 @@ const types = @import("types.zig");
 const Lsn = @import("lsn.zig").Lsn;
 const query_mod = @import("query.zig");
 
+// ── ABI version ───────────────────────────────────────────────────────
+//
+// Bumped whenever the layout or semantics of any exported config struct
+// or function changes in an incompatible way. Callers (e.g. the Ruby
+// gem) should resolve this symbol at load time and refuse to proceed
+// when it does not match the value they were built against. A missing
+// symbol indicates a pre-0.4.0 library, which is also incompatible.
+const PGZR_ABI_VERSION: u32 = 0x00040000;
+
+export fn pgzr_abi_version() u32 {
+    return PGZR_ABI_VERSION;
+}
+
 // ── Error handling ────────────────────────────────────────────────────
 
 threadlocal var last_error_buf: [1024]u8 = undefined;
