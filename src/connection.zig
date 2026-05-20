@@ -66,7 +66,8 @@ pub const Connection = struct {
 
             // Read 1-byte response
             var resp: [1]u8 = undefined;
-            _ = stream.read(&resp) catch return error.ConnectionClosed;
+            const n = stream.read(&resp) catch return error.ConnectionClosed;
+            if (n == 0) return error.ConnectionClosed;
 
             if (resp[0] == 'S') {
                 // Server accepts TLS — perform handshake
