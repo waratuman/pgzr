@@ -5,6 +5,23 @@ const types = @import("types.zig");
 const Lsn = @import("lsn.zig").Lsn;
 const query_mod = @import("query.zig");
 
+// ── std.Options ───────────────────────────────────────────────────────
+//
+// When loaded via dlopen (e.g. by a Ruby extension), libpgzr's TLS slot
+// is not bootstrapped for threads that predate the load. Zig's default
+// CSPRNG lazily initializes a per-thread context with mmap+madvise on
+// first use; the EINVAL probe at the top of that path triggers an error
+// return that needs to update the per-thread error-return-trace, which
+// is itself stored in TLS — and crashes on threads where libpgzr's TLS
+// was never allocated. Setting `crypto_always_getrandom` makes
+// std.crypto.random go straight to getrandom(2), skipping the
+// thread-local setup entirely. This costs one syscall per call (we use
+// it sparingly, only inside TLS handshakes), and removes a class of
+// dlopen+threads bugs.
+pub const std_options: std.Options = .{
+    .crypto_always_getrandom = true,
+};
+
 // ── ABI version ───────────────────────────────────────────────────────
 //
 // Bumped whenever the layout or semantics of any exported config struct
