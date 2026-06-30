@@ -65,6 +65,40 @@ fn runCmd(allocator: std.mem.Allocator, args: []const []const u8) void {
     _ = child.spawnAndWait() catch {};
 }
 
+/// Simulates the hub's zombie reaper (issue #14): requeues any batch stuck in
+/// 'processing' back to 'pending'. A short statement_timeout keeps it from
+/// blocking indefinitely on rows a live worker holds locked, mirroring a reaper
+/// that cannot tell a hung worker from a live-but-slow one. Returns the number
+/// of batches it actually requeued.
+fn reapOnce(allocator: std.mem.Allocator) u32 {
+    const out = runPsqlCapture(
+        allocator,
+        DEST_DB,
+        "SET statement_timeout='200ms'; " ++
+            "WITH r AS (UPDATE wal_batches SET state='pending' " ++
+            "WHERE state='processing' RETURNING 1) SELECT count(*) FROM r",
+    ) catch return 0;
+    defer allocator.free(out);
+    return std.fmt.parseInt(u32, out, 10) catch 0;
+}
+
+const Reaper = struct {
+    stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    requeued: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn run(self: *Reaper, allocator: std.mem.Allocator) void {
+        while (!self.stop_flag.load(.acquire)) {
+            const n = reapOnce(allocator);
+            if (n > 0) _ = self.requeued.fetchAdd(n, .monotonic);
+            std.Thread.sleep(2 * std.time.ns_per_ms);
+        }
+    }
+
+    fn stop(self: *Reaper) void {
+        self.stop_flag.store(true, .release);
+    }
+};
+
 fn sourceConnConfig() pgzr.ConnConfig {
     return .{
         .host = "127.0.0.1",
@@ -268,16 +302,31 @@ fn runStressTest(allocator: std.mem.Allocator) !void {
         }
     }.run;
 
+    // Run a zombie reaper concurrently with the workers (issue #14). It
+    // aggressively requeues 'processing' batches; the processor must hold the
+    // claim's row lock for the whole decode/insert/delete cycle so the reaper
+    // can never requeue a live worker's batch and cause double-processing.
+    var reaper = Reaper{};
+    const reaper_thread = std.Thread.spawn(.{}, Reaper.run, .{ &reaper, allocator }) catch |err| {
+        std.debug.print("FAIL (spawn reaper: {})\n", .{err});
+        return err;
+    };
+
     var threads: [4]std.Thread = undefined;
     for (0..num_workers) |i| {
         threads[i] = std.Thread.spawn(.{}, worker, .{ &results[i], allocator }) catch |err| {
             std.debug.print("FAIL (spawn thread {d}: {})\n", .{ i, err });
             for (0..i) |j| threads[j].join();
+            reaper.stop();
+            reaper_thread.join();
             return err;
         };
     }
 
     for (0..num_workers) |i| threads[i].join();
+
+    reaper.stop();
+    reaper_thread.join();
 
     const process_ms = timer.read() / std.time.ns_per_ms;
 
@@ -339,5 +388,6 @@ fn runStressTest(allocator: std.mem.Allocator) !void {
     std.debug.print("    Timing:  insert={d}ms ingest={d}ms process={d}ms\n", .{
         insert_ms, ingest_ms, process_ms,
     });
+    std.debug.print("    Reaper:  {d} batches requeued\n", .{reaper.requeued.load(.monotonic)});
     std.debug.print("    Duplicates: 0\n", .{});
 }

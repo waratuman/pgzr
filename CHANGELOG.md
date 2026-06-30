@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-30
+
 ### Added
 
 - **`pgzr_abi_version()` C export.** Returns a `u32` ABI version
@@ -11,6 +13,20 @@ All notable changes to this project will be documented in this file.
   detect struct-layout skew before invoking other entry points. Missing
   symbol indicates a pre-0.4.0 library. Bump this constant in lockstep
   with any incompatible change to an exported config struct.
+
+### Fixed
+
+- **Processor no longer double-processes a batch under concurrent zombie
+  recovery (#14).** The claim/decode/insert/delete cycle now runs inside a
+  single transaction, so the claim's row lock is held for the whole batch.
+  A live worker's batch can no longer be requeued by an external reaper
+  (the reaper's `UPDATE` blocks on the held lock), and a crashed worker's
+  claim rolls back automatically — returning the batch to `pending` with no
+  duplicate events and no reaper required for correctness.
+- **Connection query helpers drain the trailing `ReadyForQuery` after an
+  `ErrorResponse`** instead of returning early, keeping the connection in
+  sync so a `ROLLBACK` (or any follow-up query) after a failed statement
+  behaves correctly.
 
 ## [0.4.0] - 2026-03-12
 

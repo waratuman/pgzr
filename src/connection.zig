@@ -204,6 +204,10 @@ pub const Connection = struct {
         // Recomputed after readBodyGrowing since the buffer may grow.
         var stable_base = self.recv_buf.len / 2;
         var stable_pos: usize = 0;
+        // On ErrorResponse the server still sends a trailing ReadyForQuery; we
+        // must read through it before returning so the connection stays in sync
+        // for subsequent queries (e.g. a ROLLBACK after a failed statement).
+        var server_error = false;
 
         while (true) {
             const header = try protocol.readHeader(self.transport);
@@ -248,13 +252,14 @@ pub const Connection = struct {
                 },
                 protocol.MSG_READY => {
                     _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
+                    if (server_error) return error.ServerError;
                     return result;
                 },
                 protocol.MSG_ERROR => {
                     const body = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
-                    return error.ServerError;
+                    server_error = true;
                 },
                 protocol.MSG_COPY_BOTH => {
                     _ = try self.readBodyGrowing(header);
@@ -288,6 +293,10 @@ pub const Connection = struct {
         try self.transport.writeAll(msg);
         std.log.debug("execLarge: query sent, waiting for response", .{});
 
+        // On ErrorResponse the server still sends a trailing ReadyForQuery; read
+        // through it before returning so the connection stays in sync.
+        var server_error = false;
+
         while (true) {
             std.log.debug("execLarge: reading response header...", .{});
             const header = try protocol.readHeader(self.transport);
@@ -303,13 +312,14 @@ pub const Connection = struct {
                 },
                 protocol.MSG_READY => {
                     _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    if (server_error) return error.ServerError;
                     return;
                 },
                 protocol.MSG_ERROR => {
                     const body = try self.readBodyGrowing(header);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
-                    return error.ServerError;
+                    server_error = true;
                 },
                 else => {
                     _ = try self.readBodyGrowing(header);
@@ -343,6 +353,9 @@ pub const Connection = struct {
         // Recomputed after readBodyGrowing since the buffer may grow.
         var stable_base = self.recv_buf.len / 2;
         var stable_pos: usize = 0;
+        // On ErrorResponse the server still sends a trailing ReadyForQuery; read
+        // through it before returning so the connection stays in sync.
+        var server_error = false;
 
         while (true) {
             const header = try protocol.readHeader(self.transport);
@@ -385,13 +398,14 @@ pub const Connection = struct {
                 },
                 protocol.MSG_READY => {
                     _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
+                    if (server_error) return error.ServerError;
                     return result;
                 },
                 protocol.MSG_ERROR => {
                     const body = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
-                    return error.ServerError;
+                    server_error = true;
                 },
                 protocol.MSG_NOTICE => {
                     _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);

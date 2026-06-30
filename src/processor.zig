@@ -122,6 +122,45 @@ pub const Processor = struct {
     /// source_id + begin_lsn). Partial batches are fetched alongside their
     /// completing batch and processed as one logical unit.
     pub fn processOne(self: *Processor) ProcessError!bool {
+        // Run the whole claim/decode/insert/delete cycle inside one transaction
+        // so the claim's row lock (FOR UPDATE) is held until the work commits.
+        //
+        // This makes the processor idempotent under concurrent zombie recovery
+        // (issue #14): an external reaper that requeues stuck 'processing'
+        // batches cannot reclaim a row this worker still holds — its UPDATE
+        // blocks on the lock. If this worker crashes mid-batch the transaction
+        // rolls back, reverting state='processing' to 'pending' and releasing
+        // the lock, so the batch is retried automatically with no duplicate
+        // events and no reaper required.
+        _ = try self.dest.simpleQuery("BEGIN");
+
+        const claimed = self.claimAndProcess() catch |err| {
+            // Roll back the claim and all inserts, then park the claimed
+            // batch(es) in 'error' state so a poison batch is not retried
+            // forever. Both are best-effort: a dead connection makes them
+            // no-ops. markBatchesError runs post-rollback (autocommit) so it
+            // is not undone by the rollback.
+            _ = self.dest.simpleQuery("ROLLBACK") catch {};
+            self.markBatchesError();
+            self.clearPending();
+            return err;
+        };
+
+        if (!claimed) {
+            _ = self.dest.simpleQuery("COMMIT") catch {};
+            return false;
+        }
+
+        _ = try self.dest.simpleQuery("COMMIT");
+        self.clearPending();
+        return true;
+    }
+
+    /// Claim a pending batch group and process it, inserting all decoded rows
+    /// and deleting the claimed batches. Must run inside a transaction opened
+    /// by the caller (processOne) so the claim's row lock is held throughout.
+    /// Returns true if a batch was claimed, false if none were pending.
+    fn claimAndProcess(self: *Processor) ProcessError!bool {
         // Step 1: Claim a complete batch (identifies the group)
         const claim_complete =
             "UPDATE wal_batches SET state='processing'" ++
@@ -202,16 +241,15 @@ pub const Processor = struct {
         // beginning of the transaction, complete batch contains the end)
         try self.pending_data.appendSlice(self.allocator, complete_data);
 
-        // Step 3: Process all accumulated data
-        self.processBatch(self.pending_data.items) catch |err| {
-            self.markBatchesError();
-            self.clearPending();
-            return err;
-        };
+        // Step 3: Process all accumulated data. Errors propagate to processOne,
+        // which rolls back the transaction (reverting the claim) and parks the
+        // batches in 'error' state.
+        try self.processBatch(self.pending_data.items);
 
-        // Step 4: Delete all claimed batches
-        self.deleteBatches() catch {};
-        self.clearPending();
+        // Step 4: Delete all claimed batches. Inside the claim's transaction, so
+        // a delete failure rolls back the inserts too — the batch returns to
+        // 'pending' rather than being processed without being removed.
+        try self.deleteBatches();
 
         return true;
     }
