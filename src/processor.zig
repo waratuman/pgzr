@@ -156,90 +156,140 @@ pub const Processor = struct {
         return true;
     }
 
+    /// One row captured by the group claim, owned copies of the data the
+    /// callback borrows from recv_buf.
+    const ClaimedRow = struct {
+        start_lsn: u64,
+        complete: bool,
+        data: []u8,
+
+        /// Partials (in start_lsn order) sort before the complete batch:
+        /// partials contain the beginning of the transaction, the complete
+        /// batch contains the end.
+        fn lessThan(_: void, a: ClaimedRow, b: ClaimedRow) bool {
+            if (a.complete != b.complete) return b.complete;
+            return a.start_lsn < b.start_lsn;
+        }
+    };
+
+    /// Callback context for the group claim query. queryRows callbacks cannot
+    /// return errors, so allocation failures are recorded in `err` and
+    /// re-raised after the query completes.
+    const ClaimContext = struct {
+        proc: *Processor,
+        rows: std.ArrayListUnmanaged(ClaimedRow) = .{},
+        source_id: ?[]u8 = null,
+        relations_json: ?[]u8 = null,
+        err: ?std.mem.Allocator.Error = null,
+
+        fn onRow(self: *ClaimContext, cols: []const Connection.QueryColumn) void {
+            if (self.err != null) return;
+            self.onRowInner(cols) catch |e| {
+                self.err = e;
+            };
+        }
+
+        fn onRowInner(self: *ClaimContext, cols: []const Connection.QueryColumn) !void {
+            const proc = self.proc;
+            if (cols.len < 6) return;
+
+            // Track the claimed id for deleteBatches/markBatchesError
+            const id_copy = try proc.allocator.alloc(u8, cols[0].data.len);
+            @memcpy(id_copy, cols[0].data);
+            errdefer proc.allocator.free(id_copy);
+            try proc.pending_batch_ids.append(proc.allocator, id_copy);
+
+            const start_lsn = std.fmt.parseInt(u64, cols[2].data, 10) catch 0;
+            const complete = cols[3].data.len > 0 and cols[3].data[0] == 't';
+
+            const data = try proc.decodeBytea(cols[4].data);
+            errdefer proc.allocator.free(data);
+            try self.rows.append(proc.allocator, .{
+                .start_lsn = start_lsn,
+                .complete = complete,
+                .data = data,
+            });
+
+            // source_id and relations snapshot come from the complete batch
+            if (complete) {
+                if (self.source_id == null) {
+                    const sid = try proc.allocator.alloc(u8, cols[1].data.len);
+                    @memcpy(sid, cols[1].data);
+                    self.source_id = sid;
+                }
+                if (self.relations_json == null and !cols[5].is_null) {
+                    const rj = try proc.allocator.alloc(u8, cols[5].data.len);
+                    @memcpy(rj, cols[5].data);
+                    self.relations_json = rj;
+                }
+            }
+        }
+
+        fn deinit(self: *ClaimContext, allocator: std.mem.Allocator) void {
+            for (self.rows.items) |row| {
+                allocator.free(row.data);
+            }
+            self.rows.deinit(allocator);
+            if (self.source_id) |s| allocator.free(s);
+            if (self.relations_json) |r| allocator.free(r);
+        }
+    };
+
     /// Claim a pending batch group and process it, inserting all decoded rows
     /// and deleting the claimed batches. Must run inside a transaction opened
     /// by the caller (processOne) so the claim's row lock is held throughout.
     /// Returns true if a batch was claimed, false if none were pending.
     fn claimAndProcess(self: *Processor) ProcessError!bool {
-        // Step 1: Claim a complete batch (identifies the group)
-        const claim_complete =
-            "UPDATE wal_batches SET state='processing'" ++
-            " WHERE id = (" ++
-            " SELECT id FROM wal_batches" ++
+        // Claim the whole batch group (one complete batch + its partials) in a
+        // single statement. The group selector uses SKIP LOCKED so concurrent
+        // workers pick different groups; member rows use plain FOR UPDATE so
+        // an external reaper's UPDATE blocks on rows this worker holds
+        // (issue #14).
+        const claim_group =
+            "WITH grp AS (" ++
+            " SELECT id, source_id, begin_lsn FROM wal_batches" ++
             " WHERE state='pending' AND complete=true" ++
             " ORDER BY created_at LIMIT 1" ++
             " FOR UPDATE SKIP LOCKED" ++
-            ") RETURNING id, source_id, begin_lsn, data, relations";
+            "), members AS (" ++
+            " SELECT w.id FROM wal_batches w, grp" ++
+            " WHERE w.source_id=grp.source_id AND w.begin_lsn=grp.begin_lsn" ++
+            " AND w.state='pending' AND w.complete=false" ++
+            " FOR UPDATE OF w" ++
+            ")" ++
+            " UPDATE wal_batches SET state='processing'" ++
+            " WHERE id IN (SELECT id FROM grp UNION ALL SELECT id FROM members)" ++
+            " RETURNING id, source_id, start_lsn, complete, data, relations";
 
-        const result = try self.dest.simpleQuery(claim_complete);
-        if (result.column_count == 0) return false;
+        var ctx = ClaimContext{ .proc = self };
+        defer ctx.deinit(self.allocator);
 
-        const batch_id = result.columns[0].data;
-        const source_id = result.columns[1].data;
-        const begin_lsn_str = result.columns[2].data;
-        const raw_data = result.columns[3].data;
-        const relations_json = result.columns[4].data;
+        _ = try self.dest.queryRows(claim_group, &ctx, ClaimContext.onRow);
+        if (ctx.err) |e| return e;
+        if (ctx.rows.items.len == 0) return false;
 
-        // Copy batch_id (borrowed from recv_buf)
-        const batch_id_copy = try self.allocator.alloc(u8, batch_id.len);
-        @memcpy(batch_id_copy, batch_id);
-        try self.pending_batch_ids.append(self.allocator, batch_id_copy);
-
-        // Set current source_id from batch
-        if (self.current_source_id) |old| self.allocator.free(old);
-        const source_id_copy = try self.allocator.alloc(u8, source_id.len);
-        @memcpy(source_id_copy, source_id);
-        self.current_source_id = source_id_copy;
-
-        // Load relations from JSONB snapshot
-        try self.loadRelationsFromJson(relations_json);
-
-        // Decode complete batch data
-        const complete_data = try self.decodeBytea(raw_data);
-        defer self.allocator.free(complete_data);
-
-        // Step 2: Claim all partial batches for this group
-        var partial_sql: std.ArrayListUnmanaged(u8) = .{};
-        defer partial_sql.deinit(self.allocator);
-
-        try partial_sql.appendSlice(
-            self.allocator,
-            "UPDATE wal_batches SET state='processing'" ++
-                " WHERE id = (" ++
-                " SELECT id FROM wal_batches" ++
-                " WHERE source_id=",
-        );
-        try query_mod.appendEscapedUuid(&partial_sql, self.allocator, source_id);
-        try partial_sql.appendSlice(self.allocator, " AND begin_lsn=");
-        try partial_sql.appendSlice(self.allocator, begin_lsn_str);
-        try partial_sql.appendSlice(
-            self.allocator,
-            " AND state='pending' AND complete=false" ++
-                " ORDER BY start_lsn LIMIT 1" ++
-                " FOR UPDATE" ++
-                ") RETURNING id, data",
-        );
-
-        // Loop to claim all partials (simpleQuery returns one row at a time)
-        while (true) {
-            const partial_result = try self.dest.simpleQuery(partial_sql.items);
-            if (partial_result.column_count == 0) break;
-
-            const p_id = partial_result.columns[0].data;
-            const p_data = partial_result.columns[1].data;
-
-            const p_id_copy = try self.allocator.alloc(u8, p_id.len);
-            @memcpy(p_id_copy, p_id);
-            try self.pending_batch_ids.append(self.allocator, p_id_copy);
-
-            const decoded = try self.decodeBytea(p_data);
-            try self.pending_data.appendSlice(self.allocator, decoded);
-            self.allocator.free(decoded);
+        // Set current source_id from the complete batch (ownership transfer)
+        if (ctx.source_id) |sid| {
+            if (self.current_source_id) |old| self.allocator.free(old);
+            self.current_source_id = sid;
+            ctx.source_id = null;
         }
 
-        // Append complete batch data after partials (partials contain the
-        // beginning of the transaction, complete batch contains the end)
-        try self.pending_data.appendSlice(self.allocator, complete_data);
+        // Load relations from the complete batch's JSONB snapshot
+        if (ctx.relations_json) |rj| {
+            try self.loadRelationsFromJson(rj);
+        }
+
+        // Assemble data: partials in start_lsn order, complete batch last.
+        // Each row's copy is freed as soon as it is appended so peak memory
+        // stays ~1x the group size instead of holding a second full copy
+        // until ctx.deinit.
+        std.mem.sort(ClaimedRow, ctx.rows.items, {}, ClaimedRow.lessThan);
+        for (ctx.rows.items) |*row| {
+            try self.pending_data.appendSlice(self.allocator, row.data);
+            self.allocator.free(row.data);
+            row.data = &.{};
+        }
 
         // Step 3: Process all accumulated data. Errors propagate to processOne,
         // which rolls back the transaction (reverting the claim) and parks the
@@ -254,28 +304,37 @@ pub const Processor = struct {
         return true;
     }
 
-    fn markBatchesError(self: *Processor) void {
-        for (self.pending_batch_ids.items) |bid| {
-            var err_buf: [256]u8 = undefined;
-            const err_sql = std.fmt.bufPrint(
-                &err_buf,
-                "UPDATE wal_batches SET state='error' WHERE id={s}",
-                .{bid},
-            ) catch continue;
-            _ = self.dest.simpleQuery(err_sql) catch {};
+    /// Append "id IN (id1, id2, ...)" for all pending batch ids. The ids come
+    /// from RETURNING id on a BIGSERIAL column, so they are numeric text.
+    fn appendBatchIdList(self: *Processor, sql: *std.ArrayListUnmanaged(u8)) !void {
+        try sql.appendSlice(self.allocator, "id IN (");
+        for (self.pending_batch_ids.items, 0..) |bid, i| {
+            if (i > 0) try sql.append(self.allocator, ',');
+            try sql.appendSlice(self.allocator, bid);
         }
+        try sql.append(self.allocator, ')');
+    }
+
+    fn markBatchesError(self: *Processor) void {
+        if (self.pending_batch_ids.items.len == 0) return;
+
+        var sql: std.ArrayListUnmanaged(u8) = .{};
+        defer sql.deinit(self.allocator);
+
+        sql.appendSlice(self.allocator, "UPDATE wal_batches SET state='error' WHERE ") catch return;
+        self.appendBatchIdList(&sql) catch return;
+        self.dest.execLarge(self.allocator, sql.items) catch {};
     }
 
     fn deleteBatches(self: *Processor) !void {
-        for (self.pending_batch_ids.items) |bid| {
-            var del_buf: [128]u8 = undefined;
-            const del_sql = std.fmt.bufPrint(
-                &del_buf,
-                "DELETE FROM wal_batches WHERE id={s}",
-                .{bid},
-            ) catch continue;
-            _ = try self.dest.simpleQuery(del_sql);
-        }
+        if (self.pending_batch_ids.items.len == 0) return;
+
+        var sql: std.ArrayListUnmanaged(u8) = .{};
+        defer sql.deinit(self.allocator);
+
+        try sql.appendSlice(self.allocator, "DELETE FROM wal_batches WHERE ");
+        try self.appendBatchIdList(&sql);
+        try self.dest.execLarge(self.allocator, sql.items);
     }
 
     fn clearPending(self: *Processor) void {
@@ -433,26 +492,14 @@ pub const Processor = struct {
         try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_xid);
         try sql.appendSlice(self.allocator, ", ");
         try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
-        try sql.appendSlice(self.allocator, ") ON CONFLICT (source_id, lsn, committed_at) DO NOTHING RETURNING id");
+        // DO UPDATE (a no-op overwrite of xid) instead of DO NOTHING so
+        // RETURNING always yields the row's id — on conflict included —
+        // avoiding a fallback SELECT round trip.
+        try sql.appendSlice(self.allocator, ") ON CONFLICT (source_id, lsn, committed_at) DO UPDATE SET xid = EXCLUDED.xid RETURNING id");
 
         const result = try self.dest.execLargeWithResult(self.allocator, sql.items);
         if (result.column_count > 0 and result.columns[0].data.len > 0) {
             return std.fmt.parseInt(i64, result.columns[0].data, 10) catch null;
-        }
-        // ON CONFLICT hit — look up existing id
-        var lookup_sql: std.ArrayListUnmanaged(u8) = .{};
-        defer lookup_sql.deinit(self.allocator);
-
-        try lookup_sql.appendSlice(self.allocator, "SELECT id FROM transactions WHERE source_id=");
-        try query_mod.appendEscapedUuid(&lookup_sql, self.allocator, self.sourceId());
-        try lookup_sql.appendSlice(self.allocator, " AND lsn=");
-        try query_mod.appendIntValue(&lookup_sql, self.allocator, lsn);
-        try lookup_sql.appendSlice(self.allocator, " AND committed_at=");
-        try query_mod.appendTimestamp(&lookup_sql, self.allocator, self.current_txn_timestamp);
-
-        const lookup_result = try self.dest.simpleQuery(lookup_sql.items);
-        if (lookup_result.column_count > 0 and lookup_result.columns[0].data.len > 0) {
-            return std.fmt.parseInt(i64, lookup_result.columns[0].data, 10) catch null;
         }
         return null;
     }
@@ -1055,24 +1102,32 @@ pub const Processor = struct {
 };
 
 /// Append a JSON-escaped string (with surrounding double quotes) to the list.
+/// Runs of characters that need no escaping are copied in bulk.
 fn appendJsonString(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: []const u8) !void {
     try list.append(allocator, '"');
-    for (value) |c| {
-        switch (c) {
-            '"' => try list.appendSlice(allocator, "\\\""),
-            '\'' => try list.appendSlice(allocator, "''"),
-            '\\' => try list.appendSlice(allocator, "\\\\"),
-            '\n' => try list.appendSlice(allocator, "\\n"),
-            '\r' => try list.appendSlice(allocator, "\\r"),
-            '\t' => try list.appendSlice(allocator, "\\t"),
-            // Control characters
-            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
-                var buf: [6]u8 = undefined;
-                _ = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
-                try list.appendSlice(allocator, &buf);
-            },
-            else => try list.append(allocator, c),
+    var start: usize = 0;
+    for (value, 0..) |c, i| {
+        const esc: []const u8 = switch (c) {
+            '"' => "\\\"",
+            '\'' => "''",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            // Control characters: \u-escaped below
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => "",
+            else => continue,
+        };
+        try list.appendSlice(allocator, value[start..i]);
+        if (esc.len > 0) {
+            try list.appendSlice(allocator, esc);
+        } else {
+            var buf: [6]u8 = undefined;
+            _ = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
+            try list.appendSlice(allocator, &buf);
         }
+        start = i + 1;
     }
+    try list.appendSlice(allocator, value[start..]);
     try list.append(allocator, '"');
 }

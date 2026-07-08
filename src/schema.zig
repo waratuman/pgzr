@@ -16,6 +16,18 @@ pub const create_wal_batches =
     \\)
 ;
 
+pub const create_wal_batches_pending_index =
+    \\CREATE INDEX IF NOT EXISTS idx_wal_batches_pending
+    \\    ON wal_batches (created_at)
+    \\    WHERE state = 'pending' AND complete = true
+;
+
+pub const create_wal_batches_partial_index =
+    \\CREATE INDEX IF NOT EXISTS idx_wal_batches_partial
+    \\    ON wal_batches (source_id, begin_lsn)
+    \\    WHERE state = 'pending' AND complete = false
+;
+
 pub const create_transactions =
     \\CREATE TABLE IF NOT EXISTS transactions (
     \\    id              BIGSERIAL NOT NULL,
@@ -81,6 +93,8 @@ pub const create_events_identity_index =
 /// Create all tables if they don't already exist.
 pub fn ensureSchema(conn: *Connection) !void {
     _ = try conn.simpleQuery(create_wal_batches);
+    _ = try conn.simpleQuery(create_wal_batches_pending_index);
+    _ = try conn.simpleQuery(create_wal_batches_partial_index);
     _ = try conn.simpleQuery(create_transactions);
     _ = try conn.simpleQuery(create_transactions_default_partition);
     _ = try conn.simpleQuery(create_relation_snapshots);

@@ -434,6 +434,9 @@ pub const Connection = struct {
         try self.transport.writeAll(msg);
 
         var row_count: usize = 0;
+        // On ErrorResponse the server still sends a trailing ReadyForQuery; read
+        // through it before returning so the connection stays in sync.
+        var server_error = false;
 
         while (true) {
             const header = try protocol.readHeader(self.transport);
@@ -466,13 +469,14 @@ pub const Connection = struct {
                 },
                 protocol.MSG_READY => {
                     _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    if (server_error) return error.ServerError;
                     return row_count;
                 },
                 protocol.MSG_ERROR => {
                     const body = try self.readBodyGrowing(header);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
-                    return error.ServerError;
+                    server_error = true;
                 },
                 protocol.MSG_NOTICE => {
                     _ = try self.readBodyGrowing(header);

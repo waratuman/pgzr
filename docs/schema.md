@@ -22,7 +22,19 @@ CREATE TABLE IF NOT EXISTS wal_batches (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (source_id, start_lsn)
 );
+
+CREATE INDEX IF NOT EXISTS idx_wal_batches_pending
+    ON wal_batches (created_at)
+    WHERE state = 'pending' AND complete = true;
+CREATE INDEX IF NOT EXISTS idx_wal_batches_partial
+    ON wal_batches (source_id, begin_lsn)
+    WHERE state = 'pending' AND complete = false;
 ```
+
+The partial indexes back the Processor's claim queries: the first serves the
+oldest-pending-batch scan (`ORDER BY created_at LIMIT 1`), the second the
+lookup of a claimed group's partial batches by `(source_id, begin_lsn)`. Both
+stay small since they only cover unprocessed rows.
 
 | Column       | Description |
 |--------------|-------------|

@@ -151,22 +151,29 @@ fn isValidUuid(s: []const u8) bool {
 /// Does not validate multibyte sequences; callers must ensure valid UTF-8.
 pub fn appendEscapedString(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: []const u8) !void {
     try list.append(alloc, '\'');
-    for (value) |c| {
-        if (c == '\'') try list.append(alloc, '\'');
-        try list.append(alloc, c);
+    // Copy runs between quotes in bulk instead of byte-at-a-time
+    var start: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, value, start, '\'')) |i| {
+        try list.appendSlice(alloc, value[start .. i + 1]);
+        try list.append(alloc, '\''); // double the quote
+        start = i + 1;
     }
+    try list.appendSlice(alloc, value[start..]);
     try list.append(alloc, '\'');
 }
 
 /// Append a hex-encoded bytea literal to the list: '\xdeadbeef'
 pub fn appendEscapedBytea(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: []const u8) !void {
-    try list.appendSlice(alloc, "'\\x");
     const hex = "0123456789abcdef";
-    for (value) |byte| {
-        try list.append(alloc, hex[byte >> 4]);
-        try list.append(alloc, hex[byte & 0x0f]);
+    // Output size is exact: '\x + 2 chars per byte + closing quote
+    try list.ensureUnusedCapacity(alloc, 4 + value.len * 2);
+    list.appendSliceAssumeCapacity("'\\x");
+    const out = list.addManyAsSliceAssumeCapacity(value.len * 2);
+    for (value, 0..) |byte, i| {
+        out[i * 2] = hex[byte >> 4];
+        out[i * 2 + 1] = hex[byte & 0x0f];
     }
-    try list.append(alloc, '\'');
+    list.appendAssumeCapacity('\'');
 }
 
 /// Append a validated UUID as a SQL literal: 'xxxxxxxx-xxxx-...'

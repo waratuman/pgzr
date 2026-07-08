@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-08
+
+### Changed
+
+- **Processor batch throughput: fewer round trips per batch.** The batch
+  group claim (complete batch + all partials) is now a single CTE
+  `UPDATE ... RETURNING` statement instead of one query per partial plus a
+  trailing probe; claimed batches are deleted with one `DELETE ... WHERE id
+  IN (...)` instead of one per row; and the transaction insert uses
+  `ON CONFLICT ... DO UPDATE ... RETURNING id` so the conflict path no
+  longer needs a fallback `SELECT`. A minimal batch drops from 7 round
+  trips to 4; batches with many transactions roughly halve.
+- **New partial indexes on `wal_batches`** (`idx_wal_batches_pending`,
+  `idx_wal_batches_partial`) back the claim queries, keeping batch claiming
+  O(log n) under backlog instead of a sequential scan per poll. Created
+  automatically by `ensureSchema`.
+- **SQL literal escaping copies clean runs in bulk** instead of
+  byte-at-a-time (string, bytea, and JSON escaping), reducing per-event CPU
+  when building multi-row inserts.
+
+### Fixed
+
+- **`Connection.queryRows` drains the trailing `ReadyForQuery` after an
+  `ErrorResponse`** instead of returning early, matching the 0.4.1 fix to
+  `simpleQuery`/`execLarge` and keeping the connection usable for a
+  follow-up `ROLLBACK`.
+
 ## [0.4.1] - 2026-06-30
 
 ### Added
