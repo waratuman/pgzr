@@ -18,6 +18,7 @@ pub const MSG_CMD_COMPLETE: u8 = 'C';
 pub const MSG_ERROR: u8 = 'E';
 pub const MSG_NOTICE: u8 = 'N';
 pub const MSG_COPY_BOTH: u8 = 'W';
+pub const MSG_COPY_IN: u8 = 'G';
 pub const MSG_COPY_DATA: u8 = 'd';
 pub const MSG_COPY_DONE: u8 = 'c';
 

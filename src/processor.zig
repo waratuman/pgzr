@@ -44,9 +44,12 @@ pub const Processor = struct {
     metadata_table_oid: ?u32,
 
     // Buffered events: accumulated during a transaction and flushed as a
-    // single multi-row INSERT at commit time (or in chunks when the buffer
-    // exceeds flush_threshold to bound memory for large transactions).
+    // single COPY at commit time (or in chunks when the buffer exceeds
+    // flush_threshold to bound memory for large transactions).
     pending_events: std.ArrayListUnmanaged([]u8),
+
+    // Reusable COPY stream buffer for flushPendingEvents.
+    copy_buf: std.ArrayListUnmanaged(u8),
 
     // Stop flag for graceful shutdown
     stop_flag: std.atomic.Value(bool),
@@ -109,6 +112,7 @@ pub const Processor = struct {
             .metadata_chunks = .{},
             .metadata_table_oid = null,
             .pending_events = .{},
+            .copy_buf = .{},
             .stop_flag = std.atomic.Value(bool).init(false),
         };
     }
@@ -566,11 +570,11 @@ pub const Processor = struct {
         }
     }
 
-    /// Append a pgoutput tuple as a JSONB literal ('{"col":"val",...}')
-    /// or NULL if the tuple has no data.
-    fn appendTupleAsJsonb(
+    /// Append a pgoutput tuple as a COPY text-format JSONB field
+    /// ({"col":"val",...}) or \N if the tuple has no data.
+    fn appendTupleAsJsonbCopy(
         self: *Processor,
-        sql: *std.ArrayListUnmanaged(u8),
+        frag: *std.ArrayListUnmanaged(u8),
         rel: OwnedRelation,
         tuple: []const pgoutput.ColumnData,
     ) !void {
@@ -588,40 +592,40 @@ pub const Processor = struct {
         }
 
         if (!has_any) {
-            try sql.appendSlice(self.allocator, "NULL");
+            try frag.appendSlice(self.allocator, query_mod.copy_null);
             return;
         }
 
-        try sql.appendSlice(self.allocator, "'{");
+        try frag.append(self.allocator, '{');
         var first = true;
         for (rel.columns, 0..) |col, i| {
             if (i >= tuple.len) continue;
 
             switch (tuple[i]) {
                 .text => |t| {
-                    if (!first) try sql.appendSlice(self.allocator, ",");
+                    if (!first) try frag.append(self.allocator, ',');
                     first = false;
-                    try appendJsonString(sql, self.allocator, col.name);
-                    try sql.append(self.allocator, ':');
-                    try appendJsonString(sql, self.allocator, t);
+                    try appendJsonStringCopy(frag, self.allocator, col.name);
+                    try frag.append(self.allocator, ':');
+                    try appendJsonStringCopy(frag, self.allocator, t);
                 },
                 .binary => |b| {
-                    if (!first) try sql.appendSlice(self.allocator, ",");
+                    if (!first) try frag.append(self.allocator, ',');
                     first = false;
-                    try appendJsonString(sql, self.allocator, col.name);
-                    try sql.append(self.allocator, ':');
-                    try appendJsonString(sql, self.allocator, b);
+                    try appendJsonStringCopy(frag, self.allocator, col.name);
+                    try frag.append(self.allocator, ':');
+                    try appendJsonStringCopy(frag, self.allocator, b);
                 },
                 .null_value => {
-                    if (!first) try sql.appendSlice(self.allocator, ",");
+                    if (!first) try frag.append(self.allocator, ',');
                     first = false;
-                    try appendJsonString(sql, self.allocator, col.name);
-                    try sql.appendSlice(self.allocator, ":null");
+                    try appendJsonStringCopy(frag, self.allocator, col.name);
+                    try frag.appendSlice(self.allocator, ":null");
                 },
                 .unchanged => {},
             }
         }
-        try sql.appendSlice(self.allocator, "}'::jsonb");
+        try frag.append(self.allocator, '}');
     }
 
     fn computeIdentityDigest(self: *Processor, rel: OwnedRelation, tuple: []const pgoutput.ColumnData) !?[]u8 {
@@ -925,44 +929,41 @@ pub const Processor = struct {
         } else null;
         defer if (prev_identity_digest) |d| self.allocator.free(d);
 
+        // Build a COPY text-format fragment: tab-separated fields for
+        // rel_oid, type, identity_digest, previous_identity_digest, data,
+        // old_data. transaction_id and committed_at are prepended at flush.
         var frag: std.ArrayListUnmanaged(u8) = .{};
         errdefer frag.deinit(self.allocator);
 
         // rel_oid
         try query_mod.appendIntValue(&frag, self.allocator, relation_oid);
-        try frag.appendSlice(self.allocator, ", '");
+        try frag.append(self.allocator, '\t');
+
+        // type (single char I/U/D/T — no escaping needed)
         try frag.append(self.allocator, event_type);
-        try frag.appendSlice(self.allocator, "', ");
+        try frag.append(self.allocator, '\t');
 
         // identity_digest
-        try query_mod.appendByteaOrNull(&frag, self.allocator, identity_digest);
-        try frag.appendSlice(self.allocator, ", ");
+        try query_mod.appendCopyByteaOrNull(&frag, self.allocator, identity_digest);
+        try frag.append(self.allocator, '\t');
 
         // previous_identity_digest
-        try query_mod.appendByteaOrNull(&frag, self.allocator, prev_identity_digest);
-        try frag.appendSlice(self.allocator, ", ");
+        try query_mod.appendCopyByteaOrNull(&frag, self.allocator, prev_identity_digest);
+        try frag.append(self.allocator, '\t');
 
         // data JSONB
-        if (rel) |r| {
-            if (tuple) |t| {
-                try self.appendTupleAsJsonb(&frag, r, t);
-            } else {
-                try frag.appendSlice(self.allocator, "NULL");
-            }
+        if (rel != null and tuple != null) {
+            try self.appendTupleAsJsonbCopy(&frag, rel.?, tuple.?);
         } else {
-            try frag.appendSlice(self.allocator, "NULL");
+            try frag.appendSlice(self.allocator, query_mod.copy_null);
         }
-        try frag.appendSlice(self.allocator, ", ");
+        try frag.append(self.allocator, '\t');
 
         // old_data JSONB
-        if (rel) |r| {
-            if (old_tuple) |ot| {
-                try self.appendTupleAsJsonb(&frag, r, ot);
-            } else {
-                try frag.appendSlice(self.allocator, "NULL");
-            }
+        if (rel != null and old_tuple != null) {
+            try self.appendTupleAsJsonbCopy(&frag, rel.?, old_tuple.?);
         } else {
-            try frag.appendSlice(self.allocator, "NULL");
+            try frag.appendSlice(self.allocator, query_mod.copy_null);
         }
 
         const owned = try frag.toOwnedSlice(self.allocator);
@@ -975,49 +976,57 @@ pub const Processor = struct {
         }
     }
 
-    /// Insert all buffered events as a single multi-row INSERT with the
-    /// transaction_id and committed_at timestamp.
+    /// Insert all buffered events via COPY with the transaction_id and
+    /// committed_at timestamp. COPY skips SQL lexing/parsing/planning on
+    /// the server, which dominates the cost of large multi-row INSERTs.
     fn flushPendingEvents(self: *Processor) !void {
         if (self.pending_events.items.len == 0) return;
 
+        const txn_id = self.current_txn_id orelse try self.lookupTransactionId();
+
+        var txn_id_buf: [20]u8 = undefined;
+        const txn_id_text = std.fmt.bufPrint(&txn_id_buf, "{d}", .{txn_id}) catch unreachable;
+        var ts_buf: [40]u8 = undefined;
+        const ts_text = query_mod.writeTimestampText(&ts_buf, self.current_txn_timestamp);
+
+        self.copy_buf.clearRetainingCapacity();
+        for (self.pending_events.items) |frag| {
+            try self.copy_buf.appendSlice(self.allocator, txn_id_text);
+            try self.copy_buf.append(self.allocator, '\t');
+            try self.copy_buf.appendSlice(self.allocator, ts_text);
+            try self.copy_buf.append(self.allocator, '\t');
+            try self.copy_buf.appendSlice(self.allocator, frag);
+            try self.copy_buf.append(self.allocator, '\n');
+        }
+
+        try self.dest.copyIn(
+            self.allocator,
+            "COPY events (transaction_id, committed_at, rel_oid, type, " ++
+                "identity_digest, previous_identity_digest, data, old_data) FROM STDIN",
+            self.copy_buf.items,
+        );
+        self.clearPendingEvents();
+    }
+
+    /// Resolve the current transaction's id when insertTransaction did not
+    /// return one. Preserves the pre-COPY fallback (a per-row subquery in
+    /// the INSERT); with COPY the id must be resolved client-side.
+    fn lookupTransactionId(self: *Processor) !i64 {
         var sql: std.ArrayListUnmanaged(u8) = .{};
         defer sql.deinit(self.allocator);
 
-        try sql.appendSlice(
-            self.allocator,
-            "INSERT INTO events (transaction_id, committed_at, rel_oid, type, " ++
-                "identity_digest, previous_identity_digest, data, old_data) VALUES ",
-        );
+        try sql.appendSlice(self.allocator, "SELECT id FROM transactions WHERE source_id=");
+        try query_mod.appendEscapedUuid(&sql, self.allocator, self.sourceId());
+        try sql.appendSlice(self.allocator, " AND lsn=");
+        try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
+        try sql.appendSlice(self.allocator, " AND committed_at=");
+        try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
 
-        for (self.pending_events.items, 0..) |frag, i| {
-            if (i > 0) try sql.appendSlice(self.allocator, ", ");
-            try sql.append(self.allocator, '(');
-
-            // transaction_id
-            if (self.current_txn_id) |txn_id| {
-                try query_mod.appendIntValue(&sql, self.allocator, txn_id);
-            } else {
-                try sql.appendSlice(self.allocator, "(SELECT id FROM transactions WHERE source_id=");
-                try query_mod.appendEscapedUuid(&sql, self.allocator, self.sourceId());
-                try sql.appendSlice(self.allocator, " AND lsn=");
-                try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
-                try sql.appendSlice(self.allocator, " AND committed_at=");
-                try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
-                try sql.append(self.allocator, ')');
-            }
-            try sql.appendSlice(self.allocator, ", ");
-
-            // committed_at
-            try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
-            try sql.appendSlice(self.allocator, ", ");
-
-            // rest of the values (rel_oid, type, digests, data, old_data)
-            try sql.appendSlice(self.allocator, frag);
-            try sql.append(self.allocator, ')');
+        const result = try self.dest.simpleQuery(sql.items);
+        if (result.column_count > 0 and result.columns[0].data.len > 0) {
+            return std.fmt.parseInt(i64, result.columns[0].data, 10) catch return error.ServerError;
         }
-
-        try self.dest.execLarge(self.allocator, sql.items);
-        self.clearPendingEvents();
+        return error.ServerError;
     }
 
     fn clearPendingEvents(self: *Processor) void {
@@ -1097,9 +1106,72 @@ pub const Processor = struct {
         self.metadata_chunks.deinit(self.allocator);
         self.clearPendingEvents();
         self.pending_events.deinit(self.allocator);
+        self.copy_buf.deinit(self.allocator);
         self.dest.close();
     }
 };
+
+/// Append a JSON-escaped string (with surrounding double quotes) in COPY
+/// text format. Each JSON escape's backslash is doubled so it survives COPY
+/// unescaping (\\" on the wire → \" after COPY → escaped quote in JSON).
+/// Unlike the SQL-literal variant, single quotes need no escaping. Runs of
+/// characters that need no escaping are copied in bulk.
+fn appendJsonStringCopy(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    try list.append(allocator, '"');
+    var start: usize = 0;
+    for (value, 0..) |c, i| {
+        const esc: []const u8 = switch (c) {
+            '"' => "\\\\\"",
+            '\\' => "\\\\\\\\",
+            '\n' => "\\\\n",
+            '\r' => "\\\\r",
+            '\t' => "\\\\t",
+            // Control characters: \u-escaped below
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => "",
+            else => continue,
+        };
+        try list.appendSlice(allocator, value[start..i]);
+        if (esc.len > 0) {
+            try list.appendSlice(allocator, esc);
+        } else {
+            var buf: [8]u8 = undefined;
+            const u = std.fmt.bufPrint(&buf, "\\\\u{x:0>4}", .{c}) catch unreachable;
+            try list.appendSlice(allocator, u);
+        }
+        start = i + 1;
+    }
+    try list.appendSlice(allocator, value[start..]);
+    try list.append(allocator, '"');
+}
+
+test "appendJsonStringCopy: plain" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendJsonStringCopy(&list, std.testing.allocator, "hello");
+    try std.testing.expectEqualStrings("\"hello\"", list.items);
+}
+
+test "appendJsonStringCopy: quote and backslash double for COPY" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendJsonStringCopy(&list, std.testing.allocator, "a\"b\\c");
+    // JSON: a\"b\\c — each escape backslash doubled for COPY
+    try std.testing.expectEqualStrings("\"a\\\\\"b\\\\\\\\c\"", list.items);
+}
+
+test "appendJsonStringCopy: single quote passes through" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendJsonStringCopy(&list, std.testing.allocator, "it's");
+    try std.testing.expectEqualStrings("\"it's\"", list.items);
+}
+
+test "appendJsonStringCopy: newline tab control" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendJsonStringCopy(&list, std.testing.allocator, "a\nb\tc\x07d");
+    try std.testing.expectEqualStrings("\"a\\\\nb\\\\tc\\\\u0007d\"", list.items);
+}
 
 /// Append a JSON-escaped string (with surrounding double quotes) to the list.
 /// Runs of characters that need no escaping are copied in bulk.

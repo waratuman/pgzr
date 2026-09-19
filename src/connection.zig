@@ -417,6 +417,91 @@ pub const Connection = struct {
         }
     }
 
+    /// Execute a COPY ... FROM STDIN command, sending `data` as the copy
+    /// stream (pre-encoded in the format the command expects, e.g. text
+    /// format rows). The server parses the stream directly, skipping SQL
+    /// lexing/parsing/planning — much faster than multi-row INSERT for bulk
+    /// loads. Returns error.ServerError if the command is rejected or any
+    /// row fails; the connection is drained to ReadyForQuery either way.
+    pub fn copyIn(self: *Connection, allocator: std.mem.Allocator, command: []const u8, data: []const u8) QueryError!void {
+        self.resetRecvBuf();
+
+        // Send the COPY command
+        const msg_len = 1 + 4 + command.len + 1;
+        self.send_buf.clearRetainingCapacity();
+        self.send_buf.ensureTotalCapacity(allocator, msg_len) catch return error.OutOfMemory;
+        const buf = self.send_buf.allocatedSlice()[0..msg_len];
+        const msg = protocol.encodeQuery(buf, command);
+        try self.transport.writeAll(msg);
+
+        // Wait for CopyInResponse. If the command is rejected the server
+        // sends ErrorResponse + ReadyForQuery without entering copy mode.
+        var server_error = false;
+        copy_wait: while (true) {
+            const header = try protocol.readHeader(self.transport);
+            switch (header.msg_type) {
+                protocol.MSG_COPY_IN => {
+                    _ = try self.readBodyGrowing(header);
+                    break :copy_wait;
+                },
+                protocol.MSG_READY => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    return error.ServerError;
+                },
+                protocol.MSG_ERROR => {
+                    const body = try self.readBodyGrowing(header);
+                    const err = protocol.parseError(body);
+                    std.log.err("Copy error: {s}: {s}", .{ err.code, err.message });
+                    server_error = true;
+                },
+                else => {
+                    _ = try self.readBodyGrowing(header);
+                },
+            }
+        }
+
+        // Stream the data as CopyData messages. If the server errors
+        // mid-copy it discards further CopyData until CopyDone, so writing
+        // everything before reading cannot deadlock.
+        var hdr: [5]u8 = undefined;
+        const chunk_size: usize = 64 * 1024;
+        var pos: usize = 0;
+        while (pos < data.len) {
+            const n = @min(chunk_size, data.len - pos);
+            hdr[0] = protocol.MSG_COPY_DATA;
+            std.mem.writeInt(u32, hdr[1..5], @intCast(4 + n), .big);
+            try self.transport.writeAll(&hdr);
+            try self.transport.writeAll(data[pos .. pos + n]);
+            pos += n;
+        }
+
+        // CopyDone
+        hdr[0] = protocol.MSG_COPY_DONE;
+        std.mem.writeInt(u32, hdr[1..5], 4, .big);
+        try self.transport.writeAll(&hdr);
+
+        // Drain to ReadyForQuery
+        while (true) {
+            const header = try protocol.readHeader(self.transport);
+            switch (header.msg_type) {
+                protocol.MSG_READY => {
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    if (server_error) return error.ServerError;
+                    return;
+                },
+                protocol.MSG_ERROR => {
+                    const body = try self.readBodyGrowing(header);
+                    const err = protocol.parseError(body);
+                    std.log.err("Copy error: {s}: {s}", .{ err.code, err.message });
+                    server_error = true;
+                },
+                else => {
+                    _ = try self.readBodyGrowing(header);
+                },
+            }
+        }
+    }
+
     /// Execute a simple query and invoke a callback for each DataRow.
     /// The callback receives the column data slice (borrowed from recv_buf)
     /// and must copy any data it needs before returning.

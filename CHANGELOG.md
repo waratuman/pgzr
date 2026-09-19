@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Events are inserted via `COPY ... FROM STDIN`** instead of multi-row
+  INSERT statements. The server no longer lexes/parses/plans megabyte-scale
+  SQL per flush, and the client emits COPY text format directly (no SQL
+  literal quoting layer). ~10% end-to-end on the 100K-event stress test
+  over a local socket; larger on remote/TLS links. Adds
+  `Connection.copyIn` and a `CopyInResponse` protocol handler.
+
+### Added
+
+- `DEVELOPMENT.md` with the performance roadmap and benchmarking notes.
+
 ## [0.4.2] - 2026-07-08
 
 ### Changed

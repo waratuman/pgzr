@@ -62,10 +62,10 @@ pub fn formatInt(allocator: std.mem.Allocator, value: i64) ![]u8 {
 }
 
 /// Format a PostgreSQL timestamp (microseconds since 2000-01-01 00:00:00 UTC)
-/// as an ISO 8601 SQL timestamp literal: '2024-01-15 12:34:56.789012+00'
+/// as ISO 8601 text without quotes into the caller's buffer:
+/// 2024-01-15 12:34:56.789012+00
 /// Handles dates before Unix epoch (1970) by clamping to epoch.
-/// Caller owns the returned slice.
-pub fn formatTimestamp(allocator: std.mem.Allocator, pg_usec: i64) ![]u8 {
+pub fn writeTimestampText(buf: *[40]u8, pg_usec: i64) []const u8 {
     // PostgreSQL epoch is 2000-01-01 00:00:00 UTC
     // Unix epoch offset: seconds between 1970-01-01 and 2000-01-01
     const pg_epoch_offset_us: i64 = 946_684_800 * 1_000_000;
@@ -84,8 +84,7 @@ pub fn formatTimestamp(allocator: std.mem.Allocator, pg_usec: i64) ![]u8 {
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
 
-    var buf: [40]u8 = undefined;
-    const result = std.fmt.bufPrint(&buf, "'{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}+00'", .{
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}+00", .{
         yd.year,
         @as(u32, @intFromEnum(md.month)),
         @as(u32, md.day_index) + 1,
@@ -94,9 +93,20 @@ pub fn formatTimestamp(allocator: std.mem.Allocator, pg_usec: i64) ![]u8 {
         ds.getSecondsIntoMinute(),
         frac_us,
     }) catch unreachable;
+}
 
-    const out = try allocator.alloc(u8, result.len);
-    @memcpy(out, result);
+/// Format a PostgreSQL timestamp (microseconds since 2000-01-01 00:00:00 UTC)
+/// as an ISO 8601 SQL timestamp literal: '2024-01-15 12:34:56.789012+00'
+/// Handles dates before Unix epoch (1970) by clamping to epoch.
+/// Caller owns the returned slice.
+pub fn formatTimestamp(allocator: std.mem.Allocator, pg_usec: i64) ![]u8 {
+    var buf: [40]u8 = undefined;
+    const text = writeTimestampText(&buf, pg_usec);
+
+    const out = try allocator.alloc(u8, text.len + 2);
+    out[0] = '\'';
+    @memcpy(out[1 .. 1 + text.len], text);
+    out[out.len - 1] = '\'';
     return out;
 }
 
@@ -198,31 +208,12 @@ pub fn appendIntValue(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocato
 
 /// Append a PostgreSQL timestamp as a SQL literal.
 pub fn appendTimestamp(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, pg_usec: i64) !void {
-    const pg_epoch_offset_us: i64 = 946_684_800 * 1_000_000;
-    const unix_us = pg_usec + pg_epoch_offset_us;
-    const clamped_us = @max(unix_us, 0);
-    const unix_sec = @divFloor(clamped_us, @as(i64, 1_000_000));
-    const frac_us: u64 = @intCast(@mod(clamped_us, 1_000_000));
-
-    const epoch_secs: u64 = @intCast(unix_sec);
-    const es = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
-    const day = es.getEpochDay();
-    const yd = day.calculateYearDay();
-    const md = yd.calculateMonthDay();
-    const ds = es.getDaySeconds();
-
     var buf: [40]u8 = undefined;
-    const result = std.fmt.bufPrint(&buf, "'{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}+00'", .{
-        yd.year,
-        @as(u32, @intFromEnum(md.month)),
-        @as(u32, md.day_index) + 1,
-        ds.getHoursIntoDay(),
-        ds.getMinutesIntoHour(),
-        ds.getSecondsIntoMinute(),
-        frac_us,
-    }) catch unreachable;
-
-    try list.appendSlice(alloc, result);
+    const text = writeTimestampText(&buf, pg_usec);
+    try list.ensureUnusedCapacity(alloc, text.len + 2);
+    list.appendAssumeCapacity('\'');
+    list.appendSliceAssumeCapacity(text);
+    list.appendAssumeCapacity('\'');
 }
 
 /// Append a bytea value or NULL if data is null.
@@ -231,6 +222,37 @@ pub fn appendByteaOrNull(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Alloc
         try appendEscapedBytea(list, alloc, v);
     } else {
         try appendNull(list, alloc);
+    }
+}
+
+// ── COPY text-format helpers ──────────────────────────────────────────
+//
+// COPY text format is tab-separated fields, newline-terminated rows, with
+// backslash escapes (\t \n \r \\) and \N for NULL. No quoting layer, so
+// single quotes are literal.
+
+/// The COPY text-format NULL field: \N
+pub const copy_null = "\\N";
+
+/// Append a bytea value in COPY text format: \\x<hex>
+/// (COPY unescapes \\ to \, so the bytea input parser sees \x<hex>.)
+pub fn appendCopyBytea(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: []const u8) !void {
+    const hex = "0123456789abcdef";
+    try list.ensureUnusedCapacity(alloc, 3 + value.len * 2);
+    list.appendSliceAssumeCapacity("\\\\x");
+    const out = list.addManyAsSliceAssumeCapacity(value.len * 2);
+    for (value, 0..) |byte, i| {
+        out[i * 2] = hex[byte >> 4];
+        out[i * 2 + 1] = hex[byte & 0x0f];
+    }
+}
+
+/// Append a bytea value in COPY text format, or \N if null.
+pub fn appendCopyByteaOrNull(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: ?[]const u8) !void {
+    if (value) |v| {
+        try appendCopyBytea(list, alloc, v);
+    } else {
+        try list.appendSlice(alloc, copy_null);
     }
 }
 
@@ -485,6 +507,26 @@ test "appendByteaOrNull: null" {
     defer list.deinit(std.testing.allocator);
     try appendByteaOrNull(&list, std.testing.allocator, null);
     try std.testing.expectEqualStrings("NULL", list.items);
+}
+
+test "writeTimestampText: no quotes" {
+    var buf: [40]u8 = undefined;
+    const text = writeTimestampText(&buf, 0);
+    try std.testing.expectEqualStrings("2000-01-01 00:00:00.000000+00", text);
+}
+
+test "appendCopyBytea: hex with doubled backslash" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendCopyBytea(&list, std.testing.allocator, &[_]u8{ 0xde, 0xad });
+    try std.testing.expectEqualStrings("\\\\xdead", list.items);
+}
+
+test "appendCopyByteaOrNull: null" {
+    var list: std.ArrayListUnmanaged(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try appendCopyByteaOrNull(&list, std.testing.allocator, null);
+    try std.testing.expectEqualStrings("\\N", list.items);
 }
 
 test "appendEscapedString: matches escapeString" {
