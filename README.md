@@ -372,3 +372,7 @@ benchmark/
   a source has been rebuilt, failed over to a different timeline, or when
   batches from different clusters are accidentally mixed.
 
+
+## License
+
+All rights reserved. See [LICENSE](LICENSE).
