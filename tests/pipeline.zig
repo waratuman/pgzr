@@ -1009,6 +1009,136 @@ fn testStreamingMetadataViaMessage(allocator: std.mem.Allocator) !void {
 }
 
 // =========================================================================
+// Test 9b: Interleaved streamed transactions — two concurrent large
+// transactions stream interleaved segments; each must commit with exactly
+// its own events.
+// =========================================================================
+fn testInterleavedStreams(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: interleaved streamed transactions... ", .{});
+
+    runPsql(allocator, SOURCE_DB, "ALTER SYSTEM SET logical_decoding_work_mem = '64kB'") catch {};
+    runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+    defer {
+        runPsql(allocator, SOURCE_DB, "ALTER SYSTEM RESET logical_decoding_work_mem") catch {};
+        runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+    }
+
+    runPsql(
+        allocator,
+        DEST_DB,
+        "TRUNCATE events, relation_snapshots, transactions, wal_batches CASCADE",
+    ) catch {};
+    runPsql(allocator, SOURCE_DB, "TRUNCATE items RESTART IDENTITY") catch {};
+
+    // Two concurrent sessions, each writing >64kB in two chunks with
+    // sleeps so their WAL (and thus their stream segments) interleave.
+    const Worker = struct {
+        fn run(alloc: std.mem.Allocator, script: []const u8) void {
+            runPsql(alloc, SOURCE_DB, script) catch {};
+        }
+    };
+    const script_a =
+        \\BEGIN;
+        \\INSERT INTO items (name, quantity) SELECT 'a' || repeat('x', 1000) || g, g FROM generate_series(1, 75) g;
+        \\SELECT pg_sleep(1.0);
+        \\INSERT INTO items (name, quantity) SELECT 'a' || repeat('x', 1000) || g, g FROM generate_series(76, 150) g;
+        \\COMMIT;
+    ;
+    const script_b =
+        \\BEGIN;
+        \\INSERT INTO items (name, quantity) SELECT 'b' || repeat('y', 1000) || g, g FROM generate_series(1, 75) g;
+        \\SELECT pg_sleep(1.0);
+        \\INSERT INTO items (name, quantity) SELECT 'b' || repeat('y', 1000) || g, g FROM generate_series(76, 150) g;
+        \\COMMIT;
+    ;
+    const t_a = std.Thread.spawn(.{}, Worker.run, .{ allocator, script_a }) catch |err| {
+        std.debug.print("FAIL (spawn: {})\n", .{err});
+        return err;
+    };
+    sleepMs(400);
+    const t_b = std.Thread.spawn(.{}, Worker.run, .{ allocator, script_b }) catch |err| {
+        std.debug.print("FAIL (spawn: {})\n", .{err});
+        t_a.join();
+        return err;
+    };
+    t_a.join();
+    t_b.join();
+
+    const end_lsn = getCurrentWalLsn(allocator) catch |err| {
+        std.debug.print("FAIL (get LSN: {})\n", .{err});
+        return err;
+    };
+
+    var ingestor = pgzr.Ingestor.init(allocator, io, .{
+        .source = .{
+            .conn = sourceConnConfig(),
+            .slot_name = SLOT_NAME,
+            .end_position = end_lsn,
+            .options = &.{
+                .{ "proto_version", "2" },
+                .{ "publication_names", PUB_NAME },
+                .{ "streaming", "on" },
+            },
+        },
+        .dest = destConnConfig(),
+        .source_id = SOURCE_ID,
+        .max_batch_size = 256 * 1024,
+    }) catch |err| {
+        std.debug.print("FAIL (init ingestor: {})\n", .{err});
+        return err;
+    };
+    defer ingestor.deinit();
+
+    ingestor.run() catch |err| {
+        std.debug.print("FAIL (ingestor run: {})\n", .{err});
+        return err;
+    };
+
+    var processor = pgzr.Processor.init(allocator, io, .{
+        .dest = destConnConfig(),
+    }) catch |err| {
+        std.debug.print("FAIL (init processor: {})\n", .{err});
+        return err;
+    };
+    defer processor.deinit();
+
+    var batch_count: u32 = 0;
+    while (true) {
+        const processed = processor.processOne() catch |err| {
+            std.debug.print("FAIL (processOne: {})\n", .{err});
+            return err;
+        };
+        if (!processed) break;
+        batch_count += 1;
+        if (batch_count > 100) break;
+    }
+
+    // All of this test's events captured, and each attributed to exactly
+    // its own transaction (the shared slot also carries unrelated
+    // transactions from earlier tests, so scope every check to our rows).
+    const a_events = try queryCount(allocator, DEST_DB, "SELECT count(*) FROM events WHERE type='I' AND data->>'name' LIKE 'ax%'");
+    const b_events = try queryCount(allocator, DEST_DB, "SELECT count(*) FROM events WHERE type='I' AND data->>'name' LIKE 'by%'");
+    if (a_events != 150 or b_events != 150) {
+        std.debug.print("FAIL (expected 150+150 insert events, got a={d} b={d})\n", .{ a_events, b_events });
+        return error.ServerError;
+    }
+    const a_txns = try queryCount(allocator, DEST_DB, "SELECT count(DISTINCT transaction_id) FROM events WHERE data->>'name' LIKE 'ax%'");
+    const b_txns = try queryCount(allocator, DEST_DB, "SELECT count(DISTINCT transaction_id) FROM events WHERE data->>'name' LIKE 'by%'");
+    const ab_txns = try queryCount(allocator, DEST_DB, "SELECT count(DISTINCT transaction_id) FROM events WHERE data->>'name' LIKE 'ax%' OR data->>'name' LIKE 'by%'");
+    if (a_txns != 1 or b_txns != 1 or ab_txns != 2) {
+        std.debug.print("FAIL (attribution: a={d} b={d} a+b={d})\n", .{ a_txns, b_txns, ab_txns });
+        return error.ServerError;
+    }
+    const leftover = try queryCount(allocator, DEST_DB, "SELECT count(*) FROM wal_batches");
+    if (leftover != 0) {
+        std.debug.print("FAIL ({d} unprocessed wal_batches)\n", .{leftover});
+        return error.ServerError;
+    }
+
+    std.debug.print("OK (2 txn, 300 events, {d} batch groups, correct attribution)\n", .{batch_count});
+}
+
+// =========================================================================
 // Test 10: Proto v4 — metadata via pg_logical_emit_message
 // =========================================================================
 fn testProtoV4MetadataViaMessage(allocator: std.mem.Allocator) !void {
@@ -1328,6 +1458,10 @@ pub fn main(init: std.process.Init) !void {
     };
 
     testProtoV4MetadataViaMessage(allocator) catch {
+        failures += 1;
+    };
+
+    testInterleavedStreams(allocator) catch {
         failures += 1;
     };
 

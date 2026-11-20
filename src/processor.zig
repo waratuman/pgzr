@@ -49,6 +49,15 @@ pub const Processor = struct {
     // flush_threshold to bound memory for large transactions).
     pending_events: std.ArrayListUnmanaged([]u8),
 
+    // Per-transaction buffers for streamed (proto v2+) transactions,
+    // keyed by top-level xid. Streamed transactions may interleave, so
+    // their events and metadata cannot share the non-streamed buffers;
+    // they are adopted into the shared flush path at stream_commit. Each
+    // item is tagged with the (sub)xid that produced it so a
+    // subtransaction abort can discard exactly its changes.
+    stream_events: std.AutoHashMap(u32, std.ArrayListUnmanaged(StreamItem)),
+    stream_metadata: std.AutoHashMap(u32, std.ArrayListUnmanaged(StreamItem)),
+
     // Reusable COPY stream buffer for flushPendingEvents.
     copy_buf: std.ArrayListUnmanaged(u8),
 
@@ -57,6 +66,11 @@ pub const Processor = struct {
 
     // Maximum number of buffered events before an intermediate flush.
     const flush_threshold: usize = 1000;
+
+    const StreamItem = struct {
+        sub_xid: u32,
+        data: []u8,
+    };
 
     const OwnedRelation = struct {
         oid: u32,
@@ -114,6 +128,8 @@ pub const Processor = struct {
             .metadata_chunks = .empty,
             .metadata_table_oid = null,
             .pending_events = .empty,
+            .stream_events = std.AutoHashMap(u32, std.ArrayListUnmanaged(StreamItem)).init(allocator),
+            .stream_metadata = std.AutoHashMap(u32, std.ArrayListUnmanaged(StreamItem)).init(allocator),
             .copy_buf = .empty,
             .stop_flag = std.atomic.Value(bool).init(false),
         };
@@ -207,6 +223,7 @@ pub const Processor = struct {
         self.clearPending();
         self.clearPendingEvents();
         self.clearMetadataChunks();
+        self.clearStreamBuffers();
         self.in_transaction = false;
         self.current_txn_id = null;
         self.current_stream_xid = null;
@@ -454,25 +471,25 @@ pub const Processor = struct {
                 },
                 .insert => |ins| {
                     if (self.isMetadataTable(ins.relation_oid)) {
-                        try self.extractMetadataFromTuple(ins.relation_oid, ins.new_tuple);
+                        try self.extractMetadataFromTuple(ins.relation_oid, ins.new_tuple, ins.xid);
                     } else {
-                        try self.bufferEvent(ins.relation_oid, 'I', ins.new_tuple, null);
+                        try self.bufferEvent(ins.relation_oid, 'I', ins.new_tuple, null, ins.xid);
                     }
                 },
                 .update => |upd| {
                     if (self.isMetadataTable(upd.relation_oid)) {
-                        try self.extractMetadataFromTuple(upd.relation_oid, upd.new_tuple);
+                        try self.extractMetadataFromTuple(upd.relation_oid, upd.new_tuple, upd.xid);
                     } else {
-                        try self.bufferEvent(upd.relation_oid, 'U', upd.new_tuple, upd.old_tuple);
+                        try self.bufferEvent(upd.relation_oid, 'U', upd.new_tuple, upd.old_tuple, upd.xid);
                     }
                 },
                 .delete => |del| {
                     if (!self.isMetadataTable(del.relation_oid)) {
-                        try self.bufferEvent(del.relation_oid, 'D', null, del.old_tuple);
+                        try self.bufferEvent(del.relation_oid, 'D', null, del.old_tuple, del.xid);
                     }
                 },
-                .truncate => {
-                    try self.bufferEvent(0, 'T', null, null);
+                .truncate => |trunc| {
+                    try self.bufferEvent(0, 'T', null, null, trunc.xid);
                 },
                 // Proto v2: streaming — events and metadata are buffered
                 // during stream chunks and flushed at commit time when
@@ -480,10 +497,10 @@ pub const Processor = struct {
                 .stream_start => |ss| {
                     self.current_stream_xid = ss.xid;
                     if (ss.first_segment) {
-                        self.current_txn_xid = ss.xid;
-                        self.in_transaction = true;
-                        self.clearMetadataChunks();
-                        self.clearPendingEvents();
+                        // Fresh start of this transaction's stream: drop
+                        // any stale buffered state for this xid (e.g. a
+                        // batch replayed after a crash).
+                        self.dropStreamTxn(ss.xid);
                     }
                 },
                 .stream_stop => {
@@ -491,20 +508,26 @@ pub const Processor = struct {
                 },
                 .stream_commit => |sc| {
                     self.current_txn_lsn = sc.lsn;
+                    self.current_txn_xid = sc.xid;
                     self.current_txn_timestamp = sc.timestamp;
                     self.current_txn_id = try self.insertTransaction(sc.lsn);
+                    try self.adoptStreamBuffers(sc.xid);
                     try self.flushPendingEvents();
                     try self.flushMetadata();
                     self.current_stream_xid = null;
-                    self.in_transaction = false;
                     self.current_txn_id = null;
                 },
-                .stream_abort => {
-                    self.clearMetadataChunks();
-                    self.clearPendingEvents();
+                .stream_abort => |sa| {
+                    // A top-level abort discards the whole transaction; a
+                    // subtransaction abort discards only the changes tagged
+                    // with that sub_xid. Other interleaved transactions are
+                    // untouched.
+                    if (sa.sub_xid == sa.xid) {
+                        self.dropStreamTxn(sa.xid);
+                    } else {
+                        self.dropStreamSubxact(sa.xid, sa.sub_xid);
+                    }
                     self.current_stream_xid = null;
-                    self.in_transaction = false;
-                    self.current_txn_id = null;
                 },
                 // Proto v3: two-phase commit
                 .begin_prepare => |bp| {
@@ -535,7 +558,11 @@ pub const Processor = struct {
                 .message => |logical_msg| {
                     if (self.config.metadata_message_prefix) |prefix| {
                         if (std.mem.eql(u8, logical_msg.prefix, prefix)) {
-                            try self.addMetadataChunk(logical_msg.content);
+                            if (self.current_stream_xid) |top| {
+                                try self.addStreamMetadata(top, logical_msg.xid orelse top, logical_msg.content);
+                            } else {
+                                try self.addMetadataChunk(logical_msg.content);
+                            }
                         }
                     }
                 },
@@ -900,21 +927,117 @@ pub const Processor = struct {
         try self.metadata_chunks.append(self.allocator, copy);
     }
 
-    fn extractMetadataFromTuple(self: *Processor, relation_oid: u32, tuple: ?[]const pgoutput.ColumnData) !void {
+    fn addStreamMetadata(self: *Processor, xid: u32, sub_xid: u32, content: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, content);
+        errdefer self.allocator.free(copy);
+        const gop = try self.stream_metadata.getOrPut(xid);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(self.allocator, .{ .sub_xid = sub_xid, .data = copy });
+    }
+
+    fn extractMetadataFromTuple(self: *Processor, relation_oid: u32, tuple: ?[]const pgoutput.ColumnData, sub_xid: ?u32) !void {
         const t = tuple orelse return;
         const rel = self.relations.get(relation_oid) orelse return;
 
         // Find the "data" column and extract its value
         for (rel.columns, 0..) |col, i| {
             if (std.mem.eql(u8, col.name, "data") and i < t.len) {
-                switch (t[i]) {
-                    .text => |v| try self.addMetadataChunk(v),
-                    .binary => |v| try self.addMetadataChunk(v),
-                    else => {},
+                const value: []const u8 = switch (t[i]) {
+                    .text => |v| v,
+                    .binary => |v| v,
+                    else => return,
+                };
+                if (self.current_stream_xid) |top| {
+                    try self.addStreamMetadata(top, sub_xid orelse top, value);
+                } else {
+                    try self.addMetadataChunk(value);
                 }
                 return;
             }
         }
+    }
+
+    /// Move a committed streamed transaction's buffered events and
+    /// metadata into the shared (non-streamed) buffers for flushing.
+    /// Ownership of each item's bytes transfers to the shared lists.
+    fn adoptStreamBuffers(self: *Processor, xid: u32) !void {
+        if (self.stream_events.fetchRemove(xid)) |entry| {
+            var list = entry.value;
+            defer list.deinit(self.allocator);
+            for (list.items, 0..) |item, i| {
+                self.pending_events.append(self.allocator, item.data) catch |err| {
+                    for (list.items[i..]) |rest| self.allocator.free(rest.data);
+                    return err;
+                };
+            }
+        }
+        if (self.stream_metadata.fetchRemove(xid)) |entry| {
+            var list = entry.value;
+            defer list.deinit(self.allocator);
+            for (list.items, 0..) |item, i| {
+                self.metadata_chunks.append(self.allocator, item.data) catch |err| {
+                    for (list.items[i..]) |rest| self.allocator.free(rest.data);
+                    return err;
+                };
+            }
+        }
+    }
+
+    /// Discard all buffered state for a streamed transaction.
+    fn dropStreamTxn(self: *Processor, xid: u32) void {
+        if (self.stream_events.fetchRemove(xid)) |entry| {
+            var list = entry.value;
+            for (list.items) |item| self.allocator.free(item.data);
+            list.deinit(self.allocator);
+        }
+        if (self.stream_metadata.fetchRemove(xid)) |entry| {
+            var list = entry.value;
+            for (list.items) |item| self.allocator.free(item.data);
+            list.deinit(self.allocator);
+        }
+    }
+
+    /// Discard the buffered changes of one aborted subtransaction,
+    /// keeping the rest of the transaction's buffer intact.
+    fn dropStreamSubxact(self: *Processor, xid: u32, sub_xid: u32) void {
+        if (self.stream_events.getPtr(xid)) |list| {
+            var i: usize = 0;
+            while (i < list.items.len) {
+                if (list.items[i].sub_xid == sub_xid) {
+                    self.allocator.free(list.items[i].data);
+                    _ = list.orderedRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        if (self.stream_metadata.getPtr(xid)) |list| {
+            var i: usize = 0;
+            while (i < list.items.len) {
+                if (list.items[i].sub_xid == sub_xid) {
+                    self.allocator.free(list.items[i].data);
+                    _ = list.orderedRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Discard all per-xid streamed transaction buffers.
+    fn clearStreamBuffers(self: *Processor) void {
+        var ev_it = self.stream_events.iterator();
+        while (ev_it.next()) |entry| {
+            for (entry.value_ptr.items) |item| self.allocator.free(item.data);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.stream_events.clearRetainingCapacity();
+        var md_it = self.stream_metadata.iterator();
+        while (md_it.next()) |entry| {
+            for (entry.value_ptr.items) |item| self.allocator.free(item.data);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.stream_metadata.clearRetainingCapacity();
     }
 
     fn clearMetadataChunks(self: *Processor) void {
@@ -967,6 +1090,7 @@ pub const Processor = struct {
         event_type: u8,
         tuple: ?[]const pgoutput.ColumnData,
         old_tuple: ?[]const pgoutput.ColumnData,
+        sub_xid: ?u32,
     ) !void {
         const rel = if (relation_oid != 0) self.relations.get(relation_oid) else null;
 
@@ -1027,7 +1151,20 @@ pub const Processor = struct {
         }
 
         const owned = try frag.toOwnedSlice(self.allocator);
-        try self.pending_events.append(self.allocator, owned);
+
+        if (self.current_stream_xid) |top| {
+            // Streamed transaction: buffer per-xid until its stream_commit.
+            errdefer self.allocator.free(owned);
+            const gop = try self.stream_events.getOrPut(top);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(self.allocator, .{ .sub_xid = sub_xid orelse top, .data = owned });
+            return;
+        }
+
+        {
+            errdefer self.allocator.free(owned);
+            try self.pending_events.append(self.allocator, owned);
+        }
 
         // Flush in chunks to bound memory for large transactions.
         // Only possible when current_txn_id is known (non-streaming path).
@@ -1166,6 +1303,9 @@ pub const Processor = struct {
         self.metadata_chunks.deinit(self.allocator);
         self.clearPendingEvents();
         self.pending_events.deinit(self.allocator);
+        self.clearStreamBuffers();
+        self.stream_events.deinit();
+        self.stream_metadata.deinit();
         self.copy_buf.deinit(self.allocator);
         self.dest.close();
     }

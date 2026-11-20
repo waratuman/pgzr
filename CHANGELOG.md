@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Interleaved streamed transactions are now handled correctly.** With
+  proto v2+ streaming, segments of concurrently-streaming large
+  transactions interleave in the WAL stream; previously the ingestor's
+  single `in_transaction`/`txn_begin_lsn` and the processor's shared
+  event buffer silently dropped or mis-attributed events (even a single
+  multi-segment stream could lose its earlier partial batches). The
+  ingestor now tracks the set of open transactions — a batch group's
+  `begin_lsn` is fixed when the first transaction opens, and only a
+  close that leaves zero transactions open flushes `complete=true`. The
+  processor buffers streamed events and metadata per top-level xid,
+  adopting them into the flush path at that transaction's
+  `stream_commit`. Streamed messages now expose their embedded (sub)xid,
+  so a subtransaction abort discards exactly its own changes instead of
+  the whole buffer. Adds a pipeline test that commits two concurrently
+  streaming transactions and verifies per-transaction attribution.
+
 - **Transient failures no longer permanently park batches.** A processor
   failure now parks the claimed batches in `state='error'` only when the
   failure is a property of the batch itself: pgoutput decode errors,
