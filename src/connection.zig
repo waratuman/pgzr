@@ -532,8 +532,10 @@ pub const Connection = struct {
                 },
                 protocol.MSG_DATA_ROW => {
                     const body = try self.readBodyGrowing(header);
-                    const col_count = std.mem.readInt(u16, body[0..2], .big);
+                    const raw_col_count = std.mem.readInt(u16, body[0..2], .big);
                     var cols: [16]QueryColumn = undefined;
+                    // Clamp to the local array; extra columns are dropped.
+                    const col_count = @min(raw_col_count, cols.len);
                     var pos: usize = 2;
                     for (0..col_count) |i| {
                         const col_len_raw = std.mem.readInt(i32, body[pos..][0..4], .big);

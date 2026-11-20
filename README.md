@@ -257,12 +257,12 @@ ls zig-out/lib/libpgzr.*
 Exported functions:
 
 ```
-pgzr_ingestor_new(config)   → *Ingestor or NULL
+pgzr_ingestor_new(config)   → opaque handle or NULL
 pgzr_ingestor_run(ptr)      → 0 on success, -1 on error
 pgzr_ingestor_stop(ptr)     → void (thread-safe)
 pgzr_ingestor_free(ptr)     → void
 
-pgzr_processor_new(config)       → *Processor or NULL
+pgzr_processor_new(config)       → opaque handle or NULL
 pgzr_processor_run(ptr)          → 0 on success, -1 on error
 pgzr_processor_process_one(ptr)  → 1 if batch processed, 0 if none, -1 on error
 pgzr_processor_stop(ptr)         → void (thread-safe)
@@ -270,6 +270,9 @@ pgzr_processor_free(ptr)         → void
 
 pgzr_last_error(out_len)    → pointer to error message
 ```
+
+The config structs and every string they point to are copied during
+`pgzr_*_new`; the caller may free them as soon as the call returns.
 
 The `PgzrIngestConfig` struct accepts an optional `on_flush` callback
 (`void (*)(void *context, uint64_t start_lsn, uint64_t end_lsn, size_t msg_count, bool is_complete)`)

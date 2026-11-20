@@ -105,6 +105,7 @@ pub const TlsState = struct {
 
     pub const UpgradeError = error{
         TlsNotSupported,
+        CaCertificatesUnavailable,
         TlsAlert,
         TlsUnexpectedMessage,
         TlsIllegalParameter,
@@ -177,23 +178,32 @@ pub const TlsState = struct {
         state.stream_writer = stream.writer(&state.stream_write_buf);
 
         if (verify) {
-            // Load system CA certificates for verification
+            // Load system CA certificates for verification. verify-full must
+            // fail closed: if no CA bundle can be loaded, refuse to connect
+            // rather than silently downgrading to an unverified connection.
             var ca_bundle: Certificate.Bundle = .{};
             ca_bundle.rescan(allocator) catch {
-                ca_bundle = .{};
+                ca_bundle.deinit(allocator);
+                return error.CaCertificatesUnavailable;
             };
+            if (ca_bundle.map.count() == 0) {
+                ca_bundle.deinit(allocator);
+                return error.CaCertificatesUnavailable;
+            }
+            // Client.init performs the full handshake (including certificate
+            // verification) synchronously, so the bundle can be freed after.
+            defer ca_bundle.deinit(allocator);
 
             state.tls_client = tls.Client.init(
                 state.stream_reader.interface(),
                 &state.stream_writer.interface,
                 .{
                     .host = .{ .explicit = host },
-                    .ca = if (ca_bundle.map.count() > 0) .{ .bundle = ca_bundle } else .no_verification,
+                    .ca = .{ .bundle = ca_bundle },
                     .read_buffer = &state.tls_read_buf,
                     .write_buffer = &state.tls_write_buf,
                 },
             ) catch |err| {
-                ca_bundle.deinit(allocator);
                 return err;
             };
         } else {

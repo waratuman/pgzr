@@ -146,7 +146,7 @@ pub const Processor = struct {
             // is not undone by the rollback.
             _ = self.dest.simpleQuery("ROLLBACK") catch {};
             self.markBatchesError();
-            self.clearPending();
+            self.resetBatchState();
             return err;
         };
 
@@ -155,9 +155,29 @@ pub const Processor = struct {
             return false;
         }
 
-        _ = try self.dest.simpleQuery("COMMIT");
+        _ = self.dest.simpleQuery("COMMIT") catch |err| {
+            // The transaction rolled back server-side (or the connection
+            // died), reverting the claimed rows to 'pending'. The batch data
+            // is intact, so don't park it — just discard all local state so
+            // the next cycle starts clean instead of replaying stale
+            // pending_data/pending_events against a new claim.
+            self.resetBatchState();
+            return err;
+        };
         self.clearPending();
         return true;
+    }
+
+    /// Discard all per-batch state after a failed cycle: claimed ids,
+    /// assembled batch data, buffered events, metadata chunks, and any
+    /// mid-transaction decode state.
+    fn resetBatchState(self: *Processor) void {
+        self.clearPending();
+        self.clearPendingEvents();
+        self.clearMetadataChunks();
+        self.in_transaction = false;
+        self.current_txn_id = null;
+        self.current_stream_xid = null;
     }
 
     /// One row captured by the group claim, owned copies of the data the
@@ -197,22 +217,29 @@ pub const Processor = struct {
             const proc = self.proc;
             if (cols.len < 6) return;
 
-            // Track the claimed id for deleteBatches/markBatchesError
+            // Track the claimed id for deleteBatches/markBatchesError.
+            // The errdefer is scoped to the block: once append succeeds the
+            // list owns id_copy, and clearPending must be the only freer.
             const id_copy = try proc.allocator.alloc(u8, cols[0].data.len);
             @memcpy(id_copy, cols[0].data);
-            errdefer proc.allocator.free(id_copy);
-            try proc.pending_batch_ids.append(proc.allocator, id_copy);
+            {
+                errdefer proc.allocator.free(id_copy);
+                try proc.pending_batch_ids.append(proc.allocator, id_copy);
+            }
 
             const start_lsn = std.fmt.parseInt(u64, cols[2].data, 10) catch 0;
             const complete = cols[3].data.len > 0 and cols[3].data[0] == 't';
 
+            // Same scoping: after append, rows (freed via ctx.deinit) owns data.
             const data = try proc.decodeBytea(cols[4].data);
-            errdefer proc.allocator.free(data);
-            try self.rows.append(proc.allocator, .{
-                .start_lsn = start_lsn,
-                .complete = complete,
-                .data = data,
-            });
+            {
+                errdefer proc.allocator.free(data);
+                try self.rows.append(proc.allocator, .{
+                    .start_lsn = start_lsn,
+                    .complete = complete,
+                    .data = data,
+                });
+            }
 
             // source_id and relations snapshot come from the complete batch
             if (complete) {
@@ -375,6 +402,7 @@ pub const Processor = struct {
                     self.current_txn_timestamp = begin.timestamp;
                     self.in_transaction = true;
                     self.clearMetadataChunks();
+                    self.clearPendingEvents();
                     self.current_txn_id = try self.insertTransaction(begin.final_lsn);
                 },
                 .commit => {
