@@ -16,6 +16,7 @@ pub const ScramError = protocol.ReadError || protocol.ReadBodyError || Transport
 /// the list of mechanism names (null-terminated strings followed by a final \0).
 pub fn performScramAuth(
     transport: Transport,
+    io: std.Io,
     user: []const u8,
     password: []const u8,
     auth_body: []const u8,
@@ -28,7 +29,7 @@ pub fn performScramAuth(
 
     // Step 1: Generate client nonce and build client-first-message
     var nonce_bytes: [18]u8 = undefined;
-    std.crypto.random.bytes(&nonce_bytes);
+    io.random(&nonce_bytes);
     var client_nonce: [24]u8 = undefined;
     _ = std.base64.standard.Encoder.encode(&client_nonce, &nonce_bytes);
 

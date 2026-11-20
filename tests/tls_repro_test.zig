@@ -5,18 +5,22 @@ pub const std_options: std.Options = .{
     .log_level = .debug,
 };
 
-fn getEnv(key: []const u8) ?[]const u8 {
-    return std.posix.getenv(key);
+/// Io instance for the whole run, set at the top of main.
+var io: std.Io = undefined;
+
+fn getEnv(key: [*:0]const u8) ?[]const u8 {
+    const p = std.c.getenv(key) orelse return null;
+    return std.mem.span(p);
 }
 
-fn getEnvRequired(key: []const u8) []const u8 {
-    return std.posix.getenv(key) orelse {
+fn getEnvRequired(key: [*:0]const u8) []const u8 {
+    return getEnv(key) orelse {
         std.debug.print("Missing required env var: {s}\n", .{key});
         std.process.exit(1);
     };
 }
 
-fn getEnvPort(key: []const u8) u16 {
+fn getEnvPort(key: [*:0]const u8) u16 {
     const val = getEnvRequired(key);
     return std.fmt.parseUnsigned(u16, val, 10) catch {
         std.debug.print("Invalid port in {s}: {s}\n", .{ key, val });
@@ -24,10 +28,21 @@ fn getEnvPort(key: []const u8) u16 {
     };
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+const Stopwatch = struct {
+    start_ts: std.Io.Timestamp,
+
+    fn start() Stopwatch {
+        return .{ .start_ts = std.Io.Clock.awake.now(io) };
+    }
+
+    fn read(self: *const Stopwatch) u64 {
+        return @intCast(self.start_ts.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+    }
+};
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    io = init.io;
 
     const source_host = getEnvRequired("PGZR_TLS_REPRO_SOURCE_HOST");
     const source_port = getEnvPort("PGZR_TLS_REPRO_SOURCE_PORT");
@@ -56,9 +71,9 @@ pub fn main() !void {
     if (debug) std.debug.print("Debug:  enabled\n", .{});
     std.debug.print("\n", .{});
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = Stopwatch.start();
 
-    var ingestor = pgzr.Ingestor.init(allocator, .{
+    var ingestor = pgzr.Ingestor.init(allocator, io, .{
         .source = .{
             .conn = .{
                 .host = source_host,

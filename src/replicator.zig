@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const Connection = @import("connection.zig").Connection;
 const protocol = @import("protocol.zig");
 const Lsn = @import("lsn.zig").Lsn;
@@ -12,6 +13,7 @@ pub const Replicator = struct {
     conn: Connection,
     config: types.ReplicatorConfig,
     allocator: std.mem.Allocator,
+    io: Io,
 
     last_server_lsn: Lsn = Lsn.zero,
     last_received_lsn: Lsn = Lsn.zero,
@@ -34,14 +36,15 @@ pub const Replicator = struct {
         SystemIdMismatch,
     };
 
-    pub fn init(allocator: std.mem.Allocator, config: types.ReplicatorConfig) InitError!Replicator {
-        var conn = try Connection.connect(allocator, config.conn);
+    pub fn init(allocator: std.mem.Allocator, io: Io, config: types.ReplicatorConfig) InitError!Replicator {
+        var conn = try Connection.connect(allocator, io, config.conn);
         errdefer conn.close();
 
         var repl = Replicator{
             .conn = conn,
             .config = config,
             .allocator = allocator,
+            .io = io,
         };
 
         try repl.identifySystem();
@@ -182,7 +185,7 @@ pub const Replicator = struct {
             // Skip poll if the transport (TLS) has buffered data ready to read.
             const has_pending = self.conn.transport.hasPending();
             if (!has_pending) {
-                const now_ms = std.time.milliTimestamp();
+                const now_ms = Io.Clock.awake.now(self.io).toMilliseconds();
                 const interval: i64 = @intCast(self.config.status_interval_ms);
                 const elapsed = now_ms - self.last_status_time_ms;
                 const remaining = @max(100, interval - elapsed);
@@ -260,10 +263,8 @@ pub const Replicator = struct {
     fn isConnectionError(err: NextError) bool {
         return switch (err) {
             error.ConnectionClosed,
-            error.ConnectionResetByPeer,
-            error.BrokenPipe,
+            error.ReadFailed,
             error.WriteFailed,
-            error.TlsConnectionTruncated,
             => true,
             else => false,
         };
@@ -287,10 +288,10 @@ pub const Replicator = struct {
             }
 
             std.log.info("Reconnecting (attempt {d})...", .{attempts});
-            std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+            self.io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
 
             // Try to establish a new connection
-            var conn = Connection.connect(self.allocator, self.config.conn) catch {
+            var conn = Connection.connect(self.allocator, self.io, self.config.conn) catch {
                 delay_ms = @min(delay_ms * 2, self.config.max_reconnect_delay_ms);
                 continue;
             };
@@ -399,7 +400,7 @@ pub const Replicator = struct {
     }
 
     fn maybeSendStatus(self: *Replicator) NextError!void {
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = Io.Clock.awake.now(self.io).toMilliseconds();
         const interval: i64 = @intCast(self.config.status_interval_ms);
         if (now_ms - self.last_status_time_ms >= interval) {
             try self.sendStatus();
@@ -412,7 +413,7 @@ pub const Replicator = struct {
             self.last_processed_lsn,
             self.last_server_lsn,
         });
-        self.last_status_time_ms = std.time.milliTimestamp();
+        self.last_status_time_ms = Io.Clock.awake.now(self.io).toMilliseconds();
 
         const lsn_location = if (self.last_processed_lsn.value == 0)
             Lsn.zero
@@ -420,7 +421,7 @@ pub const Replicator = struct {
             self.last_processed_lsn.inc();
 
         // Convert current time to PG epoch (microseconds since 2000-01-01)
-        const now_us = std.time.microTimestamp();
+        const now_us = Io.Clock.real.now(self.io).toMicroseconds();
         const pg_timestamp = now_us - PG_EPOCH_OFFSET_US;
 
         var buf: [128]u8 = undefined;

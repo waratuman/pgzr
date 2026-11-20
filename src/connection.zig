@@ -1,4 +1,6 @@
 const std = @import("std");
+const Io = std.Io;
+const net = std.Io.net;
 const protocol = @import("protocol.zig");
 const auth_mod = @import("auth.zig");
 const Lsn = @import("lsn.zig").Lsn;
@@ -13,45 +15,58 @@ pub const default_recv_buf_size: usize = 1024 * 1024;
 pub const Connection = struct {
     transport: Transport,
     allocator: std.mem.Allocator,
+    io: Io,
     backend_pid: u32 = 0,
     backend_key: u32 = 0,
     recv_buf: []u8,
     /// Reusable send buffer for execLarge/execLargeWithResult.
-    send_buf: std.ArrayListUnmanaged(u8) = .{},
+    send_buf: std.ArrayListUnmanaged(u8) = .empty,
     /// Heap-allocated transport state (PlainState or TlsState).
     plain_state: ?*PlainState = null,
     tls_state: ?*TlsState = null,
 
-    pub const TcpConnectError = @typeInfo(@typeInfo(@TypeOf(std.net.tcpConnectToHost)).@"fn".return_type.?).error_union.error_set;
-    pub const UnixConnectError = @typeInfo(@typeInfo(@TypeOf(std.net.connectUnixSocket)).@"fn".return_type.?).error_union.error_set;
-    pub const ConnectError = auth_mod.AuthError || std.mem.Allocator.Error || TcpConnectError || UnixConnectError || Transport.WriteError || TlsState.UpgradeError || error{
+    pub const ConnectError = auth_mod.AuthError || std.mem.Allocator.Error ||
+        Transport.ReadError || Transport.WriteError || TlsState.UpgradeError ||
+        net.IpAddress.ConnectError || net.HostName.ConnectError ||
+        net.UnixAddress.ConnectError || net.UnixAddress.InitError ||
+        net.HostName.ValidateError || error{
         ServerError,
         TlsNotSupported,
     };
 
-    pub fn connect(allocator: std.mem.Allocator, config: types.ConnConfig) ConnectError!Connection {
+    pub fn connect(allocator: std.mem.Allocator, io: Io, config: types.ConnConfig) ConnectError!Connection {
         const stream = if (config.socket_path) |path| blk: {
             // Build socket path: if it doesn't end with a port suffix,
             // append "/.s.PGSQL.<port>"
             if (std.mem.endsWith(u8, path, ".s.PGSQL.5432") or
                 std.mem.indexOf(u8, path, ".s.PGSQL.") != null)
             {
-                break :blk try std.net.connectUnixSocket(path);
+                const ua = try net.UnixAddress.init(path);
+                break :blk try ua.connect(io);
             } else {
                 var path_buf: [256]u8 = undefined;
                 const full_path = std.fmt.bufPrint(&path_buf, "{s}/.s.PGSQL.{d}", .{
                     path,
                     config.port,
-                }) catch return error.OutOfMemory;
-                break :blk try std.net.connectUnixSocket(full_path);
+                }) catch return error.NameTooLong;
+                const ua = try net.UnixAddress.init(full_path);
+                break :blk try ua.connect(io);
             }
-        } else try std.net.tcpConnectToHost(allocator, config.host, config.port);
-        errdefer stream.close();
+        } else blk: {
+            // IP literal first, then DNS via HostName.
+            if (net.IpAddress.parse(config.host, config.port)) |addr| {
+                break :blk try addr.connect(io, .{ .mode = .stream });
+            } else |_| {
+                const hn = try net.HostName.init(config.host);
+                break :blk try hn.connect(io, config.port, .{ .mode = .stream });
+            }
+        };
+        errdefer stream.close(io);
 
         // Set up transport (plain initially, may upgrade to TLS)
         var plain_state: ?*PlainState = try allocator.create(PlainState);
         errdefer if (plain_state) |ps| allocator.destroy(ps);
-        plain_state.?.* = .{ .stream = stream };
+        plain_state.?.* = .{ .io = io, .stream = stream };
         var transport = Transport.plain(plain_state.?);
 
         var tls_state: ?*TlsState = null;
@@ -62,16 +77,16 @@ pub const Connection = struct {
             var ssl_buf: [8]u8 = undefined;
             std.mem.writeInt(u32, ssl_buf[0..4], 8, .big);
             std.mem.writeInt(u32, ssl_buf[4..8], 80877103, .big);
-            stream.writeAll(&ssl_buf) catch return error.WriteFailed;
+            try transport.writeAll(&ssl_buf);
 
             // Read 1-byte response
             var resp: [1]u8 = undefined;
-            const n = stream.read(&resp) catch return error.ConnectionClosed;
+            const n = try transport.read(&resp);
             if (n == 0) return error.ConnectionClosed;
 
             if (resp[0] == 'S') {
                 // Server accepts TLS — perform handshake
-                const ts = try TlsState.upgrade(allocator, stream, config.host, config.tls == .verify_full);
+                const ts = try TlsState.upgrade(allocator, io, stream, config.host, config.tls == .verify_full);
                 tls_state = ts;
                 errdefer if (tls_state) |ts2| allocator.destroy(ts2);
                 transport = Transport.tlsClient(ts);
@@ -92,7 +107,7 @@ pub const Connection = struct {
         try transport.writeAll(startup);
 
         // Authenticate
-        try auth_mod.authenticate(transport, config.user, config.password);
+        try auth_mod.authenticate(transport, io, config.user, config.password);
 
         const recv_buf = try allocator.alloc(u8, default_recv_buf_size);
         errdefer allocator.free(recv_buf);
@@ -100,6 +115,7 @@ pub const Connection = struct {
         var conn = Connection{
             .transport = transport,
             .allocator = allocator,
+            .io = io,
             .recv_buf = recv_buf,
             .plain_state = if (tls_state == null) plain_state else null,
             .tls_state = tls_state,
@@ -577,8 +593,8 @@ pub const Connection = struct {
 
     /// Return the underlying socket file descriptor.
     pub fn getStreamHandle(self: *const Connection) std.posix.fd_t {
-        if (self.tls_state) |ts| return ts.stream.handle;
-        if (self.plain_state) |ps| return ps.stream.handle;
+        if (self.tls_state) |ts| return ts.stream.socket.handle;
+        if (self.plain_state) |ps| return ps.stream.socket.handle;
         unreachable;
     }
 

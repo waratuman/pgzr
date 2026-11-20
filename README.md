@@ -76,12 +76,11 @@ Stream raw WAL messages from a logical replication slot:
 const std = @import("std");
 const pgzr = @import("pgzr");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    var repl = try pgzr.Replicator.init(allocator, .{
+    var repl = try pgzr.Replicator.init(allocator, io, .{
         .conn = .{
             .host = "127.0.0.1",
             .port = 5432,
@@ -109,7 +108,7 @@ Stream WAL from a source database and store packed batches in a destination
 database for later processing:
 
 ```zig
-var ingestor = try pgzr.Ingestor.init(allocator, .{
+var ingestor = try pgzr.Ingestor.init(allocator, io, .{
     .source = .{
         .conn = .{
             .host = "127.0.0.1",
@@ -143,7 +142,7 @@ try ingestor.run();
 Process stored WAL batches into structured transactions and events:
 
 ```zig
-var processor = try pgzr.Processor.init(allocator, .{
+var processor = try pgzr.Processor.init(allocator, io, .{
     .dest = .{
         .host = "127.0.0.1",
         .port = 5432,
@@ -226,9 +225,14 @@ Connections support four TLS modes via the `tls` field on `ConnConfig`:
 For the C ABI, the `tls_mode` integer maps as: 0 = disable, 1 = prefer,
 2 = require, 3 = verify-full.
 
+All init functions take a `std.Io` instance. Inside `main(init:
+std.process.Init)` use `init.io`; elsewhere create one with
+`var io_threaded: std.Io.Threaded = .init(allocator, .{});` and pass
+`io_threaded.io()`.
+
 ## Prerequisites
 
-- Zig 0.15.2+
+- Zig 0.17.1+
 - PostgreSQL with `wal_level = logical`
 - A logical replication slot (e.g. created with `test_decoding` or `pgoutput`)
 

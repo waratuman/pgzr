@@ -12,6 +12,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const Processor = struct {
     dest: Connection,
     allocator: std.mem.Allocator,
+    io: std.Io,
     config: types.ProcessorConfig,
 
     // Relation cache (rebuilt from binary messages in each batch)
@@ -84,10 +85,10 @@ pub const Processor = struct {
 
     pub const InitError = Connection.ConnectError || Connection.QueryError || std.mem.Allocator.Error;
 
-    pub fn init(allocator: std.mem.Allocator, config: types.ProcessorConfig) InitError!Processor {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: types.ProcessorConfig) InitError!Processor {
         var dest_config = config.dest;
         dest_config.replication = false;
-        var dest = try Connection.connect(allocator, dest_config);
+        var dest = try Connection.connect(allocator, io, dest_config);
         errdefer dest.close();
 
         try schema_mod.ensureSchema(&dest);
@@ -95,6 +96,7 @@ pub const Processor = struct {
         return Processor{
             .dest = dest,
             .allocator = allocator,
+            .io = io,
             .config = config,
             .relations = std.AutoHashMap(u32, OwnedRelation).init(allocator),
             .col_buf = undefined,
@@ -107,12 +109,12 @@ pub const Processor = struct {
             .current_txn_id = null,
             .in_transaction = false,
             .current_stream_xid = null,
-            .pending_data = .{},
-            .pending_batch_ids = .{},
-            .metadata_chunks = .{},
+            .pending_data = .empty,
+            .pending_batch_ids = .empty,
+            .metadata_chunks = .empty,
             .metadata_table_oid = null,
-            .pending_events = .{},
-            .copy_buf = .{},
+            .pending_events = .empty,
+            .copy_buf = .empty,
             .stop_flag = std.atomic.Value(bool).init(false),
         };
     }
@@ -201,7 +203,7 @@ pub const Processor = struct {
     /// re-raised after the query completes.
     const ClaimContext = struct {
         proc: *Processor,
-        rows: std.ArrayListUnmanaged(ClaimedRow) = .{},
+        rows: std.ArrayListUnmanaged(ClaimedRow) = .empty,
         source_id: ?[]u8 = null,
         relations_json: ?[]u8 = null,
         err: ?std.mem.Allocator.Error = null,
@@ -349,7 +351,7 @@ pub const Processor = struct {
     fn markBatchesError(self: *Processor) void {
         if (self.pending_batch_ids.items.len == 0) return;
 
-        var sql: std.ArrayListUnmanaged(u8) = .{};
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
         defer sql.deinit(self.allocator);
 
         sql.appendSlice(self.allocator, "UPDATE wal_batches SET state='error' WHERE ") catch return;
@@ -360,7 +362,7 @@ pub const Processor = struct {
     fn deleteBatches(self: *Processor) !void {
         if (self.pending_batch_ids.items.len == 0) return;
 
-        var sql: std.ArrayListUnmanaged(u8) = .{};
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
         defer sql.deinit(self.allocator);
 
         try sql.appendSlice(self.allocator, "DELETE FROM wal_batches WHERE ");
@@ -513,7 +515,7 @@ pub const Processor = struct {
     }
 
     fn insertTransaction(self: *Processor, lsn: u64) !?i64 {
-        var sql: std.ArrayListUnmanaged(u8) = .{};
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
         defer sql.deinit(self.allocator);
 
         try sql.appendSlice(self.allocator, "INSERT INTO transactions (source_id, lsn, xid, committed_at) VALUES (");
@@ -544,7 +546,7 @@ pub const Processor = struct {
             }
         }
 
-        var sql: std.ArrayListUnmanaged(u8) = .{};
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
         defer sql.deinit(self.allocator);
 
         try sql.appendSlice(
@@ -895,7 +897,7 @@ pub const Processor = struct {
     fn flushMetadata(self: *Processor) !void {
         if (self.metadata_chunks.items.len == 0) return;
 
-        var sql: std.ArrayListUnmanaged(u8) = .{};
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
         defer sql.deinit(self.allocator);
 
         try sql.appendSlice(self.allocator, "UPDATE transactions SET metadata = ");
@@ -960,7 +962,7 @@ pub const Processor = struct {
         // Build a COPY text-format fragment: tab-separated fields for
         // rel_oid, type, identity_digest, previous_identity_digest, data,
         // old_data. transaction_id and committed_at are prepended at flush.
-        var frag: std.ArrayListUnmanaged(u8) = .{};
+        var frag: std.ArrayListUnmanaged(u8) = .empty;
         errdefer frag.deinit(self.allocator);
 
         // rel_oid
@@ -1040,7 +1042,7 @@ pub const Processor = struct {
     /// return one. Preserves the pre-COPY fallback (a per-row subquery in
     /// the INSERT); with COPY the id must be resolved client-side.
     fn lookupTransactionId(self: *Processor) !i64 {
-        var sql: std.ArrayListUnmanaged(u8) = .{};
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
         defer sql.deinit(self.allocator);
 
         try sql.appendSlice(self.allocator, "SELECT id FROM transactions WHERE source_id=");
@@ -1109,7 +1111,7 @@ pub const Processor = struct {
         while (!self.stop_flag.load(.acquire)) {
             const processed = try self.processOne();
             if (!processed) {
-                std.Thread.sleep(self.config.poll_interval_ms * std.time.ns_per_ms);
+                self.io.sleep(.fromMilliseconds(@intCast(self.config.poll_interval_ms)), .awake) catch {};
             }
         }
     }
@@ -1173,14 +1175,14 @@ fn appendJsonStringCopy(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Al
 }
 
 test "appendJsonStringCopy: plain" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendJsonStringCopy(&list, std.testing.allocator, "hello");
     try std.testing.expectEqualStrings("\"hello\"", list.items);
 }
 
 test "appendJsonStringCopy: quote and backslash double for COPY" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendJsonStringCopy(&list, std.testing.allocator, "a\"b\\c");
     // JSON: a\"b\\c — each escape backslash doubled for COPY
@@ -1188,14 +1190,14 @@ test "appendJsonStringCopy: quote and backslash double for COPY" {
 }
 
 test "appendJsonStringCopy: single quote passes through" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendJsonStringCopy(&list, std.testing.allocator, "it's");
     try std.testing.expectEqualStrings("\"it's\"", list.items);
 }
 
 test "appendJsonStringCopy: newline tab control" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendJsonStringCopy(&list, std.testing.allocator, "a\nb\tc\x07d");
     try std.testing.expectEqualStrings("\"a\\\\nb\\\\tc\\\\u0007d\"", list.items);

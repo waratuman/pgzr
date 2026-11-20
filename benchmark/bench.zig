@@ -1,62 +1,62 @@
 const std = @import("std");
 const pgzr = @import("pgzr");
 
+/// Io instance for the whole run, set at the top of main.
+var io: std.Io = undefined;
+
+fn getenv(name: [*:0]const u8) ?[]const u8 {
+    const p = std.c.getenv(name) orelse return null;
+    return std.mem.span(p);
+}
+
+fn sleepMs(ms: i64) void {
+    io.sleep(.fromMilliseconds(ms), .awake) catch {};
+}
+
+const Stopwatch = struct {
+    start_ts: std.Io.Timestamp,
+
+    fn start() Stopwatch {
+        return .{ .start_ts = std.Io.Clock.awake.now(io) };
+    }
+
+    fn read(self: *const Stopwatch) u64 {
+        return @intCast(self.start_ts.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+    }
+};
+
 const DB_NAME = "pgzr_bench";
 const SLOT_NAME = "pgzr_bench_slot";
 
 fn getUser() []const u8 {
-    return std.posix.getenv("PGUSER") orelse std.posix.getenv("USER") orelse "postgres";
+    return getenv("PGUSER") orelse getenv("USER") orelse "postgres";
 }
 
 fn runPsql(allocator: std.mem.Allocator, db: []const u8, sql: []const u8) !void {
-    var child = std.process.Child.init(
-        &.{ "psql", "-d", db, "-c", sql },
-        allocator,
-    );
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    _ = try child.spawnAndWait();
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "psql", "-d", db, "-c", sql },
+    });
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
 }
 
 fn runPsqlCapture(allocator: std.mem.Allocator, db: []const u8, sql: []const u8) ![]u8 {
-    var child = std.process.Child.init(
-        &.{ "psql", "-d", db, "-t", "-A", "-c", sql },
-        allocator,
-    );
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    _ = try child.spawn();
+    const run_result = try std.process.run(allocator, io, .{
+        .argv = &.{ "psql", "-d", db, "-t", "-A", "-c", sql },
+    });
+    defer allocator.free(run_result.stdout);
+    allocator.free(run_result.stderr);
 
-    var buf: [256]u8 = undefined;
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = child.stdout.?.read(buf[total..]) catch break;
-        if (n == 0) break;
-        total += n;
-    }
-    _ = try child.wait();
-
-    var end = total;
-    while (end > 0 and (buf[end - 1] == '\n' or buf[end - 1] == '\r' or buf[end - 1] == ' ')) {
-        end -= 1;
-    }
-
-    const result = try allocator.alloc(u8, end);
-    @memcpy(result, buf[0..end]);
+    const trimmed = std.mem.trimEnd(u8, run_result.stdout, "\n\r ");
+    const result = try allocator.alloc(u8, trimmed.len);
+    @memcpy(result, trimmed);
     return result;
 }
 
 fn setup(allocator: std.mem.Allocator) !void {
-    var child = std.process.Child.init(
-        &.{ "createdb", DB_NAME },
-        allocator,
-    );
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    _ = try child.spawnAndWait();
+    const run_result = try std.process.run(allocator, io, .{ .argv = &.{ "createdb", DB_NAME } });
+    allocator.free(run_result.stdout);
+    allocator.free(run_result.stderr);
 
     runPsql(allocator, DB_NAME, "CREATE TABLE IF NOT EXISTS bench (id serial PRIMARY KEY, val text)") catch {};
     runPsql(allocator, DB_NAME, "SELECT pg_drop_replication_slot('" ++ SLOT_NAME ++ "')") catch {};
@@ -65,14 +65,10 @@ fn setup(allocator: std.mem.Allocator) !void {
 
 fn teardown(allocator: std.mem.Allocator) void {
     runPsql(allocator, DB_NAME, "SELECT pg_drop_replication_slot('" ++ SLOT_NAME ++ "')") catch {};
-    var child = std.process.Child.init(
-        &.{ "dropdb", "--if-exists", "--force", DB_NAME },
-        allocator,
-    );
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    _ = child.spawnAndWait() catch {};
+    if (std.process.run(allocator, io, .{ .argv = &.{ "dropdb", "--if-exists", "--force", DB_NAME } })) |run_result| {
+        allocator.free(run_result.stdout);
+        allocator.free(run_result.stderr);
+    } else |_| {}
 }
 
 fn insertRows(allocator: std.mem.Allocator, n: usize) !void {
@@ -85,17 +81,14 @@ fn insertRows(allocator: std.mem.Allocator, n: usize) !void {
     };
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    io = init.io;
 
     // Parse row count from args
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
+    const args = init.minimal.args.vector;
     const row_count: usize = if (args.len > 1)
-        std.fmt.parseUnsigned(usize, args[1], 10) catch 10_000
+        std.fmt.parseUnsigned(usize, std.mem.span(args[1]), 10) catch 10_000
     else
         10_000;
 
@@ -131,7 +124,7 @@ pub fn main() !void {
     std.debug.print("End LSN: {s}\n", .{lsn_str});
 
     // Benchmark: consume all messages
-    var repl = pgzr.Replicator.init(allocator, .{
+    var repl = pgzr.Replicator.init(allocator, io, .{
         .conn = .{
             .host = "127.0.0.1",
             .port = 5432,
@@ -149,7 +142,7 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    var timer = try std.time.Timer.start();
+    var timer = Stopwatch.start();
 
     var msg_count: u64 = 0;
     while (true) {

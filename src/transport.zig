@@ -1,9 +1,12 @@
 const std = @import("std");
+const Io = std.Io;
+const net = std.Io.net;
 const tls = std.crypto.tls;
 const Certificate = std.crypto.Certificate;
 
 fn tlsDebugEnabled() bool {
-    const value = std.posix.getenv("PGZR_TLS_DEBUG") orelse return false;
+    const ptr = std.c.getenv("PGZR_TLS_DEBUG") orelse return false;
+    const value = std.mem.span(ptr);
     return value.len > 0 and !std.mem.eql(u8, value, "0");
 }
 
@@ -21,8 +24,8 @@ pub const Transport = struct {
     close_fn: *const fn (ctx: *anyopaque) void,
     has_pending_fn: *const fn (ctx: *anyopaque) bool,
 
-    pub const ReadError = std.net.Stream.ReadError || tls.Client.ReadError || error{ConnectionClosed};
-    pub const WriteError = std.net.Stream.WriteError || error{WriteFailed};
+    pub const ReadError = error{ ConnectionClosed, ReadFailed, Canceled };
+    pub const WriteError = error{ WriteFailed, Canceled };
 
     pub fn read(self: Transport, buf: []u8) ReadError!usize {
         return self.read_fn(self.context, buf);
@@ -42,7 +45,7 @@ pub const Transport = struct {
         return self.has_pending_fn(self.context);
     }
 
-    /// Create a Transport backed by a plain std.net.Stream (TCP or Unix socket).
+    /// Create a Transport backed by a plain TCP or Unix socket stream.
     pub fn plain(state: *PlainState) Transport {
         return .{
             .context = @ptrCast(state),
@@ -66,26 +69,34 @@ pub const Transport = struct {
 };
 
 pub const PlainState = struct {
-    stream: std.net.Stream,
+    io: Io,
+    stream: net.Stream,
 
     fn readFn(ctx: *anyopaque, buf: []u8) Transport.ReadError!usize {
         const self: *PlainState = @ptrCast(@alignCast(ctx));
-        return self.stream.read(buf);
+        var bufs: [1][]u8 = .{buf};
+        return self.stream.read(self.io, &bufs) catch |err| switch (err) {
+            error.Canceled => error.Canceled,
+            else => error.ReadFailed,
+        };
     }
 
     fn writeFn(ctx: *anyopaque, data: []const u8) Transport.WriteError!void {
         const self: *PlainState = @ptrCast(@alignCast(ctx));
-        var index: usize = 0;
-        while (index < data.len) {
-            index += self.stream.write(data[index..]) catch |err| switch (err) {
-                inline else => |e| return @as(Transport.WriteError, e),
+        // Unbuffered writer: writeAll drains directly to the socket.
+        var w = self.stream.writer(self.io, &.{});
+        w.interface.writeAll(data) catch {
+            if (w.err) |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return error.WriteFailed,
             };
-        }
+            return error.WriteFailed;
+        };
     }
 
     fn closeFn(ctx: *anyopaque) void {
         const self: *PlainState = @ptrCast(@alignCast(ctx));
-        self.stream.close();
+        self.stream.close(self.io);
     }
 
     fn hasPendingFn(_: *anyopaque) bool {
@@ -94,133 +105,75 @@ pub const PlainState = struct {
 };
 
 pub const TlsState = struct {
-    stream: std.net.Stream,
+    io: Io,
+    allocator: std.mem.Allocator,
+    stream: net.Stream,
     tls_client: tls.Client,
-    stream_reader: std.net.Stream.Reader,
-    stream_writer: std.net.Stream.Writer,
+    stream_reader: net.Stream.Reader,
+    stream_writer: net.Stream.Writer,
     stream_read_buf: [tls.Client.min_buffer_len]u8,
     stream_write_buf: [tls.Client.min_buffer_len]u8,
     tls_read_buf: [tls.Client.min_buffer_len]u8,
     tls_write_buf: [tls.Client.min_buffer_len]u8,
+    /// CA bundle for verify-full mode. Populated by tls.Client.init during
+    /// the handshake; owned by this state and freed on close.
+    ca_bundle: Certificate.Bundle,
+    ca_lock: Io.RwLock,
 
-    pub const UpgradeError = error{
-        TlsNotSupported,
-        CaCertificatesUnavailable,
-        TlsAlert,
-        TlsUnexpectedMessage,
-        TlsIllegalParameter,
-        TlsDecryptFailure,
-        TlsRecordOverflow,
-        TlsBadRecordMac,
-        TlsDecryptError,
-        TlsConnectionTruncated,
-        TlsDecodeError,
-        TlsBadSignatureScheme,
-        TlsBadRsaSignatureBitCount,
-        CertificateFieldHasInvalidLength,
-        CertificateHostMismatch,
-        CertificatePublicKeyInvalid,
-        CertificateExpired,
-        CertificateFieldHasWrongDataType,
-        CertificateIssuerMismatch,
-        CertificateNotYetValid,
-        CertificateSignatureAlgorithmMismatch,
-        CertificateSignatureAlgorithmUnsupported,
-        CertificateSignatureInvalid,
-        CertificateSignatureInvalidLength,
-        CertificateSignatureNamedCurveUnsupported,
-        CertificateSignatureUnsupportedBitCount,
-        TlsCertificateNotVerified,
-        UnsupportedCertificateVersion,
-        CertificateTimeInvalid,
-        CertificateHasUnrecognizedObjectId,
-        CertificateHasInvalidBitString,
-        InvalidEncoding,
-        InvalidSignature,
-        SignatureVerificationFailed,
-        IdentityElement,
-        NotSquare,
-        NonCanonical,
-        WeakPublicKey,
-        MessageTooLong,
-        NegativeIntoUnsigned,
-        TargetTooSmall,
-        BufferTooSmall,
-        WriteFailed,
-        ReadFailed,
-        InsufficientEntropy,
-        DiskQuota,
-        LockViolation,
-        NotOpenForWriting,
-    };
+    pub const UpgradeError = std.mem.Allocator.Error || tls.Client.InitError;
 
     /// Upgrade an existing plain TCP connection to TLS.
-    /// Sends the SSLRequest, reads the server response, and performs the TLS handshake.
-    /// When `verify` is true, the server certificate and hostname are validated
-    /// against system CA certificates (equivalent to PostgreSQL sslmode=verify-full).
-    /// When `verify` is false, the connection is encrypted but the certificate
-    /// is not checked (equivalent to PostgreSQL sslmode=require).
+    /// Performs the TLS handshake (the SSLRequest/response exchange has
+    /// already happened on the plain stream).
+    /// When `verify` is true, the server certificate and hostname are
+    /// validated against system CA certificates (equivalent to PostgreSQL
+    /// sslmode=verify-full); verification fails closed if no CA bundle can
+    /// be loaded (error.TlsCertificateNotVerified).
+    /// When `verify` is false, the connection is encrypted but the
+    /// certificate is not checked (equivalent to PostgreSQL sslmode=require).
     pub fn upgrade(
         allocator: std.mem.Allocator,
-        stream: std.net.Stream,
+        io: Io,
+        stream: net.Stream,
         host: []const u8,
         verify: bool,
     ) UpgradeError!*TlsState {
-        const state = allocator.create(TlsState) catch return error.BufferTooSmall;
+        const state = try allocator.create(TlsState);
         errdefer allocator.destroy(state);
 
+        state.io = io;
+        state.allocator = allocator;
         state.stream = stream;
         state.stream_read_buf = undefined;
         state.stream_write_buf = undefined;
         state.tls_read_buf = undefined;
         state.tls_write_buf = undefined;
-        state.stream_reader = stream.reader(&state.stream_read_buf);
-        state.stream_writer = stream.writer(&state.stream_write_buf);
+        state.ca_bundle = .empty;
+        state.ca_lock = .init;
+        state.stream_reader = stream.reader(io, &state.stream_read_buf);
+        state.stream_writer = stream.writer(io, &state.stream_write_buf);
+        errdefer state.ca_bundle.deinit(allocator);
 
-        if (verify) {
-            // Load system CA certificates for verification. verify-full must
-            // fail closed: if no CA bundle can be loaded, refuse to connect
-            // rather than silently downgrading to an unverified connection.
-            var ca_bundle: Certificate.Bundle = .{};
-            ca_bundle.rescan(allocator) catch {
-                ca_bundle.deinit(allocator);
-                return error.CaCertificatesUnavailable;
-            };
-            if (ca_bundle.map.count() == 0) {
-                ca_bundle.deinit(allocator);
-                return error.CaCertificatesUnavailable;
-            }
-            // Client.init performs the full handshake (including certificate
-            // verification) synchronously, so the bundle can be freed after.
-            defer ca_bundle.deinit(allocator);
+        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+        io.random(&entropy);
 
-            state.tls_client = tls.Client.init(
-                state.stream_reader.interface(),
-                &state.stream_writer.interface,
-                .{
-                    .host = .{ .explicit = host },
-                    .ca = .{ .bundle = ca_bundle },
-                    .read_buffer = &state.tls_read_buf,
-                    .write_buffer = &state.tls_write_buf,
-                },
-            ) catch |err| {
-                return err;
-            };
-        } else {
-            // Encrypt only — no certificate or hostname verification
-            state.tls_client = tls.Client.init(
-                state.stream_reader.interface(),
-                &state.stream_writer.interface,
-                .{
-                    .host = .no_verification,
-                    .ca = .no_verification,
-                    .read_buffer = &state.tls_read_buf,
-                    .write_buffer = &state.tls_write_buf,
-                },
-            ) catch |err| {
-                return err;
-            };
-        }
+        state.tls_client = try tls.Client.init(
+            &state.stream_reader.interface,
+            &state.stream_writer.interface,
+            .{
+                .host = if (verify) .{ .explicit = host } else .no_verification,
+                .ca = if (verify) .{ .bundle = .{
+                    .gpa = allocator,
+                    .io = io,
+                    .lock = &state.ca_lock,
+                    .bundle = &state.ca_bundle,
+                } } else .no_verification,
+                .read_buffer = &state.tls_read_buf,
+                .write_buffer = &state.tls_write_buf,
+                .entropy = &entropy,
+                .realtime_now = Io.Clock.real.now(io),
+            },
+        );
 
         return state;
     }
@@ -230,10 +183,8 @@ pub const TlsState = struct {
         if (buf.len == 0) return 0;
 
         // Use peek/toss to correctly interact with the TLS reader's internal
-        // buffer. The previous readSliceAll approach was broken: the TLS
-        // vtable readVec writes exclusively to its internal buffer and returns
-        // the byte count, but readSliceShort interprets that as bytes written
-        // to the caller's buffer, causing data corruption and hangs.
+        // buffer: peekGreedy decrypts into the reader's buffer, we copy out
+        // as much as fits and toss it.
         const available = self.tls_client.reader.peekGreedy(1) catch |err| switch (err) {
             error.EndOfStream => {
                 tlsDebug("tls read EndOfStream", .{});
@@ -242,10 +193,10 @@ pub const TlsState = struct {
             error.ReadFailed => {
                 if (self.tls_client.read_err) |tls_err| {
                     tlsDebug("tls read failed tls_err={}", .{tls_err});
-                    return tls_err;
+                } else {
+                    tlsDebug("tls read failed", .{});
                 }
-                tlsDebug("tls read failed with ConnectionClosed fallback", .{});
-                return error.ConnectionClosed;
+                return error.ReadFailed;
             },
         };
         const n = @min(buf.len, available.len);
@@ -257,13 +208,8 @@ pub const TlsState = struct {
 
     fn writeFn(ctx: *anyopaque, data: []const u8) Transport.WriteError!void {
         const self: *TlsState = @ptrCast(@alignCast(ctx));
-        // Write in chunks that fit within a single TLS record to avoid
-        // data loss. The TLS Client.flush() calls prepareCiphertextRecord
-        // which loops creating records, but is bounded by the output
-        // buffer size (~16645 bytes). If the plaintext exceeds what can
-        // be encrypted into the output buffer, flush() silently drops the
-        // remainder (sets w.end=0). Writing in chunks <=16383 bytes
-        // (max TLS record plaintext) ensures each flush fully drains.
+        // Write in chunks that fit within a single TLS record so every
+        // flush fully drains the plaintext into encrypted records.
         const max_chunk = tls.max_ciphertext_inner_record_len;
         var offset: usize = 0;
         while (offset < data.len) {
@@ -279,7 +225,8 @@ pub const TlsState = struct {
     fn closeFn(ctx: *anyopaque) void {
         const self: *TlsState = @ptrCast(@alignCast(ctx));
         self.tls_client.end() catch {};
-        self.stream.close();
+        self.stream.close(self.io);
+        self.ca_bundle.deinit(self.allocator);
     }
 
     fn hasPendingFn(ctx: *anyopaque) bool {
@@ -296,10 +243,6 @@ pub const TlsState = struct {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-test "PlainState size" {
-    try std.testing.expect(@sizeOf(PlainState) <= 16);
-}
 
 test "TlsState buffers do not alias" {
     // The stream reader/writer and TLS client must use separate buffers.

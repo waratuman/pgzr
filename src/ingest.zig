@@ -55,15 +55,15 @@ pub const Ingestor = struct {
 
     pub const InitError = Replicator.InitError || Connection.ConnectError || Connection.QueryError || std.mem.Allocator.Error;
 
-    pub fn init(allocator: std.mem.Allocator, config: types.IngestConfig) InitError!Ingestor {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: types.IngestConfig) InitError!Ingestor {
         var dest_config = config.dest;
         dest_config.replication = false;
-        var dest = try Connection.connect(allocator, dest_config);
+        var dest = try Connection.connect(allocator, io, dest_config);
         errdefer dest.close();
 
         try schema_mod.ensureSchema(&dest);
 
-        var replicator = try Replicator.init(allocator, config.source);
+        var replicator = try Replicator.init(allocator, io, config.source);
         errdefer replicator.deinit();
 
         return Ingestor{
@@ -71,7 +71,7 @@ pub const Ingestor = struct {
             .dest = dest,
             .allocator = allocator,
             .config = config,
-            .batch_buf = .{},
+            .batch_buf = .empty,
             .batch_start_lsn = Lsn.zero,
             .batch_end_lsn = Lsn.zero,
             .batch_msg_count = 0,
@@ -223,7 +223,7 @@ pub const Ingestor = struct {
         defer self.allocator.free(relations_json);
 
         // Build INSERT query with inline hex encoding (no intermediate data_hex allocation)
-        var sql: std.ArrayListUnmanaged(u8) = .{};
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
         defer sql.deinit(self.allocator);
 
         const begin_lsn = if (self.txn_begin_lsn.value != 0) self.txn_begin_lsn else self.batch_start_lsn;
@@ -275,7 +275,7 @@ pub const Ingestor = struct {
     }
 
     fn serializeRelations(self: *Ingestor) ![]u8 {
-        var json: std.ArrayListUnmanaged(u8) = .{};
+        var json: std.ArrayListUnmanaged(u8) = .empty;
         errdefer json.deinit(self.allocator);
 
         try json.append(self.allocator, '\'');

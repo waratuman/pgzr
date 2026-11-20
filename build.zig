@@ -25,9 +25,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_example = b.addRunArtifact(example);
-    if (b.args) |args| {
-        run_example.addArgs(args);
-    }
+    run_example.addPassthruArgs();
     const example_step = b.step("example", "Run the basic example");
     example_step.dependOn(&run_example.step);
 
@@ -45,9 +43,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_ingest_example = b.addRunArtifact(ingest_example);
-    if (b.args) |args| {
-        run_ingest_example.addArgs(args);
-    }
+    run_ingest_example.addPassthruArgs();
     const ingest_example_step = b.step("ingest-example", "Run the ingest pipeline example");
     ingest_example_step.dependOn(&run_ingest_example.step);
 
@@ -73,9 +69,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_bench = b.addRunArtifact(bench);
-    if (b.args) |args| {
-        run_bench.addArgs(args);
-    }
+    run_bench.addPassthruArgs();
     const bench_step = b.step("benchmark", "Run the benchmark");
     bench_step.dependOn(&run_bench.step);
 
@@ -125,9 +119,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_pipeline_bench = b.addRunArtifact(pipeline_bench);
-    if (b.args) |args| {
-        run_pipeline_bench.addArgs(args);
-    }
+    run_pipeline_bench.addPassthruArgs();
     const pipeline_bench_step = b.step("pipeline-bench", "Run pipeline benchmark (requires PostgreSQL)");
     pipeline_bench_step.dependOn(&run_pipeline_bench.step);
 

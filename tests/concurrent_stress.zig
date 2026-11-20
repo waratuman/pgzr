@@ -7,47 +7,57 @@ const SLOT_NAME = "pgzr_stress_slot";
 const PUB_NAME = "pgzr_stress_pub";
 const SOURCE_ID = "00000000-0000-0000-0000-000000000002";
 
+/// Io instance for the whole test run, set at the top of main.
+var io: std.Io = undefined;
+
+fn getenv(name: [*:0]const u8) ?[]const u8 {
+    const p = std.c.getenv(name) orelse return null;
+    return std.mem.span(p);
+}
+
+fn sleepMs(ms: i64) void {
+    io.sleep(.fromMilliseconds(ms), .awake) catch {};
+}
+
+const Stopwatch = struct {
+    start_ts: std.Io.Timestamp,
+
+    fn start() Stopwatch {
+        return .{ .start_ts = std.Io.Clock.awake.now(io) };
+    }
+
+    fn reset(self: *Stopwatch) void {
+        self.start_ts = std.Io.Clock.awake.now(io);
+    }
+
+    fn readMs(self: *const Stopwatch) u64 {
+        const d = self.start_ts.durationTo(std.Io.Clock.awake.now(io));
+        return @intCast(d.toMilliseconds());
+    }
+};
+
 fn getUser() []const u8 {
-    return std.posix.getenv("PGUSER") orelse std.posix.getenv("USER") orelse "postgres";
+    return getenv("PGUSER") orelse getenv("USER") orelse "postgres";
 }
 
 fn runPsql(allocator: std.mem.Allocator, db: []const u8, sql: []const u8) !void {
-    var child = std.process.Child.init(
-        &.{ "psql", "-d", db, "-c", sql },
-        allocator,
-    );
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    _ = try child.spawnAndWait();
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "psql", "-d", db, "-c", sql },
+    });
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
 }
 
 fn runPsqlCapture(allocator: std.mem.Allocator, db: []const u8, sql: []const u8) ![]u8 {
-    var child = std.process.Child.init(
-        &.{ "psql", "-d", db, "-t", "-A", "-c", sql },
-        allocator,
-    );
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    _ = try child.spawn();
+    const run_result = try std.process.run(allocator, io, .{
+        .argv = &.{ "psql", "-d", db, "-t", "-A", "-c", sql },
+    });
+    defer allocator.free(run_result.stdout);
+    allocator.free(run_result.stderr);
 
-    var stdout_buf: [4096]u8 = undefined;
-    var total: usize = 0;
-    while (total < stdout_buf.len) {
-        const n = child.stdout.?.read(stdout_buf[total..]) catch break;
-        if (n == 0) break;
-        total += n;
-    }
-    _ = try child.wait();
-
-    var end = total;
-    while (end > 0 and (stdout_buf[end - 1] == '\n' or stdout_buf[end - 1] == '\r' or stdout_buf[end - 1] == ' ')) {
-        end -= 1;
-    }
-
-    const result = try allocator.alloc(u8, end);
-    @memcpy(result, stdout_buf[0..end]);
+    const trimmed = std.mem.trimEnd(u8, run_result.stdout, "\n\r ");
+    const result = try allocator.alloc(u8, trimmed.len);
+    @memcpy(result, trimmed);
     return result;
 }
 
@@ -58,11 +68,9 @@ fn queryCount(allocator: std.mem.Allocator, db: []const u8, sql: []const u8) !u3
 }
 
 fn runCmd(allocator: std.mem.Allocator, args: []const []const u8) void {
-    var child = std.process.Child.init(args, allocator);
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    _ = child.spawnAndWait() catch {};
+    const result = std.process.run(allocator, io, .{ .argv = args }) catch return;
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
 }
 
 /// Simulates the hub's zombie reaper (issue #14): requeues any batch stuck in
@@ -90,7 +98,7 @@ const Reaper = struct {
         while (!self.stop_flag.load(.acquire)) {
             const n = reapOnce(allocator);
             if (n > 0) _ = self.requeued.fetchAdd(n, .monotonic);
-            std.Thread.sleep(2 * std.time.ns_per_ms);
+            sleepMs(2);
         }
     }
 
@@ -136,7 +144,7 @@ fn setup(allocator: std.mem.Allocator) !void {
 
     runPsql(allocator, SOURCE_DB, "TRUNCATE items RESTART IDENTITY") catch {};
 
-    var dest = pgzr.Connection.connect(allocator, destConnConfig()) catch |err| {
+    var dest = pgzr.Connection.connect(allocator, io, destConnConfig()) catch |err| {
         std.debug.print("Failed to connect to dest: {}\n", .{err});
         return err;
     };
@@ -151,7 +159,7 @@ fn setup(allocator: std.mem.Allocator) !void {
 }
 
 fn teardown(allocator: std.mem.Allocator) void {
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    sleepMs(200);
     runPsql(allocator, SOURCE_DB, "SELECT pg_drop_replication_slot('" ++ SLOT_NAME ++ "')") catch {};
     runPsql(allocator, SOURCE_DB, "DROP PUBLICATION IF EXISTS " ++ PUB_NAME) catch {};
     runCmd(allocator, &.{ "dropdb", "--if-exists", "--force", SOURCE_DB });
@@ -164,15 +172,9 @@ fn getCurrentWalLsn(allocator: std.mem.Allocator) !pgzr.Lsn {
     return pgzr.Lsn.parse(output);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        if (gpa.deinit() == .leak) {
-            std.debug.print("\nMemory leak detected!\n", .{});
-            std.process.exit(1);
-        }
-    }
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    io = init.io;
 
     std.debug.print("PGZR Concurrent Processor Stress Test\n", .{});
     std.debug.print("======================================\n", .{});
@@ -210,7 +212,7 @@ fn runStressTest(allocator: std.mem.Allocator) !void {
     });
 
     // Phase 1: Insert data
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = Stopwatch.start();
 
     std.debug.print("  Inserting data... ", .{});
     for (0..num_txns) |txn_i| {
@@ -226,7 +228,7 @@ fn runStressTest(allocator: std.mem.Allocator) !void {
         };
     }
 
-    const insert_ms = timer.read() / std.time.ns_per_ms;
+    const insert_ms = timer.readMs();
     std.debug.print("done ({d}ms)\n", .{insert_ms});
 
     // Phase 2: Ingest
@@ -238,7 +240,7 @@ fn runStressTest(allocator: std.mem.Allocator) !void {
     timer.reset();
     std.debug.print("  Ingesting WAL... ", .{});
 
-    var ingestor = pgzr.Ingestor.init(allocator, .{
+    var ingestor = pgzr.Ingestor.init(allocator, io, .{
         .source = .{
             .conn = sourceConnConfig(),
             .slot_name = SLOT_NAME,
@@ -261,7 +263,7 @@ fn runStressTest(allocator: std.mem.Allocator) !void {
         return err;
     };
 
-    const ingest_ms = timer.read() / std.time.ns_per_ms;
+    const ingest_ms = timer.readMs();
     const batch_count = try queryCount(allocator, DEST_DB, "SELECT count(*) FROM wal_batches WHERE state='pending'");
     std.debug.print("done ({d}ms, {d} batches)\n", .{ ingest_ms, batch_count });
 
@@ -283,7 +285,7 @@ fn runStressTest(allocator: std.mem.Allocator) !void {
 
     const worker = struct {
         fn run(result: *SharedResult, alloc: std.mem.Allocator) void {
-            var processor = pgzr.Processor.init(alloc, .{
+            var processor = pgzr.Processor.init(alloc, io, .{
                 .dest = destConnConfig(),
             }) catch {
                 _ = result.errors.fetchAdd(1, .monotonic);
@@ -328,7 +330,7 @@ fn runStressTest(allocator: std.mem.Allocator) !void {
     reaper.stop();
     reaper_thread.join();
 
-    const process_ms = timer.read() / std.time.ns_per_ms;
+    const process_ms = timer.readMs();
 
     var total_batches: u32 = 0;
     var total_errors: u32 = 0;

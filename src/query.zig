@@ -86,7 +86,7 @@ pub fn writeTimestampText(buf: *[40]u8, pg_usec: i64) []const u8 {
 
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}+00", .{
         yd.year,
-        @as(u32, @intFromEnum(md.month)),
+        @as(u32, @backingInt(md.month)),
         @as(u32, md.day_index) + 1,
         ds.getHoursIntoDay(),
         ds.getMinutesIntoHour(),
@@ -434,76 +434,76 @@ test "escapeUuid: OOM" {
 // ── Append helper tests ───────────────────────────────────────────────
 
 test "appendEscapedString: simple" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendEscapedString(&list, std.testing.allocator, "hello");
     try std.testing.expectEqualStrings("'hello'", list.items);
 }
 
 test "appendEscapedString: with quotes" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendEscapedString(&list, std.testing.allocator, "it's");
     try std.testing.expectEqualStrings("'it''s'", list.items);
 }
 
 test "appendEscapedBytea: simple" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendEscapedBytea(&list, std.testing.allocator, &[_]u8{ 0xde, 0xad });
     try std.testing.expectEqualStrings("'\\xdead'", list.items);
 }
 
 test "appendEscapedUuid: valid" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendEscapedUuid(&list, std.testing.allocator, "550e8400-e29b-41d4-a716-446655440000");
     try std.testing.expectEqualStrings("'550e8400-e29b-41d4-a716-446655440000'", list.items);
 }
 
 test "appendEscapedUuid: invalid" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try std.testing.expectError(error.InvalidUuid, appendEscapedUuid(&list, std.testing.allocator, "bad"));
 }
 
 test "appendNull" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendNull(&list, std.testing.allocator);
     try std.testing.expectEqualStrings("NULL", list.items);
 }
 
 test "appendIntValue: positive" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendIntValue(&list, std.testing.allocator, @as(u64, 42));
     try std.testing.expectEqualStrings("42", list.items);
 }
 
 test "appendIntValue: negative" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendIntValue(&list, std.testing.allocator, @as(i64, -100));
     try std.testing.expectEqualStrings("-100", list.items);
 }
 
 test "appendTimestamp: pg epoch" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendTimestamp(&list, std.testing.allocator, 0);
     try std.testing.expectEqualStrings("'2000-01-01 00:00:00.000000+00'", list.items);
 }
 
 test "appendByteaOrNull: with data" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendByteaOrNull(&list, std.testing.allocator, &[_]u8{0xab});
     try std.testing.expectEqualStrings("'\\xab'", list.items);
 }
 
 test "appendByteaOrNull: null" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendByteaOrNull(&list, std.testing.allocator, null);
     try std.testing.expectEqualStrings("NULL", list.items);
@@ -516,14 +516,14 @@ test "writeTimestampText: no quotes" {
 }
 
 test "appendCopyBytea: hex with doubled backslash" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendCopyBytea(&list, std.testing.allocator, &[_]u8{ 0xde, 0xad });
     try std.testing.expectEqualStrings("\\\\xdead", list.items);
 }
 
 test "appendCopyByteaOrNull: null" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendCopyByteaOrNull(&list, std.testing.allocator, null);
     try std.testing.expectEqualStrings("\\N", list.items);
@@ -534,7 +534,7 @@ test "appendEscapedString: matches escapeString" {
     const heap_result = try escapeString(std.testing.allocator, input);
     defer std.testing.allocator.free(heap_result);
 
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendEscapedString(&list, std.testing.allocator, input);
 
@@ -546,7 +546,7 @@ test "appendEscapedBytea: matches escapeBytea" {
     const heap_result = try escapeBytea(std.testing.allocator, input);
     defer std.testing.allocator.free(heap_result);
 
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendEscapedBytea(&list, std.testing.allocator, input);
 

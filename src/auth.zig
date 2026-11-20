@@ -46,6 +46,7 @@ pub const AuthError = protocol.ReadError || protocol.ReadBodyError || Transport.
 /// Reads the AuthenticationRequest, responds if needed, reads until AuthenticationOk.
 pub fn authenticate(
     transport: Transport,
+    io: std.Io,
     user: []const u8,
     password: []const u8,
 ) AuthError!void {
@@ -69,7 +70,7 @@ pub fn authenticate(
             try transport.writeAll(msg);
         },
         protocol.AUTH_SASL => {
-            try scram.performScramAuth(transport, user, password, body);
+            try scram.performScramAuth(transport, io, user, password, body);
             return;
         },
         else => return error.UnsupportedAuthMethod,

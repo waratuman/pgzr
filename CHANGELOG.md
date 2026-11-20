@@ -6,6 +6,30 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Upgraded to Zig 0.17.** All networking, TLS, randomness, clocks, sleeps,
+  and child processes now go through the `std.Io` interface. Public init
+  functions take an `Io` parameter: `Connection.connect(allocator, io, config)`,
+  `Replicator.init(allocator, io, config)`, `Ingestor.init(allocator, io,
+  config)`, `Processor.init(allocator, io, config)`. The C ABI is unchanged
+  for callers — each handle creates its own `std.Io.Threaded` instance
+  internally. Transport read/write error sets collapse to
+  `error{ConnectionClosed, ReadFailed, Canceled}` / `error{WriteFailed,
+  Canceled}`. TLS verify-full certificate loading is handled by
+  `std.crypto.tls.Client` itself and still fails closed
+  (`error.TlsCertificateNotVerified`) when no CA bundle is available.
+
+- **Fixed TLS `verify_full` silently downgrading to no verification** when
+  the system CA bundle could not be loaded (pre-0.17 code path).
+
+- **Processor error paths no longer leak state across batches.** Claim and
+  COMMIT failures reset all per-batch state (pending data, batch ids,
+  buffered events, metadata chunks, transaction state); a COMMIT failure no
+  longer parks intact batches in `'error'`. `Begin` clears any stale
+  buffered events.
+
+- **C ABI handles own copies of all caller strings.** The FFI host may free
+  its config struct and strings as soon as `pgzr_*_new` returns.
+
 - **Events are inserted via `COPY ... FROM STDIN`** instead of multi-row
   INSERT statements. The server no longer lexes/parses/plans megabyte-scale
   SQL per flush, and the client emits COPY text format directly (no SQL

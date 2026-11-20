@@ -5,22 +5,11 @@ const types = @import("types.zig");
 const Lsn = @import("lsn.zig").Lsn;
 const query_mod = @import("query.zig");
 
-// ── std.Options ───────────────────────────────────────────────────────
-//
-// When loaded via dlopen (e.g. by a Ruby extension), libpgzr's TLS slot
-// is not bootstrapped for threads that predate the load. Zig's default
-// CSPRNG lazily initializes a per-thread context with mmap+madvise on
-// first use; the EINVAL probe at the top of that path triggers an error
-// return that needs to update the per-thread error-return-trace, which
-// is itself stored in TLS — and crashes on threads where libpgzr's TLS
-// was never allocated. Setting `crypto_always_getrandom` makes
-// std.crypto.random go straight to getrandom(2), skipping the
-// thread-local setup entirely. This costs one syscall per call (we use
-// it sparingly, only inside TLS handshakes), and removes a class of
-// dlopen+threads bugs.
-pub const std_options: std.Options = .{
-    .crypto_always_getrandom = true,
-};
+// Randomness note: pre-0.17 this file set `crypto_always_getrandom` to
+// avoid a dlopen+threads crash in std's threadlocal CSPRNG. Since the
+// 0.17 upgrade all randomness goes through the per-handle `Io.Threaded`
+// instance instead of a global threadlocal CSPRNG, so no std.Options
+// override is needed.
 
 // ── ABI version ───────────────────────────────────────────────────────
 //
@@ -73,7 +62,7 @@ const posix = std.posix;
 var active_ingestor = std.atomic.Value(?*Ingestor).init(null);
 var active_processor = std.atomic.Value(?*Processor).init(null);
 
-fn signalHandler(_: c_int) callconv(.c) void {
+fn signalHandler(_: posix.SIG) callconv(.c) void {
     if (active_ingestor.load(.monotonic)) |ing| ing.stop();
     if (active_processor.load(.monotonic)) |proc| proc.stop();
 }
@@ -87,16 +76,16 @@ fn installSignalHandlers(
         .mask = posix.sigemptyset(),
         .flags = 0,
     };
-    posix.sigaction(posix.SIG.INT, &sa, prev_int);
-    posix.sigaction(posix.SIG.TERM, &sa, prev_term);
+    posix.sigaction(.INT, &sa, prev_int);
+    posix.sigaction(.TERM, &sa, prev_term);
 }
 
 fn restoreSignalHandlers(
     prev_int: *const posix.Sigaction,
     prev_term: *const posix.Sigaction,
 ) void {
-    posix.sigaction(posix.SIG.INT, prev_int, null);
-    posix.sigaction(posix.SIG.TERM, prev_term, null);
+    posix.sigaction(.INT, prev_int, null);
+    posix.sigaction(.TERM, prev_term, null);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -191,6 +180,7 @@ pub const PgzrIngestConfig = extern struct {
 const IngestorHandle = struct {
     ingestor: Ingestor,
     arena: std.heap.ArenaAllocator,
+    io_threaded: std.Io.Threaded,
 };
 
 export fn pgzr_ingestor_new(config: *const PgzrIngestConfig) ?*IngestorHandle {
@@ -207,6 +197,9 @@ fn ingestorNew(config: *const PgzrIngestConfig) !*IngestorHandle {
     errdefer allocator.destroy(handle);
     handle.arena = std.heap.ArenaAllocator.init(allocator);
     errdefer handle.arena.deinit();
+    handle.io_threaded = .init(allocator, .{});
+    errdefer handle.io_threaded.deinit();
+    const io = handle.io_threaded.io();
     const aa = handle.arena.allocator();
 
     const source_conn = try buildConnConfig(
@@ -277,7 +270,7 @@ fn ingestorNew(config: *const PgzrIngestConfig) !*IngestorHandle {
         .on_flush_context = on_flush_context,
     };
 
-    handle.ingestor = try Ingestor.init(allocator, ingest_config);
+    handle.ingestor = try Ingestor.init(allocator, io, ingest_config);
     return handle;
 }
 
@@ -307,6 +300,7 @@ export fn pgzr_ingestor_stop(handle: *IngestorHandle) void {
 
 export fn pgzr_ingestor_free(handle: *IngestorHandle) void {
     handle.ingestor.deinit();
+    handle.io_threaded.deinit();
     handle.arena.deinit();
     std.heap.page_allocator.destroy(handle);
 }
@@ -333,6 +327,7 @@ pub const PgzrProcessorConfig = extern struct {
 const ProcessorHandle = struct {
     processor: Processor,
     arena: std.heap.ArenaAllocator,
+    io_threaded: std.Io.Threaded,
 };
 
 export fn pgzr_processor_new(config: *const PgzrProcessorConfig) ?*ProcessorHandle {
@@ -349,6 +344,9 @@ fn processorNew(config: *const PgzrProcessorConfig) !*ProcessorHandle {
     errdefer allocator.destroy(handle);
     handle.arena = std.heap.ArenaAllocator.init(allocator);
     errdefer handle.arena.deinit();
+    handle.io_threaded = .init(allocator, .{});
+    errdefer handle.io_threaded.deinit();
+    const io = handle.io_threaded.io();
     const aa = handle.arena.allocator();
 
     var dest_conn = try buildConnConfig(
@@ -373,7 +371,7 @@ fn processorNew(config: *const PgzrProcessorConfig) !*ProcessorHandle {
         .metadata_table = if (meta_table.len > 0) meta_table else null,
     };
 
-    handle.processor = try Processor.init(allocator, processor_config);
+    handle.processor = try Processor.init(allocator, io, processor_config);
     return handle;
 }
 
@@ -411,6 +409,7 @@ export fn pgzr_processor_stop(handle: *ProcessorHandle) void {
 
 export fn pgzr_processor_free(handle: *ProcessorHandle) void {
     handle.processor.deinit();
+    handle.io_threaded.deinit();
     handle.arena.deinit();
     std.heap.page_allocator.destroy(handle);
 }
