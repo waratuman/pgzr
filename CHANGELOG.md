@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Malformed stored batch data can no longer panic the processor.**
+  Corrupt bytes decoded from `wal_batches` now surface as decode errors
+  (which park the batch as poison) instead of crashing: negative pgoutput
+  tuple lengths and overflowing truncate relation counts return
+  `InvalidMessage`/`UnexpectedEnd` rather than tripping integer-cast
+  panics; corrupt hex bytea (odd length or invalid digit) is an error
+  instead of silently yielding empty data or a misleading `OutOfMemory`;
+  out-of-range integers in the relations JSONB snapshot are ignored
+  instead of panicking; and a short MD5 auth message fails with
+  `InvalidServerResponse` instead of a slice panic.
+
 - **Interleaved streamed transactions are now handled correctly.** With
   proto v2+ streaming, segments of concurrently-streaming large
   transactions interleave in the WAL stream; previously the ingestor's

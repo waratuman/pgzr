@@ -246,14 +246,14 @@ pub const Processor = struct {
     };
 
     /// Callback context for the group claim query. queryRows callbacks cannot
-    /// return errors, so allocation failures are recorded in `err` and
-    /// re-raised after the query completes.
+    /// return errors, so failures (allocation, corrupt stored bytea) are
+    /// recorded in `err` and re-raised after the query completes.
     const ClaimContext = struct {
         proc: *Processor,
         rows: std.ArrayListUnmanaged(ClaimedRow) = .empty,
         source_id: ?[]u8 = null,
         relations_json: ?[]u8 = null,
-        err: ?std.mem.Allocator.Error = null,
+        err: ?Processor.ProcessError = null,
 
         fn onRow(self: *ClaimContext, cols: []const Connection.QueryColumn) void {
             if (self.err != null) return;
@@ -799,7 +799,7 @@ pub const Processor = struct {
                 else => continue,
             };
             const replica_identity: u8 = switch (ri_val) {
-                .integer => |i| @intCast(i),
+                .integer => |i| std.math.cast(u8, i) orelse continue,
                 else => continue,
             };
             const cols_arr = switch (cols_val) {
@@ -846,17 +846,17 @@ pub const Processor = struct {
                 @memcpy(col_name, col_name_str);
 
                 const flags: u8 = if (col_obj.get("flags")) |f| switch (f) {
-                    .integer => |i| @intCast(i),
+                    .integer => |i| std.math.cast(u8, i) orelse 0,
                     else => 0,
                 } else 0;
 
                 const type_oid: u32 = if (col_obj.get("oid")) |o| switch (o) {
-                    .integer => |i| @intCast(i),
+                    .integer => |i| std.math.cast(u32, i) orelse 0,
                     else => 0,
                 } else 0;
 
                 const type_modifier: i32 = if (col_obj.get("typmod")) |t| switch (t) {
-                    .integer => |i| @intCast(i),
+                    .integer => |i| std.math.cast(i32, i) orelse -1,
                     else => -1,
                 } else -1;
 
@@ -1234,42 +1234,7 @@ pub const Processor = struct {
     }
 
     fn decodeBytea(self: *Processor, hex_data: []const u8) ![]u8 {
-        if (hex_data.len < 2 or hex_data[0] != '\\' or hex_data[1] != 'x') {
-            const copy = try self.allocator.alloc(u8, hex_data.len);
-            @memcpy(copy, hex_data);
-            return copy;
-        }
-
-        const hex = hex_data[2..];
-        if (hex.len % 2 != 0) {
-            return try self.allocator.alloc(u8, 0);
-        }
-
-        const out_len = hex.len / 2;
-        const out = try self.allocator.alloc(u8, out_len);
-
-        for (0..out_len) |i| {
-            const hi = hexDigit(hex[i * 2]) orelse {
-                self.allocator.free(out);
-                return error.OutOfMemory;
-            };
-            const lo = hexDigit(hex[i * 2 + 1]) orelse {
-                self.allocator.free(out);
-                return error.OutOfMemory;
-            };
-            out[i] = (hi << 4) | lo;
-        }
-
-        return out;
-    }
-
-    fn hexDigit(c: u8) ?u8 {
-        return switch (c) {
-            '0'...'9' => c - '0',
-            'a'...'f' => c - 'a' + 10,
-            'A'...'F' => c - 'A' + 10,
-            else => null,
-        };
+        return decodeByteaAlloc(self.allocator, hex_data);
     }
 
     /// Main processing loop. Processes pending batches until stopped.
@@ -1310,6 +1275,68 @@ pub const Processor = struct {
         self.dest.close();
     }
 };
+
+/// Decode a bytea value from PostgreSQL text output. Hex format
+/// (\x-prefixed) is decoded; anything else is returned as-is (escape
+/// format is not produced by servers since 9.0 defaults, but raw
+/// pass-through keeps older data readable). Corrupt hex (odd length or
+/// a non-hex digit) is an error — truncating or dropping WAL data here
+/// would silently lose events downstream.
+fn decodeByteaAlloc(allocator: std.mem.Allocator, hex_data: []const u8) ![]u8 {
+    if (hex_data.len < 2 or hex_data[0] != '\\' or hex_data[1] != 'x') {
+        return allocator.dupe(u8, hex_data);
+    }
+
+    const hex = hex_data[2..];
+    if (hex.len % 2 != 0) return error.InvalidMessage;
+
+    const out_len = hex.len / 2;
+    const out = try allocator.alloc(u8, out_len);
+    errdefer allocator.free(out);
+
+    for (0..out_len) |i| {
+        const hi = hexDigit(hex[i * 2]) orelse return error.InvalidMessage;
+        const lo = hexDigit(hex[i * 2 + 1]) orelse return error.InvalidMessage;
+        out[i] = (hi << 4) | lo;
+    }
+
+    return out;
+}
+
+fn hexDigit(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+test "decodeByteaAlloc: valid hex" {
+    const out = try decodeByteaAlloc(std.testing.allocator, "\\xdeadBEEF");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, out);
+}
+
+test "decodeByteaAlloc: empty hex" {
+    const out = try decodeByteaAlloc(std.testing.allocator, "\\x");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
+test "decodeByteaAlloc: odd-length hex is an error, not empty data" {
+    try std.testing.expectError(error.InvalidMessage, decodeByteaAlloc(std.testing.allocator, "\\xabc"));
+}
+
+test "decodeByteaAlloc: invalid hex digit is an error" {
+    try std.testing.expectError(error.InvalidMessage, decodeByteaAlloc(std.testing.allocator, "\\xzz"));
+}
+
+test "decodeByteaAlloc: non-hex input passes through" {
+    const out = try decodeByteaAlloc(std.testing.allocator, "raw");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("raw", out);
+}
 
 /// SQLSTATE classes whose errors are expected to succeed on retry:
 ///   08 — connection exception

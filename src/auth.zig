@@ -64,6 +64,7 @@ pub fn authenticate(
             try transport.writeAll(msg);
         },
         protocol.AUTH_MD5 => {
+            if (body.len < 8) return error.InvalidServerResponse;
             const salt: *const [4]u8 = body[4..8];
             const hashed = md5Password(user, password, salt);
             const msg = protocol.encodePassword(&buf, &hashed);
