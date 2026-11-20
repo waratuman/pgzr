@@ -21,6 +21,11 @@ pub const Ingestor = struct {
     in_transaction: bool,
     txn_begin_lsn: Lsn,
 
+    // Streaming context (proto v2+): xid of the stream segment currently
+    // open (between StreamStart and StreamStop). DML and Relation messages
+    // inside a segment carry a leading Int32 xid the decoder must skip.
+    stream_xid: ?u32,
+
     // Relation cache (owned copies)
     relations: std.AutoHashMap(u32, OwnedRelation),
 
@@ -77,6 +82,7 @@ pub const Ingestor = struct {
             .batch_msg_count = 0,
             .in_transaction = false,
             .txn_begin_lsn = Lsn.zero,
+            .stream_xid = null,
             .relations = std.AutoHashMap(u32, OwnedRelation).init(allocator),
             .col_buf = undefined,
             .tuple_buf = undefined,
@@ -122,6 +128,18 @@ pub const Ingestor = struct {
             if (msg_type == 'B' or msg_type == 'S') {
                 self.in_transaction = true;
                 self.txn_begin_lsn = wal_msg.wal_start;
+            }
+
+            // Track the stream segment so streamed messages (which carry a
+            // leading xid) decode correctly. 'E' (StreamStop) ends the
+            // segment; StreamCommit/StreamAbort clear it for safety.
+            if (msg_type == 'S') {
+                self.stream_xid = if (data.len >= 5)
+                    std.mem.readInt(u32, data[1..5], .big)
+                else
+                    null;
+            } else if (msg_type == 'E' or msg_type == 'c' or msg_type == 'A') {
+                self.stream_xid = null;
             }
 
             // Parse relation messages to maintain the cache
@@ -176,7 +194,7 @@ pub const Ingestor = struct {
     }
 
     fn updateRelationCache(self: *Ingestor, data: []const u8) !void {
-        const msg = pgoutput.decode(data, &self.col_buf, &self.tuple_buf, &self.tuple_buf2, null) catch return;
+        const msg = pgoutput.decode(data, &self.col_buf, &self.tuple_buf, &self.tuple_buf2, self.stream_xid) catch return;
         const rel = switch (msg) {
             .relation => |r| r,
             else => return,

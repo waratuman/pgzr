@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Streamed Relation messages corrupted the ingestor's relation cache.**
+  Inside a stream segment (proto v2+), Relation messages carry a leading
+  Int32 xid that the ingestor's cache decode did not skip, so the parse
+  misaligned and binary garbage entered the relations JSONB — the batch
+  INSERT then failed server-side with `invalid byte sequence for encoding
+  "UTF8"`. The ingestor now tracks the open stream segment
+  (StreamStart/StreamStop) and decodes streamed messages with the stream
+  xid, matching the processor's behavior.
+
 ### Changed
 
 - **Upgraded to Zig 0.17.** All networking, TLS, randomness, clocks, sleeps,
