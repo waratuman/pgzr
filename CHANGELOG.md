@@ -6,6 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Long replication commands no longer overflow fixed stack buffers.**
+  `START_REPLICATION` is now built with the allocator (no 4 KB limit on
+  slot name plus options, e.g. long publication lists) and embedded
+  quotes in option names/values are escaped. `simpleQuery`/`queryRows`
+  now use the connection's growable send buffer instead of a fixed 4 KB
+  stack buffer, removing the same overflow one layer down.
+
+- **`Replicator.system_id`/`timeline`/`xlogpos`/`db_name` are now owned
+  copies.** They previously pointed into the connection's receive buffer
+  and became garbage after the next protocol read; they now stay valid
+  for the replicator's lifetime (freed in `deinit`).
+
 - **Malformed stored batch data can no longer panic the processor.**
   Corrupt bytes decoded from `wal_batches` now surface as decode errors
   (which park the batch as poison) instead of crashing: negative pgoutput

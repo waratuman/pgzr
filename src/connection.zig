@@ -232,8 +232,13 @@ pub const Connection = struct {
     pub fn simpleQuery(self: *Connection, query: []const u8) QueryError!QueryResult {
         self.beginCommand();
 
-        var send_buf: [4096]u8 = undefined;
-        const msg = protocol.encodeQuery(&send_buf, query);
+        // Query message: 'Q' (1) + int32 len (4) + query + '\0' (1).
+        // Uses the reusable growable send buffer: queries can exceed any
+        // fixed stack buffer (e.g. START_REPLICATION with many options).
+        const msg_len = 1 + 4 + query.len + 1;
+        self.send_buf.clearRetainingCapacity();
+        self.send_buf.ensureTotalCapacity(self.allocator, msg_len) catch return error.OutOfMemory;
+        const msg = protocol.encodeQuery(self.send_buf.allocatedSlice()[0..msg_len], query);
         try self.transport.writeAll(msg);
 
         var result = QueryResult{
@@ -561,8 +566,13 @@ pub const Connection = struct {
     ) QueryError!usize {
         self.beginCommand();
 
-        var send_buf: [4096]u8 = undefined;
-        const msg = protocol.encodeQuery(&send_buf, query);
+        // Query message: 'Q' (1) + int32 len (4) + query + '\0' (1).
+        // Uses the reusable growable send buffer: queries can exceed any
+        // fixed stack buffer (e.g. START_REPLICATION with many options).
+        const msg_len = 1 + 4 + query.len + 1;
+        self.send_buf.clearRetainingCapacity();
+        self.send_buf.ensureTotalCapacity(self.allocator, msg_len) catch return error.OutOfMemory;
+        const msg = protocol.encodeQuery(self.send_buf.allocatedSlice()[0..msg_len], query);
         try self.transport.writeAll(msg);
 
         var row_count: usize = 0;
