@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Batch rows are stored via `COPY ... FROM STDIN`.** The ingestor no
+  longer builds a megabyte-scale INSERT statement (hex bytea inlined into
+  SQL the server must lex/parse/plan); it sends one COPY text row.
+  Restart-replay duplicates are detected via SQLSTATE 23505 and ignored,
+  matching the previous `ON CONFLICT DO NOTHING` semantics.
+
+- **Event flushes stream through copy-in mode in ~64 KiB chunks.**
+  `Connection` gains `copyInBegin`/`copyInWrite`/`copyInEnd`/`copyInFail`;
+  peak memory per flush drops from a full concatenated copy of the batch
+  (retained at high-water capacity) to one chunk.
+
+- **Idle processor polls cost one round trip again.** `processOne` probes
+  for pending work with a single indexed `SELECT ... LIMIT 1` before
+  opening the claim transaction (previously BEGIN + claim + COMMIT per
+  empty poll).
+
+- **Truncate events record which tables were truncated:** one `T` event
+  per truncated relation (with its `rel_oid`) instead of a single event
+  with `rel_oid = 0`.
+
+- **Non-transactional logical messages are no longer captured as
+  metadata.** Only `pg_logical_emit_message(true, ...)` (transactional)
+  attaches to a transaction; non-transactional messages were previously
+  mis-attributed to whatever transaction committed next.
+
 ### Fixed
 
 - **Long replication commands no longer overflow fixed stack buffers.**

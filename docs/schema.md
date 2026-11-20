@@ -160,7 +160,7 @@ CREATE INDEX idx_events_identity_digest ON events (identity_digest)
 | `transaction_id`          | FK to the parent transaction (composite with `committed_at`) |
 | `committed_at`            | Commit timestamp from the source WAL (partition key, denormalized from transactions) |
 | `rel_oid`                 | PostgreSQL relation OID on the source |
-| `type`                    | `I` = INSERT, `U` = UPDATE, `D` = DELETE, `T` = TRUNCATE |
+| `type`                    | `I` = INSERT, `U` = UPDATE, `D` = DELETE, `T` = TRUNCATE (one event per truncated relation, `data`/`old_data` NULL) |
 | `identity_digest`         | SHA-256 of identity column values (new tuple) |
 | `previous_identity_digest`| SHA-256 of identity column values (old tuple, for UPDATEs) |
 | `data`                    | JSONB object mapping column names to text values (new tuple) |

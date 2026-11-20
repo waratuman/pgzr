@@ -474,25 +474,33 @@ pub const Connection = struct {
     /// loads. Returns error.ServerError if the command is rejected or any
     /// row fails; the connection is drained to ReadyForQuery either way.
     pub fn copyIn(self: *Connection, allocator: std.mem.Allocator, command: []const u8, data: []const u8) QueryError!void {
+        try self.copyInBegin(allocator, command);
+        try self.copyInWrite(data);
+        try self.copyInEnd();
+    }
+
+    /// Start a COPY ... FROM STDIN command. On success the connection is
+    /// in copy-in mode: send rows with copyInWrite, then finish with
+    /// copyInEnd — or, if row production fails mid-stream, abort with
+    /// copyInFail so the connection leaves copy mode. Returns
+    /// error.ServerError (connection drained) if the command is rejected.
+    pub fn copyInBegin(self: *Connection, allocator: std.mem.Allocator, command: []const u8) QueryError!void {
         self.beginCommand();
 
-        // Send the COPY command
         const msg_len = 1 + 4 + command.len + 1;
         self.send_buf.clearRetainingCapacity();
         self.send_buf.ensureTotalCapacity(allocator, msg_len) catch return error.OutOfMemory;
-        const buf = self.send_buf.allocatedSlice()[0..msg_len];
-        const msg = protocol.encodeQuery(buf, command);
+        const msg = protocol.encodeQuery(self.send_buf.allocatedSlice()[0..msg_len], command);
         try self.transport.writeAll(msg);
 
         // Wait for CopyInResponse. If the command is rejected the server
         // sends ErrorResponse + ReadyForQuery without entering copy mode.
-        var server_error = false;
-        copy_wait: while (true) {
+        while (true) {
             const header = try protocol.readHeader(self.transport);
             switch (header.msg_type) {
                 protocol.MSG_COPY_IN => {
                     _ = try self.readBodyGrowing(header);
-                    break :copy_wait;
+                    return;
                 },
                 protocol.MSG_READY => {
                     _ = try protocol.readBody(self.transport, header, self.recv_buf);
@@ -503,17 +511,18 @@ pub const Connection = struct {
                     const err = protocol.parseError(body);
                     std.log.err("Copy error: {s}: {s}", .{ err.code, err.message });
                     self.noteServerError(err);
-                    server_error = true;
                 },
                 else => {
                     _ = try self.readBodyGrowing(header);
                 },
             }
         }
+    }
 
-        // Stream the data as CopyData messages. If the server errors
-        // mid-copy it discards further CopyData until CopyDone, so writing
-        // everything before reading cannot deadlock.
+    /// Send one chunk of copy data while in copy-in mode. If the server
+    /// errors mid-copy it discards further CopyData until CopyDone, so
+    /// writing without reading cannot deadlock.
+    pub fn copyInWrite(self: *Connection, data: []const u8) QueryError!void {
         var hdr: [5]u8 = undefined;
         const chunk_size: usize = 64 * 1024;
         var pos: usize = 0;
@@ -525,13 +534,34 @@ pub const Connection = struct {
             try self.transport.writeAll(data[pos .. pos + n]);
             pos += n;
         }
+    }
 
-        // CopyDone
+    /// Finish copy-in mode: send CopyDone and drain to ReadyForQuery.
+    pub fn copyInEnd(self: *Connection) QueryError!void {
+        var hdr: [5]u8 = undefined;
         hdr[0] = protocol.MSG_COPY_DONE;
         std.mem.writeInt(u32, hdr[1..5], 4, .big);
         try self.transport.writeAll(&hdr);
+        try self.drainCopyResult();
+    }
 
-        // Drain to ReadyForQuery
+    /// Abort copy-in mode: send CopyFail and drain to ReadyForQuery. The
+    /// server responds with an ErrorResponse, so errors are swallowed —
+    /// this is a cleanup path for client-side failures mid-stream.
+    pub fn copyInFail(self: *Connection, message: []const u8) void {
+        var buf: [128]u8 = undefined;
+        var w = protocol.MsgWriter{ .buf = &buf };
+        w.writeByte(protocol.MSG_COPY_FAIL);
+        const len_offset = w.pos;
+        w.writeInt32(0);
+        w.writeString(message[0..@min(message.len, buf.len - 7)]);
+        w.patchLength(len_offset);
+        self.transport.writeAll(w.getWritten()) catch return;
+        self.drainCopyResult() catch {};
+    }
+
+    fn drainCopyResult(self: *Connection) QueryError!void {
+        var server_error = false;
         while (true) {
             const header = try protocol.readHeader(self.transport);
             switch (header.msg_type) {

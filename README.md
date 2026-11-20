@@ -348,14 +348,12 @@ benchmark/
 - **UUIDv7 transaction IDs** — Replace `transactions.id` (BIGSERIAL) with a
   client-generated UUIDv7. This eliminates the `INSERT RETURNING id`
   round-trip when creating a transaction, since the ID is known before the
-  INSERT. The transaction INSERT can then be combined with the events
-  multi-row INSERT into a single SQL statement, reducing the per-transaction
-  round-trips from 2 to 1. Requires a schema migration:
+  INSERT. Requires a schema migration:
   `transactions.id` from `BIGSERIAL` to `UUID`, `events.transaction_id` from
   `BIGINT` to `UUID`, and updating the composite foreign key and primary keys.
   UUIDv7's time-ordered prefix preserves index locality on the partitioned
   tables. Zig's `std.crypto.random` provides the entropy source; the
-  timestamp prefix comes from `std.time.milliTimestamp()`.
+  timestamp prefix comes from the `Io` real-time clock.
 
 - **Extended query protocol** — The processor currently uses the simple query
   protocol. PostgreSQL's extended query protocol (Parse/Bind/Execute/Sync)
@@ -363,8 +361,8 @@ benchmark/
   further reducing round-trips. Requires implementing Parse, Bind, Execute,
   Describe, and Sync message encoding in `protocol.zig`, a new pipelined
   execution path in `connection.zig`, and response handling that matches
-  multiple result sequences to their corresponding requests. Event INSERTs
-  are already batched into a single multi-row INSERT per transaction.
+  multiple result sequences to their corresponding requests. Events and
+  batch rows are already inserted via `COPY ... FROM STDIN`.
 
 - **io_uring / kqueue** — The transport layer currently uses blocking I/O.
   Using io_uring (Linux) or kqueue (macOS) would allow non-blocking,

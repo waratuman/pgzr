@@ -1009,6 +1009,64 @@ fn testStreamingMetadataViaMessage(allocator: std.mem.Allocator) !void {
 }
 
 // =========================================================================
+// Test: duplicate batch COPY surfaces SQLSTATE 23505 (restart-replay
+// dedupe path in the ingestor relies on this).
+// =========================================================================
+fn testDuplicateBatchCopy(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: duplicate batch COPY reports 23505... ", .{});
+
+    var conn = pgzr.Connection.connect(allocator, io, destConnConfig()) catch |err| {
+        std.debug.print("FAIL (connect: {})\n", .{err});
+        return err;
+    };
+    defer conn.close();
+
+    runPsql(allocator, DEST_DB, "DELETE FROM wal_batches WHERE source_id = '00000000-0000-0000-0000-00000000dead'") catch {};
+
+    const cmd = "COPY wal_batches (source_id, begin_lsn, start_lsn, end_lsn, data, relations, complete) FROM STDIN";
+    const row = "00000000-0000-0000-0000-00000000dead\t1\t1\t2\t\\\\x00\t\\N\tt\n";
+
+    conn.copyIn(allocator, cmd, row) catch |err| {
+        std.debug.print("FAIL (first copy: {})\n", .{err});
+        return err;
+    };
+
+    // Second copy of the same (source_id, start_lsn) must fail with a
+    // unique violation, and the connection must stay usable.
+    if (conn.copyIn(allocator, cmd, row)) |_| {
+        std.debug.print("FAIL (duplicate copy unexpectedly succeeded)\n", .{});
+        return error.ServerError;
+    } else |err| {
+        if (err != error.ServerError) {
+            std.debug.print("FAIL (duplicate copy: {})\n", .{err});
+            return err;
+        }
+        const code = conn.lastServerErrorCode() orelse {
+            std.debug.print("FAIL (no SQLSTATE recorded)\n", .{});
+            return error.ServerError;
+        };
+        if (!std.mem.eql(u8, code, "23505")) {
+            std.debug.print("FAIL (expected 23505, got {s})\n", .{code});
+            return error.ServerError;
+        }
+    }
+
+    // Connection still in sync after the failed COPY
+    const result = conn.simpleQuery("SELECT 1") catch |err| {
+        std.debug.print("FAIL (post-error query: {})\n", .{err});
+        return err;
+    };
+    if (result.column_count == 0) {
+        std.debug.print("FAIL (post-error query returned no row)\n", .{});
+        return error.ServerError;
+    }
+
+    runPsql(allocator, DEST_DB, "DELETE FROM wal_batches WHERE source_id = '00000000-0000-0000-0000-00000000dead'") catch {};
+
+    std.debug.print("OK\n", .{});
+}
+
+// =========================================================================
 // Test 9b: Interleaved streamed transactions — two concurrent large
 // transactions stream interleaved segments; each must commit with exactly
 // its own events.
@@ -1462,6 +1520,10 @@ pub fn main(init: std.process.Init) !void {
     };
 
     testInterleavedStreams(allocator) catch {
+        failures += 1;
+    };
+
+    testDuplicateBatchCopy(allocator) catch {
         failures += 1;
     };
 

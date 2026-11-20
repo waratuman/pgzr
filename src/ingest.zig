@@ -279,42 +279,54 @@ pub const Ingestor = struct {
     fn flushBatch(self: *Ingestor, complete: bool) !void {
         if (self.batch_msg_count == 0) return;
 
+        if (!query.isValidUuid(self.config.source_id)) return error.InvalidUuid;
+
         const relations_json = try self.serializeRelations();
         defer self.allocator.free(relations_json);
 
-        // Build INSERT query with inline hex encoding (no intermediate data_hex allocation)
-        var sql: std.ArrayListUnmanaged(u8) = .empty;
-        defer sql.deinit(self.allocator);
+        // Build one COPY text-format row. COPY skips SQL
+        // lexing/parsing/planning on the server — for megabyte-scale
+        // batch rows that dominates the insert cost.
+        var row: std.ArrayListUnmanaged(u8) = .empty;
+        defer row.deinit(self.allocator);
 
         const begin_lsn = if (self.group_begin_lsn.value != 0) self.group_begin_lsn else self.batch_start_lsn;
 
-        try sql.appendSlice(self.allocator, "INSERT INTO wal_batches (source_id, begin_lsn, start_lsn, end_lsn, data, relations, complete) VALUES (");
-        try query.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
-        try sql.appendSlice(self.allocator, ", ");
-        try query.appendIntValue(&sql, self.allocator, begin_lsn.value);
-        try sql.appendSlice(self.allocator, ", ");
-        try query.appendIntValue(&sql, self.allocator, self.batch_start_lsn.value);
-        try sql.appendSlice(self.allocator, ", ");
-        try query.appendIntValue(&sql, self.allocator, self.batch_end_lsn.value);
-        try sql.appendSlice(self.allocator, ", ");
-        try query.appendEscapedBytea(&sql, self.allocator, self.batch_buf.items);
-        try sql.appendSlice(self.allocator, ", ");
-        try sql.appendSlice(self.allocator, relations_json);
-        try sql.appendSlice(self.allocator, ", ");
+        try row.appendSlice(self.allocator, self.config.source_id);
+        try row.append(self.allocator, '\t');
+        try query.appendIntValue(&row, self.allocator, begin_lsn.value);
+        try row.append(self.allocator, '\t');
+        try query.appendIntValue(&row, self.allocator, self.batch_start_lsn.value);
+        try row.append(self.allocator, '\t');
+        try query.appendIntValue(&row, self.allocator, self.batch_end_lsn.value);
+        try row.append(self.allocator, '\t');
+        try query.appendCopyBytea(&row, self.allocator, self.batch_buf.items);
+        try row.append(self.allocator, '\t');
+        try query.appendCopyText(&row, self.allocator, relations_json);
+        try row.append(self.allocator, '\t');
+        try row.append(self.allocator, if (complete) 't' else 'f');
+        try row.append(self.allocator, '\n');
 
-        if (complete) {
-            try sql.appendSlice(self.allocator, "true");
-        } else {
-            try sql.appendSlice(self.allocator, "false");
-        }
-        try sql.appendSlice(self.allocator, ") ON CONFLICT (source_id, start_lsn) DO NOTHING");
-
-        std.log.debug("flushBatch: sending INSERT sql_len={d} data_bytes={d}", .{
-            sql.items.len,
+        std.log.debug("flushBatch: sending COPY row_len={d} data_bytes={d}", .{
+            row.items.len,
             self.batch_buf.items.len,
         });
-        try self.dest.execLarge(self.allocator, sql.items);
-        std.log.debug("flushBatch: execLarge complete", .{});
+        self.dest.copyIn(
+            self.allocator,
+            "COPY wal_batches (source_id, begin_lsn, start_lsn, end_lsn, data, relations, complete) FROM STDIN",
+            row.items,
+        ) catch |err| switch (err) {
+            error.ServerError => {
+                // A unique violation on (source_id, start_lsn) means this
+                // batch was already stored by a previous run (unacked WAL
+                // replayed after restart) — equivalent to the old
+                // ON CONFLICT DO NOTHING.
+                const code = self.dest.lastServerErrorCode() orelse return err;
+                if (!std.mem.eql(u8, code, "23505")) return err;
+                std.log.debug("flushBatch: duplicate batch start_lsn={f}, already stored", .{self.batch_start_lsn});
+            },
+            else => return err,
+        };
 
         std.log.info("batch flushed: start_lsn={f} end_lsn={f} msgs={d} bytes={d} complete={}", .{
             self.batch_start_lsn,
@@ -338,7 +350,6 @@ pub const Ingestor = struct {
         var json: std.ArrayListUnmanaged(u8) = .empty;
         errdefer json.deinit(self.allocator);
 
-        try json.append(self.allocator, '\'');
         try json.append(self.allocator, '{');
 
         var first_rel = true;
@@ -404,7 +415,7 @@ pub const Ingestor = struct {
             try json.appendSlice(self.allocator, "]}");
         }
 
-        try json.appendSlice(self.allocator, "}'::jsonb");
+        try json.append(self.allocator, '}');
 
         return json.toOwnedSlice(self.allocator);
     }
@@ -413,7 +424,6 @@ pub const Ingestor = struct {
         for (s) |c| {
             switch (c) {
                 '"' => try list.appendSlice(allocator, "\\\""),
-                '\'' => try list.appendSlice(allocator, "''"),
                 '\\' => try list.appendSlice(allocator, "\\\\"),
                 '\n' => try list.appendSlice(allocator, "\\n"),
                 '\r' => try list.appendSlice(allocator, "\\r"),

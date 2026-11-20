@@ -144,6 +144,15 @@ pub const Processor = struct {
     /// source_id + begin_lsn). Partial batches are fetched alongside their
     /// completing batch and processed as one logical unit.
     pub fn processOne(self: *Processor) ProcessError!bool {
+        // Cheap existence probe first: an idle poll costs one round trip
+        // instead of three (BEGIN + claim + COMMIT). The claim re-checks
+        // under lock, so a stale probe result is harmless — a miss is
+        // caught next poll, a false hit yields an empty claim.
+        const probe = try self.dest.simpleQuery(
+            "SELECT 1 FROM wal_batches WHERE state='pending' AND complete=true LIMIT 1",
+        );
+        if (probe.column_count == 0) return false;
+
         // Run the whole claim/decode/insert/delete cycle inside one transaction
         // so the claim's row lock (FOR UPDATE) is held until the work commits.
         //
@@ -489,7 +498,15 @@ pub const Processor = struct {
                     }
                 },
                 .truncate => |trunc| {
-                    try self.bufferEvent(0, 'T', null, null, trunc.xid);
+                    // One event per truncated relation so the audit trail
+                    // records which tables were truncated.
+                    var i: u32 = 0;
+                    while (i < trunc.relation_count) : (i += 1) {
+                        const oid = try trunc.relationOid(i);
+                        if (!self.isMetadataTable(oid)) {
+                            try self.bufferEvent(oid, 'T', null, null, trunc.xid);
+                        }
+                    }
                 },
                 // Proto v2: streaming — events and metadata are buffered
                 // during stream chunks and flushed at commit time when
@@ -556,8 +573,14 @@ pub const Processor = struct {
                     // Prepared within streaming — keep txn state
                 },
                 .message => |logical_msg| {
+                    // Only transactional messages (flags bit 0) carry
+                    // metadata for the surrounding transaction; a
+                    // non-transactional message has no transaction and
+                    // would otherwise be mis-attributed to the next one.
                     if (self.config.metadata_message_prefix) |prefix| {
-                        if (std.mem.eql(u8, logical_msg.prefix, prefix)) {
+                        if ((logical_msg.flags & 1) != 0 and
+                            std.mem.eql(u8, logical_msg.prefix, prefix))
+                        {
                             if (self.current_stream_xid) |top| {
                                 try self.addStreamMetadata(top, logical_msg.xid orelse top, logical_msg.content);
                             } else {
@@ -1176,6 +1199,9 @@ pub const Processor = struct {
     /// Insert all buffered events via COPY with the transaction_id and
     /// committed_at timestamp. COPY skips SQL lexing/parsing/planning on
     /// the server, which dominates the cost of large multi-row INSERTs.
+    /// Rows are streamed through copy-in mode in ~64 KiB chunks, so peak
+    /// memory stays at one chunk instead of a full concatenated copy of
+    /// the batch.
     fn flushPendingEvents(self: *Processor) !void {
         if (self.pending_events.items.len == 0) return;
 
@@ -1186,6 +1212,24 @@ pub const Processor = struct {
         var ts_buf: [40]u8 = undefined;
         const ts_text = query_mod.writeTimestampText(&ts_buf, self.current_txn_timestamp);
 
+        try self.dest.copyInBegin(
+            self.allocator,
+            "COPY events (transaction_id, committed_at, rel_oid, type, " ++
+                "identity_digest, previous_identity_digest, data, old_data) FROM STDIN",
+        );
+        self.streamEventRows(txn_id_text, ts_text) catch |err| {
+            // Leave copy mode so the connection is usable for ROLLBACK.
+            self.dest.copyInFail("pgzr: client-side failure while streaming events");
+            return err;
+        };
+        try self.dest.copyInEnd();
+        self.clearPendingEvents();
+    }
+
+    /// Accumulate event rows into copy_buf and ship each ~64 KiB chunk.
+    const copy_chunk_target: usize = 64 * 1024;
+
+    fn streamEventRows(self: *Processor, txn_id_text: []const u8, ts_text: []const u8) !void {
         self.copy_buf.clearRetainingCapacity();
         for (self.pending_events.items) |frag| {
             try self.copy_buf.appendSlice(self.allocator, txn_id_text);
@@ -1194,15 +1238,15 @@ pub const Processor = struct {
             try self.copy_buf.append(self.allocator, '\t');
             try self.copy_buf.appendSlice(self.allocator, frag);
             try self.copy_buf.append(self.allocator, '\n');
+            if (self.copy_buf.items.len >= copy_chunk_target) {
+                try self.dest.copyInWrite(self.copy_buf.items);
+                self.copy_buf.clearRetainingCapacity();
+            }
         }
-
-        try self.dest.copyIn(
-            self.allocator,
-            "COPY events (transaction_id, committed_at, rel_oid, type, " ++
-                "identity_digest, previous_identity_digest, data, old_data) FROM STDIN",
-            self.copy_buf.items,
-        );
-        self.clearPendingEvents();
+        if (self.copy_buf.items.len > 0) {
+            try self.dest.copyInWrite(self.copy_buf.items);
+            self.copy_buf.clearRetainingCapacity();
+        }
     }
 
     /// Resolve the current transaction's id when insertTransaction did not

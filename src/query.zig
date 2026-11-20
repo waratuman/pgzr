@@ -131,7 +131,7 @@ pub fn escapeUuid(allocator: std.mem.Allocator, uuid: []const u8) ![]u8 {
     return buf;
 }
 
-fn isValidUuid(s: []const u8) bool {
+pub fn isValidUuid(s: []const u8) bool {
     if (s.len != 36) return false;
     const dash_positions = [_]usize{ 8, 13, 18, 23 };
     for (s, 0..) |c, i| {
@@ -245,6 +245,40 @@ pub fn appendCopyBytea(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocat
         out[i * 2] = hex[byte >> 4];
         out[i * 2 + 1] = hex[byte & 0x0f];
     }
+}
+
+/// Append arbitrary text as a COPY text-format field, escaping the
+/// characters COPY treats specially (backslash, tab, newline, CR).
+/// Runs of characters that need no escaping are copied in bulk.
+pub fn appendCopyText(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: []const u8) !void {
+    var start: usize = 0;
+    for (value, 0..) |c, i| {
+        const esc: []const u8 = switch (c) {
+            '\\' => "\\\\",
+            '\t' => "\\t",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            else => continue,
+        };
+        try list.appendSlice(alloc, value[start..i]);
+        try list.appendSlice(alloc, esc);
+        start = i + 1;
+    }
+    try list.appendSlice(alloc, value[start..]);
+}
+
+test "appendCopyText: escapes copy specials" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendCopyText(&list, std.testing.allocator, "a\\b\tc\nd\re");
+    try std.testing.expectEqualStrings("a\\\\b\\tc\\nd\\re", list.items);
+}
+
+test "appendCopyText: plain passthrough" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendCopyText(&list, std.testing.allocator, "{\"a\":1}");
+    try std.testing.expectEqualStrings("{\"a\":1}", list.items);
 }
 
 /// Append a bytea value in COPY text format, or \N if null.
