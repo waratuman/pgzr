@@ -141,13 +141,18 @@ pub const Processor = struct {
         _ = try self.dest.simpleQuery("BEGIN");
 
         const claimed = self.claimAndProcess() catch |err| {
-            // Roll back the claim and all inserts, then park the claimed
-            // batch(es) in 'error' state so a poison batch is not retried
-            // forever. Both are best-effort: a dead connection makes them
-            // no-ops. markBatchesError runs post-rollback (autocommit) so it
-            // is not undone by the rollback.
+            // Roll back the claim and all inserts. Park the claimed
+            // batch(es) in 'error' state only for poison failures (decode
+            // errors, non-retryable SQLSTATEs) that would repeat forever;
+            // transient failures (connection loss, deadlock, timeout,
+            // resource exhaustion) leave the rows 'pending' for retry.
+            // Classify before ROLLBACK: it clears the stored SQLSTATE.
+            // Both statements are best-effort: a dead connection makes
+            // them no-ops. markBatchesError runs post-rollback
+            // (autocommit) so it is not undone by the rollback.
+            const park = self.shouldParkBatches(err);
             _ = self.dest.simpleQuery("ROLLBACK") catch {};
-            self.markBatchesError();
+            if (park) self.markBatchesError();
             self.resetBatchState();
             return err;
         };
@@ -168,6 +173,31 @@ pub const Processor = struct {
         };
         self.clearPending();
         return true;
+    }
+
+    /// Decide whether a claimAndProcess failure should park the claimed
+    /// batches in 'error' state (poison: retrying would fail forever) or
+    /// leave them 'pending' for retry (transient). Nothing requeues
+    /// 'error' rows automatically, so parking must be reserved for
+    /// failures caused by the batch data itself.
+    fn shouldParkBatches(self: *Processor, err: ProcessError) bool {
+        return switch (err) {
+            // Client-side or connection trouble: the batch data is intact.
+            error.OutOfMemory,
+            error.ConnectionClosed,
+            error.ReadFailed,
+            error.WriteFailed,
+            error.Canceled,
+            error.ProtocolError,
+            => false,
+            // Server rejected a statement: consult the SQLSTATE.
+            error.ServerError => blk: {
+                const code = self.dest.lastServerErrorCode() orelse break :blk true;
+                break :blk !isRetryableSqlState(code);
+            },
+            // Decode/validation failures are inherent to the batch data.
+            else => true,
+        };
     }
 
     /// Discard all per-batch state after a failed cycle: claimed ids,
@@ -1140,6 +1170,42 @@ pub const Processor = struct {
         self.dest.close();
     }
 };
+
+/// SQLSTATE classes whose errors are expected to succeed on retry:
+///   08 — connection exception
+///   40 — transaction rollback (deadlock_detected, serialization_failure)
+///   53 — insufficient resources (memory, disk, connection slots)
+///   55 — object not in prerequisite state (lock_not_available)
+///   57 — operator intervention (query_canceled, shutdown)
+/// Everything else (22 data, 23 integrity, 42 syntax/access, ...) is
+/// treated as a property of the statement and therefore of the batch.
+fn isRetryableSqlState(code: []const u8) bool {
+    if (code.len < 2) return false;
+    const class = code[0..2];
+    return std.mem.eql(u8, class, "08") or
+        std.mem.eql(u8, class, "40") or
+        std.mem.eql(u8, class, "53") or
+        std.mem.eql(u8, class, "55") or
+        std.mem.eql(u8, class, "57");
+}
+
+test "isRetryableSqlState: transient classes retry" {
+    try std.testing.expect(isRetryableSqlState("40P01")); // deadlock_detected
+    try std.testing.expect(isRetryableSqlState("40001")); // serialization_failure
+    try std.testing.expect(isRetryableSqlState("57014")); // query_canceled
+    try std.testing.expect(isRetryableSqlState("53200")); // out_of_memory
+    try std.testing.expect(isRetryableSqlState("55P03")); // lock_not_available
+    try std.testing.expect(isRetryableSqlState("08006")); // connection_failure
+}
+
+test "isRetryableSqlState: data/constraint/syntax errors park" {
+    try std.testing.expect(!isRetryableSqlState("22021")); // invalid byte sequence
+    try std.testing.expect(!isRetryableSqlState("23502")); // not_null_violation
+    try std.testing.expect(!isRetryableSqlState("42601")); // syntax_error
+    try std.testing.expect(!isRetryableSqlState("22P02")); // invalid_text_representation
+    try std.testing.expect(!isRetryableSqlState(""));
+    try std.testing.expect(!isRetryableSqlState("4"));
+}
 
 /// Append a JSON-escaped string (with surrounding double quotes) in COPY
 /// text format. Each JSON escape's backslash is doubled so it survives COPY

@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Transient failures no longer permanently park batches.** A processor
+  failure now parks the claimed batches in `state='error'` only when the
+  failure is a property of the batch itself: pgoutput decode errors,
+  validation errors, or a server error with a non-retryable SQLSTATE.
+  Connection loss, deadlocks, serialization failures, statement timeouts,
+  lock timeouts, and resource exhaustion (SQLSTATE classes 08, 40, 53, 55,
+  57) leave the rows `'pending'` so the next cycle retries them.
+  `Connection` now exposes `lastServerErrorCode()` with the SQLSTATE of the
+  most recent command's server error.
+
 - **Streamed Relation messages corrupted the ingestor's relation cache.**
   Inside a stream segment (proto v2+), Relation messages carry a leading
   Int32 xid that the ingestor's cache decode did not skip, so the parse

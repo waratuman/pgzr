@@ -24,6 +24,11 @@ pub const Connection = struct {
     /// Heap-allocated transport state (PlainState or TlsState).
     plain_state: ?*PlainState = null,
     tls_state: ?*TlsState = null,
+    /// SQLSTATE of the most recent server ErrorResponse within the current
+    /// command (cleared at the start of each query). Lets callers classify
+    /// error.ServerError (e.g. retryable deadlock vs. poison data).
+    last_error_code: [5]u8 = undefined,
+    last_error_code_len: u8 = 0,
 
     pub const ConnectError = auth_mod.AuthError || std.mem.Allocator.Error ||
         Transport.ReadError || Transport.WriteError || TlsState.UpgradeError ||
@@ -149,6 +154,27 @@ pub const Connection = struct {
         }
     }
 
+    /// Per-command setup: shrink recv_buf and clear the stored SQLSTATE.
+    fn beginCommand(self: *Connection) void {
+        self.resetRecvBuf();
+        self.last_error_code_len = 0;
+    }
+
+    /// Record the SQLSTATE from a server ErrorResponse so callers can
+    /// classify error.ServerError after the call returns.
+    fn noteServerError(self: *Connection, info: protocol.ErrorInfo) void {
+        const n: u8 = @intCast(@min(info.code.len, self.last_error_code.len));
+        @memcpy(self.last_error_code[0..n], info.code[0..n]);
+        self.last_error_code_len = n;
+    }
+
+    /// SQLSTATE of the server error raised by the most recent command, or
+    /// null if the command did not produce a server error.
+    pub fn lastServerErrorCode(self: *const Connection) ?[]const u8 {
+        if (self.last_error_code_len == 0) return null;
+        return self.last_error_code[0..self.last_error_code_len];
+    }
+
     fn processPostAuth(self: *Connection) ConnectError!void {
         while (true) {
             const header = try protocol.readHeader(self.transport);
@@ -204,7 +230,7 @@ pub const Connection = struct {
     /// survives subsequent protocol reads within this call.
     /// For CopyBothResponse (START_REPLICATION), returns with in_copy_mode=true.
     pub fn simpleQuery(self: *Connection, query: []const u8) QueryError!QueryResult {
-        self.resetRecvBuf();
+        self.beginCommand();
 
         var send_buf: [4096]u8 = undefined;
         const msg = protocol.encodeQuery(&send_buf, query);
@@ -275,6 +301,7 @@ pub const Connection = struct {
                     const body = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
+                    self.noteServerError(err);
                     server_error = true;
                 },
                 protocol.MSG_COPY_BOTH => {
@@ -296,7 +323,7 @@ pub const Connection = struct {
     /// Uses a reusable send buffer to avoid per-call allocations.
     /// Does not return result rows — use for INSERT/UPDATE/DELETE/DDL.
     pub fn execLarge(self: *Connection, allocator: std.mem.Allocator, sql: []const u8) QueryError!void {
-        self.resetRecvBuf();
+        self.beginCommand();
 
         // Query message: 'Q' (1) + int32 len (4) + query + '\0' (1)
         const msg_len = 1 + 4 + sql.len + 1;
@@ -335,6 +362,7 @@ pub const Connection = struct {
                     const body = try self.readBodyGrowing(header);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
+                    self.noteServerError(err);
                     server_error = true;
                 },
                 else => {
@@ -349,7 +377,7 @@ pub const Connection = struct {
     /// Column data is copied into the second half of recv_buf so it
     /// survives subsequent protocol reads.
     pub fn execLargeWithResult(self: *Connection, allocator: std.mem.Allocator, query: []const u8) QueryError!QueryResult {
-        self.resetRecvBuf();
+        self.beginCommand();
 
         const msg_len = 1 + 4 + query.len + 1;
         self.send_buf.clearRetainingCapacity();
@@ -421,6 +449,7 @@ pub const Connection = struct {
                     const body = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
+                    self.noteServerError(err);
                     server_error = true;
                 },
                 protocol.MSG_NOTICE => {
@@ -440,7 +469,7 @@ pub const Connection = struct {
     /// loads. Returns error.ServerError if the command is rejected or any
     /// row fails; the connection is drained to ReadyForQuery either way.
     pub fn copyIn(self: *Connection, allocator: std.mem.Allocator, command: []const u8, data: []const u8) QueryError!void {
-        self.resetRecvBuf();
+        self.beginCommand();
 
         // Send the COPY command
         const msg_len = 1 + 4 + command.len + 1;
@@ -468,6 +497,7 @@ pub const Connection = struct {
                     const body = try self.readBodyGrowing(header);
                     const err = protocol.parseError(body);
                     std.log.err("Copy error: {s}: {s}", .{ err.code, err.message });
+                    self.noteServerError(err);
                     server_error = true;
                 },
                 else => {
@@ -509,6 +539,7 @@ pub const Connection = struct {
                     const body = try self.readBodyGrowing(header);
                     const err = protocol.parseError(body);
                     std.log.err("Copy error: {s}: {s}", .{ err.code, err.message });
+                    self.noteServerError(err);
                     server_error = true;
                 },
                 else => {
@@ -528,7 +559,7 @@ pub const Connection = struct {
         context: anytype,
         callback: fn (@TypeOf(context), []const QueryColumn) void,
     ) QueryError!usize {
-        self.resetRecvBuf();
+        self.beginCommand();
 
         var send_buf: [4096]u8 = undefined;
         const msg = protocol.encodeQuery(&send_buf, query);
@@ -579,6 +610,7 @@ pub const Connection = struct {
                     const body = try self.readBodyGrowing(header);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
+                    self.noteServerError(err);
                     server_error = true;
                 },
                 protocol.MSG_NOTICE => {
