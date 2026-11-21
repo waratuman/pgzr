@@ -362,7 +362,7 @@ benchmark/
   Describe, and Sync message encoding in `protocol.zig`, a new pipelined
   execution path in `connection.zig`, and response handling that matches
   multiple result sequences to their corresponding requests. Events and
-  batch rows are already inserted via `COPY ... FROM STDIN`.
+  batch rows are already inserted via `COPY ... FROM STDIN (FORMAT binary)`.
 
 - **io_uring / kqueue** — The transport layer currently uses blocking I/O.
   Using io_uring (Linux) or kqueue (macOS) would allow non-blocking,

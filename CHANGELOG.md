@@ -6,6 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **COPY now uses binary format for both `wal_batches` and `events`.**
+  Batch payloads go over the wire at 1x size (no hex) and are streamed
+  straight from the accumulation buffer with no intermediate copy;
+  event rows carry `committed_at` as 8 bytes instead of 29-char text,
+  identity digests as raw bytes instead of hex, and JSONB as plain JSON
+  with no COPY text-escaping layer.
+
+- **Plain TCP reads are buffered (64 KiB).** The protocol layer
+  previously paid poll + header read + body read (~3 syscalls) per WAL
+  message; one refill now serves many messages and `hasPending` skips
+  the poll while data is buffered. Large bodies still read directly
+  into the destination buffer.
+
+  Together: concurrent stress test (100k events, ReleaseFast) ingest
+  ~45% faster (273–291 ms vs 496–528 ms); processing unchanged
+  (server-bound).
+
 - **C ABI handles allocate with `std.heap.smp_allocator`** instead of
   `page_allocator` (page-granularity, syscall per allocation) — the FFI
   path makes per-event allocations, so this materially speeds up

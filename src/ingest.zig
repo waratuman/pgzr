@@ -279,43 +279,55 @@ pub const Ingestor = struct {
     fn flushBatch(self: *Ingestor, complete: bool) !void {
         if (self.batch_msg_count == 0) return;
 
-        if (!query.isValidUuid(self.config.source_id)) return error.InvalidUuid;
+        const uuid_bytes = try query.parseUuid(self.config.source_id);
 
         const relations_json = try self.serializeRelations();
         defer self.allocator.free(relations_json);
 
-        // Build one COPY text-format row. COPY skips SQL
-        // lexing/parsing/planning on the server — for megabyte-scale
-        // batch rows that dominates the insert cost.
-        var row: std.ArrayListUnmanaged(u8) = .empty;
-        defer row.deinit(self.allocator);
-
         const begin_lsn = if (self.group_begin_lsn.value != 0) self.group_begin_lsn else self.batch_start_lsn;
 
-        try row.appendSlice(self.allocator, self.config.source_id);
-        try row.append(self.allocator, '\t');
-        try query.appendIntValue(&row, self.allocator, begin_lsn.value);
-        try row.append(self.allocator, '\t');
-        try query.appendIntValue(&row, self.allocator, self.batch_start_lsn.value);
-        try row.append(self.allocator, '\t');
-        try query.appendIntValue(&row, self.allocator, self.batch_end_lsn.value);
-        try row.append(self.allocator, '\t');
-        try query.appendCopyBytea(&row, self.allocator, self.batch_buf.items);
-        try row.append(self.allocator, '\t');
-        try query.appendCopyText(&row, self.allocator, relations_json);
-        try row.append(self.allocator, '\t');
-        try row.append(self.allocator, if (complete) 't' else 'f');
-        try row.append(self.allocator, '\n');
+        // COPY BINARY: binary field values need no hex/escape encoding, so
+        // the megabyte-scale bytea payload goes over the wire at 1x size —
+        // and is streamed directly from batch_buf without another copy.
+        var head: std.ArrayListUnmanaged(u8) = .empty;
+        defer head.deinit(self.allocator);
 
-        std.log.debug("flushBatch: sending COPY row_len={d} data_bytes={d}", .{
-            row.items.len,
+        try head.appendSlice(self.allocator, query.copy_binary_header);
+        try query.appendBinU16(&head, self.allocator, 7); // field count
+        try query.appendBinU32(&head, self.allocator, 16); // uuid
+        try head.appendSlice(self.allocator, &uuid_bytes);
+        try query.appendBinI64Field(&head, self.allocator, @bitCast(begin_lsn.value));
+        try query.appendBinI64Field(&head, self.allocator, @bitCast(self.batch_start_lsn.value));
+        try query.appendBinI64Field(&head, self.allocator, @bitCast(self.batch_end_lsn.value));
+        try query.appendBinU32(&head, self.allocator, @intCast(self.batch_buf.items.len)); // bytea length
+
+        var tail: std.ArrayListUnmanaged(u8) = .empty;
+        defer tail.deinit(self.allocator);
+
+        // relations JSONB: 1-byte version prefix + JSON text
+        try query.appendBinU32(&tail, self.allocator, @intCast(1 + relations_json.len));
+        try tail.append(self.allocator, 1);
+        try tail.appendSlice(self.allocator, relations_json);
+        // complete BOOLEAN
+        try query.appendBinU32(&tail, self.allocator, 1);
+        try tail.append(self.allocator, @intFromBool(complete));
+        // trailer: field count -1 ends the stream
+        try tail.appendSlice(self.allocator, query.copy_binary_trailer);
+
+        std.log.debug("flushBatch: sending binary COPY data_bytes={d}", .{
             self.batch_buf.items.len,
         });
-        self.dest.copyIn(
+        try self.dest.copyInBegin(
             self.allocator,
-            "COPY wal_batches (source_id, begin_lsn, start_lsn, end_lsn, data, relations, complete) FROM STDIN",
-            row.items,
-        ) catch |err| switch (err) {
+            "COPY wal_batches (source_id, begin_lsn, start_lsn, end_lsn, data, relations, complete) FROM STDIN WITH (FORMAT binary)",
+        );
+        self.streamBatchRow(head.items, tail.items) catch |err| {
+            // Leave copy mode before propagating so the connection is not
+            // stuck mid-COPY (best-effort: the transport is likely dead).
+            self.dest.copyInFail("pgzr: client-side failure while streaming batch");
+            return err;
+        };
+        self.dest.copyInEnd() catch |err| switch (err) {
             error.ServerError => {
                 // A unique violation on (source_id, start_lsn) means this
                 // batch was already stored by a previous run (unacked WAL
@@ -344,6 +356,12 @@ pub const Ingestor = struct {
         // Reset batch
         self.batch_buf.clearRetainingCapacity();
         self.batch_msg_count = 0;
+    }
+
+    fn streamBatchRow(self: *Ingestor, head: []const u8, tail: []const u8) !void {
+        try self.dest.copyInWrite(head);
+        try self.dest.copyInWrite(self.batch_buf.items);
+        try self.dest.copyInWrite(tail);
     }
 
     fn serializeRelations(self: *Ingestor) ![]u8 {

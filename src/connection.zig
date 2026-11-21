@@ -84,7 +84,10 @@ pub const Connection = struct {
             std.mem.writeInt(u32, ssl_buf[4..8], 80877103, .big);
             try transport.writeAll(&ssl_buf);
 
-            // Read 1-byte response
+            // Read 1-byte response. Safe with the buffered plain transport:
+            // the server sends exactly one byte and then waits for the
+            // client (TLS ClientHello), so the refill cannot slurp bytes
+            // that belong to the TLS stream.
             var resp: [1]u8 = undefined;
             const n = try transport.read(&resp);
             if (n == 0) return error.ConnectionClosed;

@@ -154,6 +154,45 @@ pub fn isValidUuid(s: []const u8) bool {
     return true;
 }
 
+/// Parse a canonical UUID string (8-4-4-4-12 hex with dashes) into its
+/// 16 raw bytes (as used by PostgreSQL's binary uuid format).
+pub fn parseUuid(text: []const u8) error{InvalidUuid}![16]u8 {
+    if (!isValidUuid(text)) return error.InvalidUuid;
+    var out: [16]u8 = undefined;
+    var oi: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '-') {
+            i += 1;
+            continue;
+        }
+        const hi = hexNibble(text[i]);
+        const lo = hexNibble(text[i + 1]);
+        out[oi] = (hi << 4) | lo;
+        oi += 1;
+        i += 2;
+    }
+    return out;
+}
+
+fn hexNibble(c: u8) u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => unreachable, // isValidUuid already checked
+    };
+}
+
+test "parseUuid" {
+    const bytes = try parseUuid("00112233-4455-6677-8899-aabbccddeeff");
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    }, &bytes);
+    try std.testing.expectError(error.InvalidUuid, parseUuid("not-a-uuid"));
+}
+
 // ── Append helpers (zero-alloc, write directly into SQL builder) ───────
 
 /// Append a SQL string literal to the list, escaping single quotes.
@@ -223,6 +262,58 @@ pub fn appendByteaOrNull(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Alloc
     } else {
         try appendNull(list, alloc);
     }
+}
+
+// ── COPY binary-format helpers ────────────────────────────────────────
+
+/// COPY BINARY stream header: signature + flags + header extension length.
+pub const copy_binary_header = "PGCOPY\n\xff\r\n\x00" ++
+    "\x00\x00\x00\x00" ++
+    "\x00\x00\x00\x00";
+
+/// COPY BINARY stream trailer: tuple field count of -1.
+pub const copy_binary_trailer = "\xff\xff";
+
+/// COPY BINARY NULL field marker: length of -1.
+pub const copy_binary_null = "\xff\xff\xff\xff";
+
+pub fn appendBinU16(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, v: u16) !void {
+    try list.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeTo(u16, v, .big)));
+}
+
+pub fn appendBinU32(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, v: u32) !void {
+    try list.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeTo(u32, v, .big)));
+}
+
+/// Append an 8-byte integer field (length prefix + big-endian value).
+pub fn appendBinI64Field(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, v: i64) !void {
+    try appendBinU32(list, alloc, 8);
+    try list.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeTo(i64, v, .big)));
+}
+
+/// Append a bytea field (length prefix + raw bytes), or NULL.
+pub fn appendBinByteaField(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: ?[]const u8) !void {
+    if (value) |v| {
+        try appendBinU32(list, alloc, @intCast(v.len));
+        try list.appendSlice(alloc, v);
+    } else {
+        try list.appendSlice(alloc, copy_binary_null);
+    }
+}
+
+test "copy binary helpers" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendBinU16(&list, std.testing.allocator, 7);
+    try appendBinI64Field(&list, std.testing.allocator, -2);
+    try appendBinByteaField(&list, std.testing.allocator, null);
+    try appendBinByteaField(&list, std.testing.allocator, "ab");
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0, 7, // u16
+        0, 0, 0, 8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, // i64 -2
+        0xff, 0xff, 0xff, 0xff, // null
+        0, 0, 0, 2, 'a', 'b', // bytea
+    }, list.items);
 }
 
 // ── COPY text-format helpers ──────────────────────────────────────────

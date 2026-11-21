@@ -71,14 +71,42 @@ pub const Transport = struct {
 pub const PlainState = struct {
     io: Io,
     stream: net.Stream,
+    /// Buffered reads: the protocol layer reads a 5-byte header then a
+    /// body per message, which unbuffered costs 2 syscalls per message
+    /// (plus a poll). One refill syscall serves many messages, and
+    /// hasPending lets the replicator skip poll entirely while data is
+    /// buffered.
+    read_buf: [read_buf_len]u8 = undefined,
+    read_start: usize = 0,
+    read_end: usize = 0,
+
+    const read_buf_len = 64 * 1024;
 
     fn readFn(ctx: *anyopaque, buf: []u8) Transport.ReadError!usize {
         const self: *PlainState = @ptrCast(@alignCast(ctx));
-        var bufs: [1][]u8 = .{buf};
-        return self.stream.read(self.io, &bufs) catch |err| switch (err) {
-            error.Canceled => error.Canceled,
-            else => error.ReadFailed,
-        };
+        if (self.read_start == self.read_end) {
+            // Large destination with nothing buffered: read directly into
+            // it, skipping the intermediate copy (big message bodies).
+            if (buf.len >= read_buf_len) {
+                var bufs: [1][]u8 = .{buf};
+                return self.stream.read(self.io, &bufs) catch |err| switch (err) {
+                    error.Canceled => error.Canceled,
+                    else => error.ReadFailed,
+                };
+            }
+            var bufs: [1][]u8 = .{&self.read_buf};
+            const n = self.stream.read(self.io, &bufs) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return error.ReadFailed,
+            };
+            if (n == 0) return 0;
+            self.read_start = 0;
+            self.read_end = n;
+        }
+        const n = @min(buf.len, self.read_end - self.read_start);
+        @memcpy(buf[0..n], self.read_buf[self.read_start..][0..n]);
+        self.read_start += n;
+        return n;
     }
 
     fn writeFn(ctx: *anyopaque, data: []const u8) Transport.WriteError!void {
@@ -99,8 +127,9 @@ pub const PlainState = struct {
         self.stream.close(self.io);
     }
 
-    fn hasPendingFn(_: *anyopaque) bool {
-        return false;
+    fn hasPendingFn(ctx: *anyopaque) bool {
+        const self: *PlainState = @ptrCast(@alignCast(ctx));
+        return self.read_start != self.read_end;
     }
 };
 
