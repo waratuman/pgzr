@@ -6,6 +6,146 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **COPY now uses binary format for both `wal_batches` and `events`.**
+  Batch payloads go over the wire at 1x size (no hex) and are streamed
+  straight from the accumulation buffer with no intermediate copy;
+  event rows carry `committed_at` as 8 bytes instead of 29-char text,
+  identity digests as raw bytes instead of hex, and JSONB as plain JSON
+  with no COPY text-escaping layer.
+
+- **Plain TCP reads are buffered (64 KiB).** The protocol layer
+  previously paid poll + header read + body read (~3 syscalls) per WAL
+  message; one refill now serves many messages and `hasPending` skips
+  the poll while data is buffered. Large bodies still read directly
+  into the destination buffer.
+
+  Together: concurrent stress test (100k events, ReleaseFast) ingest
+  ~45% faster (273–291 ms vs 496–528 ms); processing unchanged
+  (server-bound).
+
+- **C ABI handles allocate with `std.heap.smp_allocator`** instead of
+  `page_allocator` (page-granularity, syscall per allocation) — the FFI
+  path makes per-event allocations, so this materially speeds up
+  production Ruby/Python hosts.
+
+- **Hot byte loops in the processor are table-driven/vectorized.** Hex
+  bytea decode of stored batch rows uses a 256-entry table (~0.2 GB/s →
+  ~2.9 GB/s measured); the COPY JSON string escape scan skips clean
+  16-byte blocks with `@Vector` (~1.5 GB/s → ~39 GB/s on clean text).
+  Stress-test processing (100k events, 4 workers, ReleaseFast) improved
+  ~15% (542 ms → ~459 ms).
+
+- **Batch rows are stored via `COPY ... FROM STDIN`.** The ingestor no
+  longer builds a megabyte-scale INSERT statement (hex bytea inlined into
+  SQL the server must lex/parse/plan); it sends one COPY text row.
+  Restart-replay duplicates are detected via SQLSTATE 23505 and ignored,
+  matching the previous `ON CONFLICT DO NOTHING` semantics.
+
+- **Event flushes stream through copy-in mode in ~64 KiB chunks.**
+  `Connection` gains `copyInBegin`/`copyInWrite`/`copyInEnd`/`copyInFail`;
+  peak memory per flush drops from a full concatenated copy of the batch
+  (retained at high-water capacity) to one chunk.
+
+- **Idle processor polls cost one round trip again.** `processOne` probes
+  for pending work with a single indexed `SELECT ... LIMIT 1` before
+  opening the claim transaction (previously BEGIN + claim + COMMIT per
+  empty poll).
+
+- **Truncate events record which tables were truncated:** one `T` event
+  per truncated relation (with its `rel_oid`) instead of a single event
+  with `rel_oid = 0`.
+
+- **Non-transactional logical messages are no longer captured as
+  metadata.** Only `pg_logical_emit_message(true, ...)` (transactional)
+  attaches to a transaction; non-transactional messages were previously
+  mis-attributed to whatever transaction committed next.
+
+### Fixed
+
+- **Long replication commands no longer overflow fixed stack buffers.**
+  `START_REPLICATION` is now built with the allocator (no 4 KB limit on
+  slot name plus options, e.g. long publication lists) and embedded
+  quotes in option names/values are escaped. `simpleQuery`/`queryRows`
+  now use the connection's growable send buffer instead of a fixed 4 KB
+  stack buffer, removing the same overflow one layer down.
+
+- **`Replicator.system_id`/`timeline`/`xlogpos`/`db_name` are now owned
+  copies.** They previously pointed into the connection's receive buffer
+  and became garbage after the next protocol read; they now stay valid
+  for the replicator's lifetime (freed in `deinit`).
+
+- **Malformed stored batch data can no longer panic the processor.**
+  Corrupt bytes decoded from `wal_batches` now surface as decode errors
+  (which park the batch as poison) instead of crashing: negative pgoutput
+  tuple lengths and overflowing truncate relation counts return
+  `InvalidMessage`/`UnexpectedEnd` rather than tripping integer-cast
+  panics; corrupt hex bytea (odd length or invalid digit) is an error
+  instead of silently yielding empty data or a misleading `OutOfMemory`;
+  out-of-range integers in the relations JSONB snapshot are ignored
+  instead of panicking; and a short MD5 auth message fails with
+  `InvalidServerResponse` instead of a slice panic.
+
+- **Interleaved streamed transactions are now handled correctly.** With
+  proto v2+ streaming, segments of concurrently-streaming large
+  transactions interleave in the WAL stream; previously the ingestor's
+  single `in_transaction`/`txn_begin_lsn` and the processor's shared
+  event buffer silently dropped or mis-attributed events (even a single
+  multi-segment stream could lose its earlier partial batches). The
+  ingestor now tracks the set of open transactions — a batch group's
+  `begin_lsn` is fixed when the first transaction opens, and only a
+  close that leaves zero transactions open flushes `complete=true`. The
+  processor buffers streamed events and metadata per top-level xid,
+  adopting them into the flush path at that transaction's
+  `stream_commit`. Streamed messages now expose their embedded (sub)xid,
+  so a subtransaction abort discards exactly its own changes instead of
+  the whole buffer. Adds a pipeline test that commits two concurrently
+  streaming transactions and verifies per-transaction attribution.
+
+- **Transient failures no longer permanently park batches.** A processor
+  failure now parks the claimed batches in `state='error'` only when the
+  failure is a property of the batch itself: pgoutput decode errors,
+  validation errors, or a server error with a non-retryable SQLSTATE.
+  Connection loss, deadlocks, serialization failures, statement timeouts,
+  lock timeouts, and resource exhaustion (SQLSTATE classes 08, 40, 53, 55,
+  57) leave the rows `'pending'` so the next cycle retries them.
+  `Connection` now exposes `lastServerErrorCode()` with the SQLSTATE of the
+  most recent command's server error.
+
+- **Streamed Relation messages corrupted the ingestor's relation cache.**
+  Inside a stream segment (proto v2+), Relation messages carry a leading
+  Int32 xid that the ingestor's cache decode did not skip, so the parse
+  misaligned and binary garbage entered the relations JSONB — the batch
+  INSERT then failed server-side with `invalid byte sequence for encoding
+  "UTF8"`. The ingestor now tracks the open stream segment
+  (StreamStart/StreamStop) and decodes streamed messages with the stream
+  xid, matching the processor's behavior.
+
+### Changed
+
+- **Upgraded to Zig 0.17.** All networking, TLS, randomness, clocks, sleeps,
+  and child processes now go through the `std.Io` interface. Public init
+  functions take an `Io` parameter: `Connection.connect(allocator, io, config)`,
+  `Replicator.init(allocator, io, config)`, `Ingestor.init(allocator, io,
+  config)`, `Processor.init(allocator, io, config)`. The C ABI is unchanged
+  for callers — each handle creates its own `std.Io.Threaded` instance
+  internally. Transport read/write error sets collapse to
+  `error{ConnectionClosed, ReadFailed, Canceled}` / `error{WriteFailed,
+  Canceled}`. TLS verify-full certificate loading is handled by
+  `std.crypto.tls.Client` itself and still fails closed
+  (`error.TlsCertificateNotVerified`) when no CA bundle is available.
+
+- **Fixed TLS `verify_full` silently downgrading to no verification** when
+  the system CA bundle could not be loaded (pre-0.17 code path).
+
+- **Processor error paths no longer leak state across batches.** Claim and
+  COMMIT failures reset all per-batch state (pending data, batch ids,
+  buffered events, metadata chunks, transaction state); a COMMIT failure no
+  longer parks intact batches in `'error'`. `Begin` clears any stale
+  buffered events.
+
+- **C ABI handles own copies of all caller strings.** The FFI host may free
+  its config struct and strings as soon as `pgzr_*_new` returns.
+
 - **Events are inserted via `COPY ... FROM STDIN`** instead of multi-row
   INSERT statements. The server no longer lexes/parses/plans megabyte-scale
   SQL per flush, and the client emits COPY text format directly (no SQL

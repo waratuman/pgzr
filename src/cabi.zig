@@ -5,22 +5,11 @@ const types = @import("types.zig");
 const Lsn = @import("lsn.zig").Lsn;
 const query_mod = @import("query.zig");
 
-// ── std.Options ───────────────────────────────────────────────────────
-//
-// When loaded via dlopen (e.g. by a Ruby extension), libpgzr's TLS slot
-// is not bootstrapped for threads that predate the load. Zig's default
-// CSPRNG lazily initializes a per-thread context with mmap+madvise on
-// first use; the EINVAL probe at the top of that path triggers an error
-// return that needs to update the per-thread error-return-trace, which
-// is itself stored in TLS — and crashes on threads where libpgzr's TLS
-// was never allocated. Setting `crypto_always_getrandom` makes
-// std.crypto.random go straight to getrandom(2), skipping the
-// thread-local setup entirely. This costs one syscall per call (we use
-// it sparingly, only inside TLS handshakes), and removes a class of
-// dlopen+threads bugs.
-pub const std_options: std.Options = .{
-    .crypto_always_getrandom = true,
-};
+// Randomness note: pre-0.17 this file set `crypto_always_getrandom` to
+// avoid a dlopen+threads crash in std's threadlocal CSPRNG. Since the
+// 0.17 upgrade all randomness goes through the per-handle `Io.Threaded`
+// instance instead of a global threadlocal CSPRNG, so no std.Options
+// override is needed.
 
 // ── ABI version ───────────────────────────────────────────────────────
 //
@@ -73,7 +62,7 @@ const posix = std.posix;
 var active_ingestor = std.atomic.Value(?*Ingestor).init(null);
 var active_processor = std.atomic.Value(?*Processor).init(null);
 
-fn signalHandler(_: c_int) callconv(.c) void {
+fn signalHandler(_: posix.SIG) callconv(.c) void {
     if (active_ingestor.load(.monotonic)) |ing| ing.stop();
     if (active_processor.load(.monotonic)) |proc| proc.stop();
 }
@@ -87,26 +76,31 @@ fn installSignalHandlers(
         .mask = posix.sigemptyset(),
         .flags = 0,
     };
-    posix.sigaction(posix.SIG.INT, &sa, prev_int);
-    posix.sigaction(posix.SIG.TERM, &sa, prev_term);
+    posix.sigaction(.INT, &sa, prev_int);
+    posix.sigaction(.TERM, &sa, prev_term);
 }
 
 fn restoreSignalHandlers(
     prev_int: *const posix.Sigaction,
     prev_term: *const posix.Sigaction,
 ) void {
-    posix.sigaction(posix.SIG.INT, prev_int, null);
-    posix.sigaction(posix.SIG.TERM, prev_term, null);
+    posix.sigaction(.INT, prev_int, null);
+    posix.sigaction(.TERM, prev_term, null);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
-fn sliceFromCStr(ptr: ?[*:0]const u8) []const u8 {
+/// Copy a caller-provided C string into `aa`-owned memory (empty slice for
+/// null). Everything handed to Ingestor/Processor configs must be copied:
+/// the FFI host (Ruby, Python) is free to garbage-collect its config struct
+/// and strings as soon as pgzr_*_new returns.
+fn dupeCStr(aa: std.mem.Allocator, ptr: ?[*:0]const u8) std.mem.Allocator.Error![]const u8 {
     const p = ptr orelse return "";
-    return std.mem.span(p);
+    return aa.dupe(u8, std.mem.span(p));
 }
 
 fn buildConnConfig(
+    aa: std.mem.Allocator,
     host: ?[*:0]const u8,
     port: u16,
     user: ?[*:0]const u8,
@@ -114,14 +108,14 @@ fn buildConnConfig(
     database: ?[*:0]const u8,
     socket_path: ?[*:0]const u8,
     tls_mode: u8,
-) types.ConnConfig {
+) std.mem.Allocator.Error!types.ConnConfig {
     return .{
-        .host = sliceFromCStr(host),
+        .host = try dupeCStr(aa, host),
         .port = port,
-        .user = sliceFromCStr(user),
-        .password = sliceFromCStr(password),
-        .database = sliceFromCStr(database),
-        .socket_path = if (socket_path) |p| std.mem.span(p) else null,
+        .user = try dupeCStr(aa, user),
+        .password = try dupeCStr(aa, password),
+        .database = try dupeCStr(aa, database),
+        .socket_path = if (socket_path != null) try dupeCStr(aa, socket_path) else null,
         .tls = switch (tls_mode) {
             1 => .prefer,
             2 => .require,
@@ -179,10 +173,40 @@ pub const PgzrIngestConfig = extern struct {
     on_flush_context: ?*anyopaque,
 };
 
-export fn pgzr_ingestor_new(config: *const PgzrIngestConfig) ?*Ingestor {
-    const allocator = std.heap.page_allocator;
+/// Opaque handle returned to C callers. The arena owns copies of every
+/// caller-provided string, the replication options array, and the flush
+/// bridge, so their lifetime is tied to the handle — the caller's config
+/// struct and strings may be freed as soon as pgzr_ingestor_new returns.
+const IngestorHandle = struct {
+    ingestor: Ingestor,
+    arena: std.heap.ArenaAllocator,
+    io_threaded: std.Io.Threaded,
+};
 
-    const source_conn = buildConnConfig(
+export fn pgzr_ingestor_new(config: *const PgzrIngestConfig) ?*IngestorHandle {
+    return ingestorNew(config) catch |err| {
+        setError("ingestor init failed: {s}", .{@errorName(err)});
+        return null;
+    };
+}
+
+fn ingestorNew(config: *const PgzrIngestConfig) !*IngestorHandle {
+    // smp_allocator: thread-safe general-purpose allocator. page_allocator
+    // (used previously) is page-granularity with a syscall per allocation —
+    // ruinous for the per-event allocations the processor makes.
+    const allocator = std.heap.smp_allocator;
+
+    const handle = try allocator.create(IngestorHandle);
+    errdefer allocator.destroy(handle);
+    handle.arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer handle.arena.deinit();
+    handle.io_threaded = .init(allocator, .{});
+    errdefer handle.io_threaded.deinit();
+    const io = handle.io_threaded.io();
+    const aa = handle.arena.allocator();
+
+    const source_conn = try buildConnConfig(
+        aa,
         config.source_host,
         config.source_port,
         config.source_user,
@@ -192,7 +216,8 @@ export fn pgzr_ingestor_new(config: *const PgzrIngestConfig) ?*Ingestor {
         config.source_tls_mode,
     );
 
-    const dest_conn = buildConnConfig(
+    const dest_conn = try buildConnConfig(
+        aa,
         config.dest_host,
         config.dest_port,
         config.dest_user,
@@ -202,11 +227,13 @@ export fn pgzr_ingestor_new(config: *const PgzrIngestConfig) ?*Ingestor {
         config.dest_tls_mode,
     );
 
-    const proto_ver = sliceFromCStr(config.proto_version);
-    const pub_names = sliceFromCStr(config.publication_names);
+    const proto_ver = try dupeCStr(aa, config.proto_version);
+    const pub_names = try dupeCStr(aa, config.publication_names);
 
-    // Build options array (up to 3 entries)
-    var options: [3][2][]const u8 = undefined;
+    // Build options array (up to 3 entries). Arena-allocated: the slice is
+    // retained by the Replicator config for the life of the handle (e.g.
+    // startReplication on reconnect), so it must not live on this stack frame.
+    const options = try aa.alloc([2][]const u8, 3);
     var opt_count: usize = 0;
 
     if (proto_ver.len > 0) {
@@ -225,48 +252,33 @@ export fn pgzr_ingestor_new(config: *const PgzrIngestConfig) ?*Ingestor {
     // Set up on_flush callback bridge if provided
     var on_flush: ?types.OnFlushFn = null;
     var on_flush_context: ?*anyopaque = null;
-    var flush_bridge: ?*CFlushBridge = null;
 
     if (config.on_flush) |c_cb| {
-        const bridge = allocator.create(CFlushBridge) catch {
-            setErrorStr("out of memory");
-            return null;
-        };
+        const bridge = try aa.create(CFlushBridge);
         bridge.* = .{ .c_callback = c_cb, .c_context = config.on_flush_context };
         on_flush = CFlushBridge.zigCallback;
         on_flush_context = @ptrCast(bridge);
-        flush_bridge = bridge;
     }
 
     const ingest_config = types.IngestConfig{
         .source = .{
             .conn = source_conn,
-            .slot_name = sliceFromCStr(config.slot_name),
+            .slot_name = try dupeCStr(aa, config.slot_name),
             .options = options[0..opt_count],
         },
         .dest = dest_conn,
-        .source_id = sliceFromCStr(config.source_id),
+        .source_id = try dupeCStr(aa, config.source_id),
         .max_batch_size = if (config.max_batch_size > 0) config.max_batch_size else 4 * 1024 * 1024,
         .on_flush = on_flush,
         .on_flush_context = on_flush_context,
     };
 
-    const ingestor = allocator.create(Ingestor) catch {
-        setErrorStr("out of memory");
-        return null;
-    };
-
-    ingestor.* = Ingestor.init(allocator, ingest_config) catch |err| {
-        setError("ingestor init failed: {s}", .{@errorName(err)});
-        allocator.destroy(ingestor);
-        if (flush_bridge) |b| allocator.destroy(b);
-        return null;
-    };
-
-    return ingestor;
+    handle.ingestor = try Ingestor.init(allocator, io, ingest_config);
+    return handle;
 }
 
-export fn pgzr_ingestor_run(ingestor: *Ingestor) c_int {
+export fn pgzr_ingestor_run(handle: *IngestorHandle) c_int {
+    const ingestor = &handle.ingestor;
     active_ingestor.store(ingestor, .release);
     var prev_int: posix.Sigaction = undefined;
     var prev_term: posix.Sigaction = undefined;
@@ -285,20 +297,15 @@ export fn pgzr_ingestor_run(ingestor: *Ingestor) c_int {
     return 0;
 }
 
-export fn pgzr_ingestor_stop(ingestor: *Ingestor) void {
-    ingestor.stop();
+export fn pgzr_ingestor_stop(handle: *IngestorHandle) void {
+    handle.ingestor.stop();
 }
 
-export fn pgzr_ingestor_free(ingestor: *Ingestor) void {
-    // Free the C flush bridge if one was allocated
-    if (ingestor.config.on_flush != null) {
-        if (ingestor.config.on_flush_context) |ctx| {
-            const bridge: *CFlushBridge = @ptrCast(@alignCast(ctx));
-            std.heap.page_allocator.destroy(bridge);
-        }
-    }
-    ingestor.deinit();
-    std.heap.page_allocator.destroy(ingestor);
+export fn pgzr_ingestor_free(handle: *IngestorHandle) void {
+    handle.ingestor.deinit();
+    handle.io_threaded.deinit();
+    handle.arena.deinit();
+    std.heap.smp_allocator.destroy(handle);
 }
 
 // ── Processor ─────────────────────────────────────────────────────────
@@ -316,10 +323,37 @@ pub const PgzrProcessorConfig = extern struct {
     metadata_table: ?[*:0]const u8,
 };
 
-export fn pgzr_processor_new(config: *const PgzrProcessorConfig) ?*Processor {
-    const allocator = std.heap.page_allocator;
+/// Opaque handle returned to C callers. The arena owns copies of every
+/// caller-provided string (notably metadata_message_prefix/metadata_table,
+/// which are dereferenced on every batch during run), so the caller's
+/// config struct and strings may be freed once pgzr_processor_new returns.
+const ProcessorHandle = struct {
+    processor: Processor,
+    arena: std.heap.ArenaAllocator,
+    io_threaded: std.Io.Threaded,
+};
 
-    var dest_conn = buildConnConfig(
+export fn pgzr_processor_new(config: *const PgzrProcessorConfig) ?*ProcessorHandle {
+    return processorNew(config) catch |err| {
+        setError("processor init failed: {s}", .{@errorName(err)});
+        return null;
+    };
+}
+
+fn processorNew(config: *const PgzrProcessorConfig) !*ProcessorHandle {
+    const allocator = std.heap.smp_allocator;
+
+    const handle = try allocator.create(ProcessorHandle);
+    errdefer allocator.destroy(handle);
+    handle.arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer handle.arena.deinit();
+    handle.io_threaded = .init(allocator, .{});
+    errdefer handle.io_threaded.deinit();
+    const io = handle.io_threaded.io();
+    const aa = handle.arena.allocator();
+
+    var dest_conn = try buildConnConfig(
+        aa,
         config.dest_host,
         config.dest_port,
         config.dest_user,
@@ -330,8 +364,8 @@ export fn pgzr_processor_new(config: *const PgzrProcessorConfig) ?*Processor {
     );
     dest_conn.replication = false;
 
-    const msg_prefix = sliceFromCStr(config.metadata_message_prefix);
-    const meta_table = sliceFromCStr(config.metadata_table);
+    const msg_prefix = try dupeCStr(aa, config.metadata_message_prefix);
+    const meta_table = try dupeCStr(aa, config.metadata_table);
 
     const processor_config = types.ProcessorConfig{
         .dest = dest_conn,
@@ -340,21 +374,12 @@ export fn pgzr_processor_new(config: *const PgzrProcessorConfig) ?*Processor {
         .metadata_table = if (meta_table.len > 0) meta_table else null,
     };
 
-    const processor = allocator.create(Processor) catch {
-        setErrorStr("out of memory");
-        return null;
-    };
-
-    processor.* = Processor.init(allocator, processor_config) catch |err| {
-        setError("processor init failed: {s}", .{@errorName(err)});
-        allocator.destroy(processor);
-        return null;
-    };
-
-    return processor;
+    handle.processor = try Processor.init(allocator, io, processor_config);
+    return handle;
 }
 
-export fn pgzr_processor_run(processor: *Processor) c_int {
+export fn pgzr_processor_run(handle: *ProcessorHandle) c_int {
+    const processor = &handle.processor;
     active_processor.store(processor, .release);
     var prev_int: posix.Sigaction = undefined;
     var prev_term: posix.Sigaction = undefined;
@@ -373,19 +398,21 @@ export fn pgzr_processor_run(processor: *Processor) c_int {
     return 0;
 }
 
-export fn pgzr_processor_process_one(processor: *Processor) c_int {
-    const processed = processor.processOne() catch |err| {
+export fn pgzr_processor_process_one(handle: *ProcessorHandle) c_int {
+    const processed = handle.processor.processOne() catch |err| {
         setError("processor process_one failed: {s}", .{@errorName(err)});
         return -1;
     };
     return if (processed) 1 else 0;
 }
 
-export fn pgzr_processor_stop(processor: *Processor) void {
-    processor.stop();
+export fn pgzr_processor_stop(handle: *ProcessorHandle) void {
+    handle.processor.stop();
 }
 
-export fn pgzr_processor_free(processor: *Processor) void {
-    processor.deinit();
-    std.heap.page_allocator.destroy(processor);
+export fn pgzr_processor_free(handle: *ProcessorHandle) void {
+    handle.processor.deinit();
+    handle.io_threaded.deinit();
+    handle.arena.deinit();
+    std.heap.smp_allocator.destroy(handle);
 }

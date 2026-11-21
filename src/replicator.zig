@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const Connection = @import("connection.zig").Connection;
 const protocol = @import("protocol.zig");
 const Lsn = @import("lsn.zig").Lsn;
@@ -12,6 +13,7 @@ pub const Replicator = struct {
     conn: Connection,
     config: types.ReplicatorConfig,
     allocator: std.mem.Allocator,
+    io: Io,
 
     last_server_lsn: Lsn = Lsn.zero,
     last_received_lsn: Lsn = Lsn.zero,
@@ -34,15 +36,17 @@ pub const Replicator = struct {
         SystemIdMismatch,
     };
 
-    pub fn init(allocator: std.mem.Allocator, config: types.ReplicatorConfig) InitError!Replicator {
-        var conn = try Connection.connect(allocator, config.conn);
+    pub fn init(allocator: std.mem.Allocator, io: Io, config: types.ReplicatorConfig) InitError!Replicator {
+        var conn = try Connection.connect(allocator, io, config.conn);
         errdefer conn.close();
 
         var repl = Replicator{
             .conn = conn,
             .config = config,
             .allocator = allocator,
+            .io = io,
         };
+        errdefer repl.freeIdentity();
 
         try repl.identifySystem();
         try repl.startReplication();
@@ -59,11 +63,14 @@ pub const Replicator = struct {
         const result = try self.conn.simpleQuery("IDENTIFY_SYSTEM");
         if (result.column_count < 3) return error.ProtocolError;
 
-        self.system_id = result.columns[0].data;
-        self.timeline = result.columns[1].data;
-        self.xlogpos = result.columns[2].data;
+        // Copy identity fields into owned memory: the query result borrows
+        // the connection's receive buffer, which the next protocol read
+        // overwrites.
+        try self.setIdentityField(&self.system_id, result.columns[0].data);
+        try self.setIdentityField(&self.timeline, result.columns[1].data);
+        try self.setIdentityField(&self.xlogpos, result.columns[2].data);
         if (result.column_count > 3 and !result.columns[3].is_null) {
-            self.db_name = result.columns[3].data;
+            try self.setIdentityField(&self.db_name, result.columns[3].data);
         }
 
         // Verify database name matches if server reported one
@@ -98,47 +105,58 @@ pub const Replicator = struct {
     }
 
     fn startReplication(self: *Replicator) InitError!void {
-        var query_buf: [4096]u8 = undefined;
         const start_lsn = self.config.start_position orelse Lsn.zero;
 
-        const query = std.fmt.bufPrint(&query_buf, "START_REPLICATION SLOT {s} LOGICAL {f}", .{
-            self.config.slot_name,
-            start_lsn,
-        }) catch return error.ProtocolError;
+        var query: std.ArrayListUnmanaged(u8) = .empty;
+        defer query.deinit(self.allocator);
 
-        var pos = query.len;
+        var lsn_buf: [20]u8 = undefined;
+        const lsn_text = std.fmt.bufPrint(&lsn_buf, "{f}", .{start_lsn}) catch unreachable;
+
+        try query.appendSlice(self.allocator, "START_REPLICATION SLOT ");
+        try query.appendSlice(self.allocator, self.config.slot_name);
+        try query.appendSlice(self.allocator, " LOGICAL ");
+        try query.appendSlice(self.allocator, lsn_text);
 
         if (self.config.options.len > 0) {
-            query_buf[pos] = ' ';
-            pos += 1;
-            query_buf[pos] = '(';
-            pos += 1;
+            try query.appendSlice(self.allocator, " (");
             for (self.config.options, 0..) |opt, i| {
-                if (i > 0) {
-                    @memcpy(query_buf[pos..][0..2], ", ");
-                    pos += 2;
+                if (i > 0) try query.appendSlice(self.allocator, ", ");
+                // Option name as a quoted identifier, value as a string
+                // literal; double embedded quotes in each.
+                try query.append(self.allocator, '"');
+                for (opt[0]) |ch| {
+                    if (ch == '"') try query.append(self.allocator, '"');
+                    try query.append(self.allocator, ch);
                 }
-                query_buf[pos] = '"';
-                pos += 1;
-                @memcpy(query_buf[pos..][0..opt[0].len], opt[0]);
-                pos += opt[0].len;
-                query_buf[pos] = '"';
-                pos += 1;
-                query_buf[pos] = ' ';
-                pos += 1;
-                query_buf[pos] = '\'';
-                pos += 1;
-                @memcpy(query_buf[pos..][0..opt[1].len], opt[1]);
-                pos += opt[1].len;
-                query_buf[pos] = '\'';
-                pos += 1;
+                try query.appendSlice(self.allocator, "\" '");
+                for (opt[1]) |ch| {
+                    if (ch == '\'') try query.append(self.allocator, '\'');
+                    try query.append(self.allocator, ch);
+                }
+                try query.append(self.allocator, '\'');
             }
-            query_buf[pos] = ')';
-            pos += 1;
+            try query.append(self.allocator, ')');
         }
 
-        const result = try self.conn.simpleQuery(query_buf[0..pos]);
+        const result = try self.conn.simpleQuery(query.items);
         if (!result.in_copy_mode) return error.ProtocolError;
+    }
+
+    fn setIdentityField(self: *Replicator, field: *?[]const u8, value: []const u8) !void {
+        if (field.*) |old| self.allocator.free(old);
+        field.* = try self.allocator.dupe(u8, value);
+    }
+
+    fn freeIdentity(self: *Replicator) void {
+        if (self.system_id) |v| self.allocator.free(v);
+        if (self.timeline) |v| self.allocator.free(v);
+        if (self.xlogpos) |v| self.allocator.free(v);
+        if (self.db_name) |v| self.allocator.free(v);
+        self.system_id = null;
+        self.timeline = null;
+        self.xlogpos = null;
+        self.db_name = null;
     }
 
     pub const NextError = protocol.ReadError || protocol.ReadBodyError || Transport.WriteError || error{
@@ -182,7 +200,7 @@ pub const Replicator = struct {
             // Skip poll if the transport (TLS) has buffered data ready to read.
             const has_pending = self.conn.transport.hasPending();
             if (!has_pending) {
-                const now_ms = std.time.milliTimestamp();
+                const now_ms = Io.Clock.awake.now(self.io).toMilliseconds();
                 const interval: i64 = @intCast(self.config.status_interval_ms);
                 const elapsed = now_ms - self.last_status_time_ms;
                 const remaining = @max(100, interval - elapsed);
@@ -260,10 +278,8 @@ pub const Replicator = struct {
     fn isConnectionError(err: NextError) bool {
         return switch (err) {
             error.ConnectionClosed,
-            error.ConnectionResetByPeer,
-            error.BrokenPipe,
+            error.ReadFailed,
             error.WriteFailed,
-            error.TlsConnectionTruncated,
             => true,
             else => false,
         };
@@ -287,10 +303,10 @@ pub const Replicator = struct {
             }
 
             std.log.info("Reconnecting (attempt {d})...", .{attempts});
-            std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+            self.io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
 
             // Try to establish a new connection
-            var conn = Connection.connect(self.allocator, self.config.conn) catch {
+            var conn = Connection.connect(self.allocator, self.io, self.config.conn) catch {
                 delay_ms = @min(delay_ms * 2, self.config.max_reconnect_delay_ms);
                 continue;
             };
@@ -399,7 +415,7 @@ pub const Replicator = struct {
     }
 
     fn maybeSendStatus(self: *Replicator) NextError!void {
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = Io.Clock.awake.now(self.io).toMilliseconds();
         const interval: i64 = @intCast(self.config.status_interval_ms);
         if (now_ms - self.last_status_time_ms >= interval) {
             try self.sendStatus();
@@ -412,7 +428,7 @@ pub const Replicator = struct {
             self.last_processed_lsn,
             self.last_server_lsn,
         });
-        self.last_status_time_ms = std.time.milliTimestamp();
+        self.last_status_time_ms = Io.Clock.awake.now(self.io).toMilliseconds();
 
         const lsn_location = if (self.last_processed_lsn.value == 0)
             Lsn.zero
@@ -420,7 +436,7 @@ pub const Replicator = struct {
             self.last_processed_lsn.inc();
 
         // Convert current time to PG epoch (microseconds since 2000-01-01)
-        const now_us = std.time.microTimestamp();
+        const now_us = Io.Clock.real.now(self.io).toMicroseconds();
         const pg_timestamp = now_us - PG_EPOCH_OFFSET_US;
 
         var buf: [128]u8 = undefined;
@@ -436,6 +452,7 @@ pub const Replicator = struct {
     }
 
     pub fn deinit(self: *Replicator) void {
+        self.freeIdentity();
         self.conn.close();
     }
 };

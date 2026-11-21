@@ -4,50 +4,48 @@ const pgzr = @import("pgzr");
 const DB_NAME = "pgzr_integ_test";
 const SLOT_NAME = "pgzr_integ_slot";
 
+/// Io instance for the whole test run, set at the top of main.
+var io: std.Io = undefined;
+
+fn getenv(name: [*:0]const u8) ?[]const u8 {
+    const p = std.c.getenv(name) orelse return null;
+    return std.mem.span(p);
+}
+
+fn sleepMs(ms: i64) void {
+    io.sleep(.fromMilliseconds(ms), .awake) catch {};
+}
+
 fn getUser() []const u8 {
-    return std.posix.getenv("PGUSER") orelse std.posix.getenv("USER") orelse "postgres";
+    return getenv("PGUSER") orelse getenv("USER") orelse "postgres";
 }
 
 fn runPsql(allocator: std.mem.Allocator, db: []const u8, sql: []const u8) !void {
-    var child = std.process.Child.init(
-        &.{ "psql", "-d", db, "-c", sql },
-        allocator,
-    );
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    _ = try child.spawnAndWait();
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "psql", "-d", db, "-c", sql },
+    });
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
 }
 
 /// Run a psql command and capture stdout output.
 fn runPsqlCapture(allocator: std.mem.Allocator, db: []const u8, sql: []const u8) ![]u8 {
-    var child = std.process.Child.init(
-        &.{ "psql", "-d", db, "-t", "-A", "-c", sql },
-        allocator,
-    );
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    _ = try child.spawn();
+    const run_result = try std.process.run(allocator, io, .{
+        .argv = &.{ "psql", "-d", db, "-t", "-A", "-c", sql },
+    });
+    defer allocator.free(run_result.stdout);
+    allocator.free(run_result.stderr);
 
-    var stdout_buf: [256]u8 = undefined;
-    var total: usize = 0;
-    while (total < stdout_buf.len) {
-        const n = child.stdout.?.read(stdout_buf[total..]) catch break;
-        if (n == 0) break;
-        total += n;
-    }
-    _ = try child.wait();
-
-    // Trim trailing whitespace/newline
-    var end = total;
-    while (end > 0 and (stdout_buf[end - 1] == '\n' or stdout_buf[end - 1] == '\r' or stdout_buf[end - 1] == ' ')) {
-        end -= 1;
-    }
-
-    const result = try allocator.alloc(u8, end);
-    @memcpy(result, stdout_buf[0..end]);
+    const trimmed = std.mem.trimEnd(u8, run_result.stdout, "\n\r ");
+    const result = try allocator.alloc(u8, trimmed.len);
+    @memcpy(result, trimmed);
     return result;
+}
+
+fn runCmd(allocator: std.mem.Allocator, args: []const []const u8) void {
+    const result = std.process.run(allocator, io, .{ .argv = args }) catch return;
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
 }
 
 /// Get the current WAL insert LSN from PostgreSQL.
@@ -66,14 +64,7 @@ fn getCurrentWalLsn(allocator: std.mem.Allocator) !pgzr.Lsn {
 
 fn setup(allocator: std.mem.Allocator) !void {
     // Create database (ignore errors if it already exists)
-    var child = std.process.Child.init(
-        &.{ "createdb", DB_NAME },
-        allocator,
-    );
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    _ = try child.spawnAndWait();
+    runCmd(allocator, &.{ "createdb", DB_NAME });
 
     // Create tables before the slot so DDL doesn't appear in the stream
     runPsql(allocator, DB_NAME, "CREATE TABLE IF NOT EXISTS integ_test (id serial PRIMARY KEY, val text)") catch {};
@@ -89,21 +80,14 @@ fn setup(allocator: std.mem.Allocator) !void {
 
 fn teardown(allocator: std.mem.Allocator) void {
     runPsql(allocator, DB_NAME, "SELECT pg_drop_replication_slot('" ++ SLOT_NAME ++ "')") catch {};
-    var child = std.process.Child.init(
-        &.{ "dropdb", "--if-exists", "--force", DB_NAME },
-        allocator,
-    );
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    _ = child.spawnAndWait() catch {};
+    runCmd(allocator, &.{ "dropdb", "--if-exists", "--force", DB_NAME });
 }
 
 /// Re-create the slot (drop + create) and truncate test tables.
 /// Useful between tests that consume the slot and need a fresh starting point.
 fn resetSlot(allocator: std.mem.Allocator) void {
     // Brief pause to allow PostgreSQL to fully release the slot
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    sleepMs(200);
     runPsql(allocator, DB_NAME, "SELECT pg_drop_replication_slot('" ++ SLOT_NAME ++ "')") catch {};
     runPsql(allocator, DB_NAME, "TRUNCATE teas, integ_test") catch {};
     runPsql(allocator, DB_NAME, "SELECT pg_create_logical_replication_slot('" ++ SLOT_NAME ++ "', 'test_decoding')") catch {};
@@ -136,7 +120,7 @@ fn testBasicReplication(allocator: std.mem.Allocator) !void {
         \\INSERT INTO teas VALUES ('煎茶'), ('蕎麦茶'), ('魔茶')
     );
 
-    var repl = pgzr.Replicator.init(allocator, .{
+    var repl = pgzr.Replicator.init(allocator, io, .{
         .conn = connConfig(),
         .slot_name = SLOT_NAME,
         .options = &.{
@@ -246,7 +230,7 @@ fn testStartPosition(allocator: std.mem.Allocator) !void {
         return err;
     };
 
-    var repl = pgzr.Replicator.init(allocator, .{
+    var repl = pgzr.Replicator.init(allocator, io, .{
         .conn = connConfig(),
         .slot_name = SLOT_NAME,
         .start_position = startpos,
@@ -354,7 +338,7 @@ fn testEndPosition(allocator: std.mem.Allocator) !void {
     // Insert second batch (should be excluded)
     try runPsql(allocator, DB_NAME, "INSERT INTO teas (kind) VALUES ('ハーブティー')");
 
-    var repl = pgzr.Replicator.init(allocator, .{
+    var repl = pgzr.Replicator.init(allocator, io, .{
         .conn = connConfig(),
         .slot_name = SLOT_NAME,
         .end_position = endpos,
@@ -439,7 +423,7 @@ fn testEndPosition(allocator: std.mem.Allocator) !void {
 fn testLastServerLsn(allocator: std.mem.Allocator) !void {
     std.debug.print("  Test: last_server_lsn... ", .{});
 
-    var repl = pgzr.Replicator.init(allocator, .{
+    var repl = pgzr.Replicator.init(allocator, io, .{
         .conn = connConfig(),
         .slot_name = SLOT_NAME,
         .options = &.{
@@ -500,7 +484,7 @@ fn testLastServerLsn(allocator: std.mem.Allocator) !void {
 fn testTimelineMismatch(allocator: std.mem.Allocator) !void {
     std.debug.print("  Test: timeline mismatch... ", .{});
 
-    const result = pgzr.Replicator.init(allocator, .{
+    const result = pgzr.Replicator.init(allocator, io, .{
         .conn = connConfig(),
         .slot_name = SLOT_NAME,
         .expected_timeline = 2, // Server is timeline 1
@@ -530,7 +514,7 @@ fn testTimelineMismatch(allocator: std.mem.Allocator) !void {
 fn testSystemIdMismatch(allocator: std.mem.Allocator) !void {
     std.debug.print("  Test: systemid mismatch... ", .{});
 
-    const result = pgzr.Replicator.init(allocator, .{
+    const result = pgzr.Replicator.init(allocator, io, .{
         .conn = connConfig(),
         .slot_name = SLOT_NAME,
         .expected_systemid = "2", // Bogus system ID
@@ -562,7 +546,7 @@ fn testStartPositionFormats(allocator: std.mem.Allocator) !void {
 
     // Test with integer value 2
     {
-        var repl = pgzr.Replicator.init(allocator, .{
+        var repl = pgzr.Replicator.init(allocator, io, .{
             .conn = connConfig(),
             .slot_name = SLOT_NAME,
             .start_position = pgzr.Lsn{ .value = 2 },
@@ -578,7 +562,7 @@ fn testStartPositionFormats(allocator: std.mem.Allocator) !void {
 
     // Test with zero
     {
-        var repl = pgzr.Replicator.init(allocator, .{
+        var repl = pgzr.Replicator.init(allocator, io, .{
             .conn = connConfig(),
             .slot_name = SLOT_NAME,
             .start_position = pgzr.Lsn.zero,
@@ -594,7 +578,7 @@ fn testStartPositionFormats(allocator: std.mem.Allocator) !void {
 
     // Test with max value (FFFFFFFF/FFFFFFFF)
     {
-        var repl = pgzr.Replicator.init(allocator, .{
+        var repl = pgzr.Replicator.init(allocator, io, .{
             .conn = connConfig(),
             .slot_name = SLOT_NAME,
             .start_position = pgzr.Lsn{ .value = std.math.maxInt(u64) },
@@ -620,7 +604,7 @@ fn testFeedback(allocator: std.mem.Allocator) !void {
     // Insert data first
     try runPsql(allocator, DB_NAME, "INSERT INTO teas (kind) VALUES ('煎茶')");
 
-    var repl = pgzr.Replicator.init(allocator, .{
+    var repl = pgzr.Replicator.init(allocator, io, .{
         .conn = connConfig(),
         .slot_name = SLOT_NAME,
         .status_interval_ms = 100, // Short interval to trigger feedback quickly
@@ -669,7 +653,7 @@ fn testStop(allocator: std.mem.Allocator) !void {
 
     try runPsql(allocator, DB_NAME, "INSERT INTO teas (kind) VALUES ('煎茶')");
 
-    var repl = pgzr.Replicator.init(allocator, .{
+    var repl = pgzr.Replicator.init(allocator, io, .{
         .conn = connConfig(),
         .slot_name = SLOT_NAME,
         .options = &.{
@@ -732,7 +716,7 @@ fn testReplicateAsync(allocator: std.mem.Allocator) !void {
 
     try runPsql(allocator, DB_NAME, "INSERT INTO teas (kind) VALUES ('煎茶')");
 
-    var repl = pgzr.Replicator.init(allocator, .{
+    var repl = pgzr.Replicator.init(allocator, io, .{
         .conn = connConfig(),
         .slot_name = SLOT_NAME,
         .options = &.{
@@ -767,7 +751,7 @@ fn testReplicateAsync(allocator: std.mem.Allocator) !void {
     };
 
     // Wait a bit for thread to start processing
-    std.Thread.sleep(500 * std.time.ns_per_ms);
+    sleepMs(500);
 
     // Request stop
     repl.stop();
@@ -797,7 +781,7 @@ fn testTlsPrefer(allocator: std.mem.Allocator) !void {
     config.tls = .prefer;
 
     // prefer mode should always succeed: TLS if server supports it, plain otherwise
-    var repl = pgzr.Replicator.init(allocator, .{
+    var repl = pgzr.Replicator.init(allocator, io, .{
         .conn = config,
         .slot_name = SLOT_NAME,
         .options = &.{
@@ -830,7 +814,7 @@ fn testTlsRequire(allocator: std.mem.Allocator) !void {
     var config = connConfig();
     config.tls = .require;
 
-    const result = pgzr.Replicator.init(allocator, .{
+    const result = pgzr.Replicator.init(allocator, io, .{
         .conn = config,
         .slot_name = SLOT_NAME,
         .options = &.{
@@ -869,15 +853,9 @@ fn testTlsRequire(allocator: std.mem.Allocator) !void {
 // =========================================================================
 // Main
 // =========================================================================
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        if (gpa.deinit() == .leak) {
-            std.debug.print("\nMemory leak detected!\n", .{});
-            std.process.exit(1);
-        }
-    }
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    io = init.io;
 
     std.debug.print("PGZR Integration Tests\n", .{});
     std.debug.print("======================\n", .{});

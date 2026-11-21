@@ -1,12 +1,11 @@
 const std = @import("std");
 const pgzr = @import("pgzr");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    var repl = pgzr.Replicator.init(allocator, .{
+    var repl = pgzr.Replicator.init(allocator, io, .{
         .conn = .{
             .host = "127.0.0.1",
             .port = 5432,

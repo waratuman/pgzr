@@ -21,6 +21,7 @@ pub const MSG_COPY_BOTH: u8 = 'W';
 pub const MSG_COPY_IN: u8 = 'G';
 pub const MSG_COPY_DATA: u8 = 'd';
 pub const MSG_COPY_DONE: u8 = 'c';
+pub const MSG_COPY_FAIL: u8 = 'f';
 
 // Auth subtypes
 pub const AUTH_OK: u32 = 0;

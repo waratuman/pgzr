@@ -1,19 +1,23 @@
 const std = @import("std");
 const pgzr = @import("pgzr");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+fn getenv(name: [*:0]const u8) ?[]const u8 {
+    const p = std.c.getenv(name) orelse return null;
+    return std.mem.span(p);
+}
 
-    const user = std.posix.getenv("PGUSER") orelse std.posix.getenv("USER") orelse "postgres";
-    const source_db = std.posix.getenv("SOURCE_DB") orelse "pgzr_source";
-    const dest_db = std.posix.getenv("DEST_DB") orelse "pgzr_dest";
-    const slot_name = std.posix.getenv("SLOT_NAME") orelse "pgzr_ingest_slot";
-    const source_id = std.posix.getenv("SOURCE_ID") orelse "00000000-0000-0000-0000-000000000001";
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+
+    const user = getenv("PGUSER") orelse getenv("USER") orelse "postgres";
+    const source_db = getenv("SOURCE_DB") orelse "pgzr_source";
+    const dest_db = getenv("DEST_DB") orelse "pgzr_dest";
+    const slot_name = getenv("SLOT_NAME") orelse "pgzr_ingest_slot";
+    const source_id = getenv("SOURCE_ID") orelse "00000000-0000-0000-0000-000000000001";
 
     // Stage 1: Ingest — replicate WAL from source into dest as packed batches
-    var ingestor = pgzr.Ingestor.init(allocator, .{
+    var ingestor = pgzr.Ingestor.init(allocator, io, .{
         .source = .{
             .conn = .{
                 .host = "127.0.0.1",

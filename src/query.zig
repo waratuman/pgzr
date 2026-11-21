@@ -86,7 +86,7 @@ pub fn writeTimestampText(buf: *[40]u8, pg_usec: i64) []const u8 {
 
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}+00", .{
         yd.year,
-        @as(u32, @intFromEnum(md.month)),
+        @as(u32, @backingInt(md.month)),
         @as(u32, md.day_index) + 1,
         ds.getHoursIntoDay(),
         ds.getMinutesIntoHour(),
@@ -131,7 +131,7 @@ pub fn escapeUuid(allocator: std.mem.Allocator, uuid: []const u8) ![]u8 {
     return buf;
 }
 
-fn isValidUuid(s: []const u8) bool {
+pub fn isValidUuid(s: []const u8) bool {
     if (s.len != 36) return false;
     const dash_positions = [_]usize{ 8, 13, 18, 23 };
     for (s, 0..) |c, i| {
@@ -152,6 +152,45 @@ fn isValidUuid(s: []const u8) bool {
         }
     }
     return true;
+}
+
+/// Parse a canonical UUID string (8-4-4-4-12 hex with dashes) into its
+/// 16 raw bytes (as used by PostgreSQL's binary uuid format).
+pub fn parseUuid(text: []const u8) error{InvalidUuid}![16]u8 {
+    if (!isValidUuid(text)) return error.InvalidUuid;
+    var out: [16]u8 = undefined;
+    var oi: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '-') {
+            i += 1;
+            continue;
+        }
+        const hi = hexNibble(text[i]);
+        const lo = hexNibble(text[i + 1]);
+        out[oi] = (hi << 4) | lo;
+        oi += 1;
+        i += 2;
+    }
+    return out;
+}
+
+fn hexNibble(c: u8) u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => unreachable, // isValidUuid already checked
+    };
+}
+
+test "parseUuid" {
+    const bytes = try parseUuid("00112233-4455-6677-8899-aabbccddeeff");
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    }, &bytes);
+    try std.testing.expectError(error.InvalidUuid, parseUuid("not-a-uuid"));
 }
 
 // ── Append helpers (zero-alloc, write directly into SQL builder) ───────
@@ -225,6 +264,58 @@ pub fn appendByteaOrNull(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Alloc
     }
 }
 
+// ── COPY binary-format helpers ────────────────────────────────────────
+
+/// COPY BINARY stream header: signature + flags + header extension length.
+pub const copy_binary_header = "PGCOPY\n\xff\r\n\x00" ++
+    "\x00\x00\x00\x00" ++
+    "\x00\x00\x00\x00";
+
+/// COPY BINARY stream trailer: tuple field count of -1.
+pub const copy_binary_trailer = "\xff\xff";
+
+/// COPY BINARY NULL field marker: length of -1.
+pub const copy_binary_null = "\xff\xff\xff\xff";
+
+pub fn appendBinU16(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, v: u16) !void {
+    try list.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeTo(u16, v, .big)));
+}
+
+pub fn appendBinU32(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, v: u32) !void {
+    try list.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeTo(u32, v, .big)));
+}
+
+/// Append an 8-byte integer field (length prefix + big-endian value).
+pub fn appendBinI64Field(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, v: i64) !void {
+    try appendBinU32(list, alloc, 8);
+    try list.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeTo(i64, v, .big)));
+}
+
+/// Append a bytea field (length prefix + raw bytes), or NULL.
+pub fn appendBinByteaField(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: ?[]const u8) !void {
+    if (value) |v| {
+        try appendBinU32(list, alloc, @intCast(v.len));
+        try list.appendSlice(alloc, v);
+    } else {
+        try list.appendSlice(alloc, copy_binary_null);
+    }
+}
+
+test "copy binary helpers" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendBinU16(&list, std.testing.allocator, 7);
+    try appendBinI64Field(&list, std.testing.allocator, -2);
+    try appendBinByteaField(&list, std.testing.allocator, null);
+    try appendBinByteaField(&list, std.testing.allocator, "ab");
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0, 7, // u16
+        0, 0, 0, 8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, // i64 -2
+        0xff, 0xff, 0xff, 0xff, // null
+        0, 0, 0, 2, 'a', 'b', // bytea
+    }, list.items);
+}
+
 // ── COPY text-format helpers ──────────────────────────────────────────
 //
 // COPY text format is tab-separated fields, newline-terminated rows, with
@@ -245,6 +336,40 @@ pub fn appendCopyBytea(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocat
         out[i * 2] = hex[byte >> 4];
         out[i * 2 + 1] = hex[byte & 0x0f];
     }
+}
+
+/// Append arbitrary text as a COPY text-format field, escaping the
+/// characters COPY treats specially (backslash, tab, newline, CR).
+/// Runs of characters that need no escaping are copied in bulk.
+pub fn appendCopyText(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: []const u8) !void {
+    var start: usize = 0;
+    for (value, 0..) |c, i| {
+        const esc: []const u8 = switch (c) {
+            '\\' => "\\\\",
+            '\t' => "\\t",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            else => continue,
+        };
+        try list.appendSlice(alloc, value[start..i]);
+        try list.appendSlice(alloc, esc);
+        start = i + 1;
+    }
+    try list.appendSlice(alloc, value[start..]);
+}
+
+test "appendCopyText: escapes copy specials" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendCopyText(&list, std.testing.allocator, "a\\b\tc\nd\re");
+    try std.testing.expectEqualStrings("a\\\\b\\tc\\nd\\re", list.items);
+}
+
+test "appendCopyText: plain passthrough" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendCopyText(&list, std.testing.allocator, "{\"a\":1}");
+    try std.testing.expectEqualStrings("{\"a\":1}", list.items);
 }
 
 /// Append a bytea value in COPY text format, or \N if null.
@@ -434,76 +559,76 @@ test "escapeUuid: OOM" {
 // ── Append helper tests ───────────────────────────────────────────────
 
 test "appendEscapedString: simple" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendEscapedString(&list, std.testing.allocator, "hello");
     try std.testing.expectEqualStrings("'hello'", list.items);
 }
 
 test "appendEscapedString: with quotes" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendEscapedString(&list, std.testing.allocator, "it's");
     try std.testing.expectEqualStrings("'it''s'", list.items);
 }
 
 test "appendEscapedBytea: simple" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendEscapedBytea(&list, std.testing.allocator, &[_]u8{ 0xde, 0xad });
     try std.testing.expectEqualStrings("'\\xdead'", list.items);
 }
 
 test "appendEscapedUuid: valid" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendEscapedUuid(&list, std.testing.allocator, "550e8400-e29b-41d4-a716-446655440000");
     try std.testing.expectEqualStrings("'550e8400-e29b-41d4-a716-446655440000'", list.items);
 }
 
 test "appendEscapedUuid: invalid" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try std.testing.expectError(error.InvalidUuid, appendEscapedUuid(&list, std.testing.allocator, "bad"));
 }
 
 test "appendNull" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendNull(&list, std.testing.allocator);
     try std.testing.expectEqualStrings("NULL", list.items);
 }
 
 test "appendIntValue: positive" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendIntValue(&list, std.testing.allocator, @as(u64, 42));
     try std.testing.expectEqualStrings("42", list.items);
 }
 
 test "appendIntValue: negative" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendIntValue(&list, std.testing.allocator, @as(i64, -100));
     try std.testing.expectEqualStrings("-100", list.items);
 }
 
 test "appendTimestamp: pg epoch" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendTimestamp(&list, std.testing.allocator, 0);
     try std.testing.expectEqualStrings("'2000-01-01 00:00:00.000000+00'", list.items);
 }
 
 test "appendByteaOrNull: with data" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendByteaOrNull(&list, std.testing.allocator, &[_]u8{0xab});
     try std.testing.expectEqualStrings("'\\xab'", list.items);
 }
 
 test "appendByteaOrNull: null" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendByteaOrNull(&list, std.testing.allocator, null);
     try std.testing.expectEqualStrings("NULL", list.items);
@@ -516,14 +641,14 @@ test "writeTimestampText: no quotes" {
 }
 
 test "appendCopyBytea: hex with doubled backslash" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendCopyBytea(&list, std.testing.allocator, &[_]u8{ 0xde, 0xad });
     try std.testing.expectEqualStrings("\\\\xdead", list.items);
 }
 
 test "appendCopyByteaOrNull: null" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendCopyByteaOrNull(&list, std.testing.allocator, null);
     try std.testing.expectEqualStrings("\\N", list.items);
@@ -534,7 +659,7 @@ test "appendEscapedString: matches escapeString" {
     const heap_result = try escapeString(std.testing.allocator, input);
     defer std.testing.allocator.free(heap_result);
 
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendEscapedString(&list, std.testing.allocator, input);
 
@@ -546,7 +671,7 @@ test "appendEscapedBytea: matches escapeBytea" {
     const heap_result = try escapeBytea(std.testing.allocator, input);
     defer std.testing.allocator.free(heap_result);
 
-    var list: std.ArrayListUnmanaged(u8) = .{};
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
     try appendEscapedBytea(&list, std.testing.allocator, input);
 

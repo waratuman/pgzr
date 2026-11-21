@@ -46,6 +46,7 @@ pub const AuthError = protocol.ReadError || protocol.ReadBodyError || Transport.
 /// Reads the AuthenticationRequest, responds if needed, reads until AuthenticationOk.
 pub fn authenticate(
     transport: Transport,
+    io: std.Io,
     user: []const u8,
     password: []const u8,
 ) AuthError!void {
@@ -63,13 +64,14 @@ pub fn authenticate(
             try transport.writeAll(msg);
         },
         protocol.AUTH_MD5 => {
+            if (body.len < 8) return error.InvalidServerResponse;
             const salt: *const [4]u8 = body[4..8];
             const hashed = md5Password(user, password, salt);
             const msg = protocol.encodePassword(&buf, &hashed);
             try transport.writeAll(msg);
         },
         protocol.AUTH_SASL => {
-            try scram.performScramAuth(transport, user, password, body);
+            try scram.performScramAuth(transport, io, user, password, body);
             return;
         },
         else => return error.UnsupportedAuthMethod,

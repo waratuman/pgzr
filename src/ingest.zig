@@ -18,8 +18,22 @@ pub const Ingestor = struct {
     batch_start_lsn: Lsn,
     batch_end_lsn: Lsn,
     batch_msg_count: usize,
-    in_transaction: bool,
-    txn_begin_lsn: Lsn,
+
+    // Open-transaction tracking. A batch group (a complete batch plus the
+    // partial batches that precede it) covers a contiguous window of the
+    // WAL stream; the group's begin_lsn is fixed when the first transaction
+    // opens and the group closes only when a commit/abort leaves zero
+    // transactions open. Streamed transactions (proto v2+) may interleave,
+    // so open streamed xids are tracked as a set; non-streamed transactions
+    // are contiguous, so one flag suffices.
+    nonstream_open: bool,
+    open_stream_xids: std.AutoHashMap(u32, void),
+    group_begin_lsn: Lsn,
+
+    // Streaming context (proto v2+): xid of the stream segment currently
+    // open (between StreamStart and StreamStop). DML and Relation messages
+    // inside a segment carry a leading Int32 xid the decoder must skip.
+    stream_xid: ?u32,
 
     // Relation cache (owned copies)
     relations: std.AutoHashMap(u32, OwnedRelation),
@@ -55,15 +69,15 @@ pub const Ingestor = struct {
 
     pub const InitError = Replicator.InitError || Connection.ConnectError || Connection.QueryError || std.mem.Allocator.Error;
 
-    pub fn init(allocator: std.mem.Allocator, config: types.IngestConfig) InitError!Ingestor {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: types.IngestConfig) InitError!Ingestor {
         var dest_config = config.dest;
         dest_config.replication = false;
-        var dest = try Connection.connect(allocator, dest_config);
+        var dest = try Connection.connect(allocator, io, dest_config);
         errdefer dest.close();
 
         try schema_mod.ensureSchema(&dest);
 
-        var replicator = try Replicator.init(allocator, config.source);
+        var replicator = try Replicator.init(allocator, io, config.source);
         errdefer replicator.deinit();
 
         return Ingestor{
@@ -71,12 +85,14 @@ pub const Ingestor = struct {
             .dest = dest,
             .allocator = allocator,
             .config = config,
-            .batch_buf = .{},
+            .batch_buf = .empty,
             .batch_start_lsn = Lsn.zero,
             .batch_end_lsn = Lsn.zero,
             .batch_msg_count = 0,
-            .in_transaction = false,
-            .txn_begin_lsn = Lsn.zero,
+            .nonstream_open = false,
+            .open_stream_xids = std.AutoHashMap(u32, void).init(allocator),
+            .group_begin_lsn = Lsn.zero,
+            .stream_xid = null,
             .relations = std.AutoHashMap(u32, OwnedRelation).init(allocator),
             .col_buf = undefined,
             .tuple_buf = undefined,
@@ -102,12 +118,12 @@ pub const Ingestor = struct {
 
             total_msgs += 1;
             const msg_type: u8 = data[0];
-            std.log.debug("ingest: msg #{d} type='{c}' lsn={f} len={d} in_tx={} batch_msgs={d} batch_bytes={d}", .{
+            std.log.debug("ingest: msg #{d} type='{c}' lsn={f} len={d} open_txns={d} batch_msgs={d} batch_bytes={d}", .{
                 total_msgs,
                 msg_type,
                 wal_msg.wal_start,
                 data.len,
-                self.in_transaction,
+                self.openTxnCount(),
                 self.batch_msg_count,
                 self.batch_buf.items.len,
             });
@@ -118,10 +134,24 @@ pub const Ingestor = struct {
             }
             self.batch_end_lsn = wal_msg.wal_start;
 
-            // Track transaction boundaries (Begin or StreamStart)
-            if (msg_type == 'B' or msg_type == 'S') {
-                self.in_transaction = true;
-                self.txn_begin_lsn = wal_msg.wal_start;
+            // Track transaction opens; the first open fixes the group's
+            // begin_lsn. 'S' also opens/continues the stream segment so
+            // streamed messages (which carry a leading xid) decode
+            // correctly; 'E' (StreamStop) ends the segment.
+            if (msg_type == 'B') {
+                self.nonstream_open = true;
+                if (self.group_begin_lsn.value == 0) self.group_begin_lsn = wal_msg.wal_start;
+            } else if (msg_type == 'S') {
+                if (data.len >= 5) {
+                    const xid = std.mem.readInt(u32, data[1..5], .big);
+                    self.stream_xid = xid;
+                    try self.open_stream_xids.put(xid, {});
+                } else {
+                    self.stream_xid = null;
+                }
+                if (self.group_begin_lsn.value == 0) self.group_begin_lsn = wal_msg.wal_start;
+            } else if (msg_type == 'E') {
+                self.stream_xid = null;
             }
 
             // Parse relation messages to maintain the cache
@@ -135,33 +165,59 @@ pub const Ingestor = struct {
             try self.batch_buf.appendSlice(self.allocator, data);
             self.batch_msg_count += 1;
 
-            // Flush on COMMIT or StreamCommit boundaries
-            if (msg_type == 'C' or msg_type == 'c') {
-                self.in_transaction = false;
-                self.txn_begin_lsn = Lsn.zero;
-                std.log.debug("ingest: flushing batch on commit, msgs={d} bytes={d}", .{
+            // Track transaction closes. StreamAbort closes the top-level
+            // transaction only when sub_xid == xid; a subtransaction abort
+            // leaves the stream open.
+            var closed = false;
+            if (msg_type == 'C') {
+                self.nonstream_open = false;
+                closed = true;
+            } else if (msg_type == 'c') {
+                self.stream_xid = null;
+                if (data.len >= 5) {
+                    _ = self.open_stream_xids.remove(std.mem.readInt(u32, data[1..5], .big));
+                }
+                closed = true;
+            } else if (msg_type == 'A') {
+                self.stream_xid = null;
+                if (data.len >= 9) {
+                    const xid = std.mem.readInt(u32, data[1..5], .big);
+                    const sub_xid = std.mem.readInt(u32, data[5..9], .big);
+                    if (sub_xid == xid) {
+                        _ = self.open_stream_xids.remove(xid);
+                        closed = true;
+                    }
+                }
+            }
+
+            // Flush complete when a close leaves no transaction open; the
+            // group (and its begin_lsn) ends here. Commits with other
+            // streamed transactions still open stay in the buffer so every
+            // batch of the window shares one group.
+            if (closed and self.openTxnCount() == 0) {
+                std.log.debug("ingest: flushing batch on group close, msgs={d} bytes={d}", .{
                     self.batch_msg_count,
                     self.batch_buf.items.len,
                 });
                 try self.flushBatch(true);
-                std.log.debug("ingest: flush complete, calling ack lsn={f}", .{wal_msg.wal_start});
+                self.group_begin_lsn = Lsn.zero;
                 self.replicator.ack(wal_msg.wal_start);
-                std.log.debug("ingest: ack done, continuing to next message", .{});
                 continue;
             }
 
-            // Flush mid-transaction when batch size limit is exceeded
+            // Flush mid-group when batch size limit is exceeded
             if (self.batch_buf.items.len >= self.config.max_batch_size) {
                 std.log.debug("ingest: batch size limit reached ({d} >= {d})", .{
                     self.batch_buf.items.len,
                     self.config.max_batch_size,
                 });
-                if (self.in_transaction) {
+                if (self.openTxnCount() > 0) {
                     // Partial batch — processor will reassemble
                     try self.flushBatch(false);
                 } else {
                     // Between transactions — safe to flush as complete
                     try self.flushBatch(true);
+                    self.group_begin_lsn = Lsn.zero;
                     self.replicator.ack(wal_msg.wal_start);
                 }
             }
@@ -169,14 +225,18 @@ pub const Ingestor = struct {
 
         // Flush any remaining batch data
         if (self.batch_msg_count > 0) {
-            try self.flushBatch(!self.in_transaction);
+            try self.flushBatch(self.openTxnCount() == 0);
         }
 
         std.log.info("Ingestor stopped", .{});
     }
 
+    fn openTxnCount(self: *const Ingestor) usize {
+        return self.open_stream_xids.count() + @intFromBool(self.nonstream_open);
+    }
+
     fn updateRelationCache(self: *Ingestor, data: []const u8) !void {
-        const msg = pgoutput.decode(data, &self.col_buf, &self.tuple_buf, &self.tuple_buf2, null) catch return;
+        const msg = pgoutput.decode(data, &self.col_buf, &self.tuple_buf, &self.tuple_buf2, self.stream_xid) catch return;
         const rel = switch (msg) {
             .relation => |r| r,
             else => return,
@@ -219,42 +279,66 @@ pub const Ingestor = struct {
     fn flushBatch(self: *Ingestor, complete: bool) !void {
         if (self.batch_msg_count == 0) return;
 
+        const uuid_bytes = try query.parseUuid(self.config.source_id);
+
         const relations_json = try self.serializeRelations();
         defer self.allocator.free(relations_json);
 
-        // Build INSERT query with inline hex encoding (no intermediate data_hex allocation)
-        var sql: std.ArrayListUnmanaged(u8) = .{};
-        defer sql.deinit(self.allocator);
+        const begin_lsn = if (self.group_begin_lsn.value != 0) self.group_begin_lsn else self.batch_start_lsn;
 
-        const begin_lsn = if (self.txn_begin_lsn.value != 0) self.txn_begin_lsn else self.batch_start_lsn;
+        // COPY BINARY: binary field values need no hex/escape encoding, so
+        // the megabyte-scale bytea payload goes over the wire at 1x size —
+        // and is streamed directly from batch_buf without another copy.
+        var head: std.ArrayListUnmanaged(u8) = .empty;
+        defer head.deinit(self.allocator);
 
-        try sql.appendSlice(self.allocator, "INSERT INTO wal_batches (source_id, begin_lsn, start_lsn, end_lsn, data, relations, complete) VALUES (");
-        try query.appendEscapedUuid(&sql, self.allocator, self.config.source_id);
-        try sql.appendSlice(self.allocator, ", ");
-        try query.appendIntValue(&sql, self.allocator, begin_lsn.value);
-        try sql.appendSlice(self.allocator, ", ");
-        try query.appendIntValue(&sql, self.allocator, self.batch_start_lsn.value);
-        try sql.appendSlice(self.allocator, ", ");
-        try query.appendIntValue(&sql, self.allocator, self.batch_end_lsn.value);
-        try sql.appendSlice(self.allocator, ", ");
-        try query.appendEscapedBytea(&sql, self.allocator, self.batch_buf.items);
-        try sql.appendSlice(self.allocator, ", ");
-        try sql.appendSlice(self.allocator, relations_json);
-        try sql.appendSlice(self.allocator, ", ");
+        try head.appendSlice(self.allocator, query.copy_binary_header);
+        try query.appendBinU16(&head, self.allocator, 7); // field count
+        try query.appendBinU32(&head, self.allocator, 16); // uuid
+        try head.appendSlice(self.allocator, &uuid_bytes);
+        try query.appendBinI64Field(&head, self.allocator, @bitCast(begin_lsn.value));
+        try query.appendBinI64Field(&head, self.allocator, @bitCast(self.batch_start_lsn.value));
+        try query.appendBinI64Field(&head, self.allocator, @bitCast(self.batch_end_lsn.value));
+        try query.appendBinU32(&head, self.allocator, @intCast(self.batch_buf.items.len)); // bytea length
 
-        if (complete) {
-            try sql.appendSlice(self.allocator, "true");
-        } else {
-            try sql.appendSlice(self.allocator, "false");
-        }
-        try sql.appendSlice(self.allocator, ") ON CONFLICT (source_id, start_lsn) DO NOTHING");
+        var tail: std.ArrayListUnmanaged(u8) = .empty;
+        defer tail.deinit(self.allocator);
 
-        std.log.debug("flushBatch: sending INSERT sql_len={d} data_bytes={d}", .{
-            sql.items.len,
+        // relations JSONB: 1-byte version prefix + JSON text
+        try query.appendBinU32(&tail, self.allocator, @intCast(1 + relations_json.len));
+        try tail.append(self.allocator, 1);
+        try tail.appendSlice(self.allocator, relations_json);
+        // complete BOOLEAN
+        try query.appendBinU32(&tail, self.allocator, 1);
+        try tail.append(self.allocator, @intFromBool(complete));
+        // trailer: field count -1 ends the stream
+        try tail.appendSlice(self.allocator, query.copy_binary_trailer);
+
+        std.log.debug("flushBatch: sending binary COPY data_bytes={d}", .{
             self.batch_buf.items.len,
         });
-        try self.dest.execLarge(self.allocator, sql.items);
-        std.log.debug("flushBatch: execLarge complete", .{});
+        try self.dest.copyInBegin(
+            self.allocator,
+            "COPY wal_batches (source_id, begin_lsn, start_lsn, end_lsn, data, relations, complete) FROM STDIN WITH (FORMAT binary)",
+        );
+        self.streamBatchRow(head.items, tail.items) catch |err| {
+            // Leave copy mode before propagating so the connection is not
+            // stuck mid-COPY (best-effort: the transport is likely dead).
+            self.dest.copyInFail("pgzr: client-side failure while streaming batch");
+            return err;
+        };
+        self.dest.copyInEnd() catch |err| switch (err) {
+            error.ServerError => {
+                // A unique violation on (source_id, start_lsn) means this
+                // batch was already stored by a previous run (unacked WAL
+                // replayed after restart) — equivalent to the old
+                // ON CONFLICT DO NOTHING.
+                const code = self.dest.lastServerErrorCode() orelse return err;
+                if (!std.mem.eql(u8, code, "23505")) return err;
+                std.log.debug("flushBatch: duplicate batch start_lsn={f}, already stored", .{self.batch_start_lsn});
+            },
+            else => return err,
+        };
 
         std.log.info("batch flushed: start_lsn={f} end_lsn={f} msgs={d} bytes={d} complete={}", .{
             self.batch_start_lsn,
@@ -274,11 +358,16 @@ pub const Ingestor = struct {
         self.batch_msg_count = 0;
     }
 
+    fn streamBatchRow(self: *Ingestor, head: []const u8, tail: []const u8) !void {
+        try self.dest.copyInWrite(head);
+        try self.dest.copyInWrite(self.batch_buf.items);
+        try self.dest.copyInWrite(tail);
+    }
+
     fn serializeRelations(self: *Ingestor) ![]u8 {
-        var json: std.ArrayListUnmanaged(u8) = .{};
+        var json: std.ArrayListUnmanaged(u8) = .empty;
         errdefer json.deinit(self.allocator);
 
-        try json.append(self.allocator, '\'');
         try json.append(self.allocator, '{');
 
         var first_rel = true;
@@ -344,7 +433,7 @@ pub const Ingestor = struct {
             try json.appendSlice(self.allocator, "]}");
         }
 
-        try json.appendSlice(self.allocator, "}'::jsonb");
+        try json.append(self.allocator, '}');
 
         return json.toOwnedSlice(self.allocator);
     }
@@ -353,7 +442,6 @@ pub const Ingestor = struct {
         for (s) |c| {
             switch (c) {
                 '"' => try list.appendSlice(allocator, "\\\""),
-                '\'' => try list.appendSlice(allocator, "''"),
                 '\\' => try list.appendSlice(allocator, "\\\\"),
                 '\n' => try list.appendSlice(allocator, "\\n"),
                 '\r' => try list.appendSlice(allocator, "\\r"),
@@ -384,6 +472,7 @@ pub const Ingestor = struct {
             rel.deinit(self.allocator);
         }
         self.relations.deinit();
+        self.open_stream_xids.deinit();
         self.batch_buf.deinit(self.allocator);
         self.replicator.deinit();
         self.dest.close();

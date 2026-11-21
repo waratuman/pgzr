@@ -106,10 +106,14 @@ Benchmark with `zig build concurrent-stress-test -Doptimize=ReleaseFast`
 (100K events, 4 workers, adversarial reaper) and compare the `process=` time.
 Two hard-won caveats:
 
-- **Always benchmark ReleaseFast.** A Debug build is ~5x slower in the
-  process phase (4.7s vs 0.9s) because `GeneralPurposeAllocator`'s safety
-  checks plus its shared mutex dominate — worker threads serialize on the
-  allocator and every protocol-level change disappears into the noise.
+- **Always benchmark ReleaseFast.** A Debug build has been measured up to
+  ~57x slower in the process phase (30.9s vs 0.54s on the stress test)
+  because the debug allocator's safety checks plus its shared mutex
+  dominate — worker threads serialize on the allocator and every
+  protocol-level change disappears into the noise. The same applies to
+  the shared library: a bare `zig build lib` produces a Debug build; use
+  the Makefile (defaults to ReleaseFast) or pass `-Doptimize=` for any
+  artifact that leaves the machine.
 - **Check `pg_stat_activity` during a run** before crediting/blaming the
   database: `idle in transaction` + `ClientRead` waits on all workers means
   the bottleneck is client-side CPU/allocations, not the server.

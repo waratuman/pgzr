@@ -1,6 +1,18 @@
 const std = @import("std");
 const pgzr = @import("pgzr");
 
+/// Io instance for the whole test run, set at the top of main.
+var io: std.Io = undefined;
+
+fn getenv(name: [*:0]const u8) ?[]const u8 {
+    const p = std.c.getenv(name) orelse return null;
+    return std.mem.span(p);
+}
+
+fn sleepMs(ms: i64) void {
+    io.sleep(.fromMilliseconds(ms), .awake) catch {};
+}
+
 const SOURCE_DB = "pgzr_pipeline_source";
 const DEST_DB = "pgzr_pipeline_dest";
 const SLOT_NAME = "pgzr_pipeline_slot";
@@ -8,46 +20,27 @@ const PUB_NAME = "pgzr_pipeline_pub";
 const SOURCE_ID = "00000000-0000-0000-0000-000000000001";
 
 fn getUser() []const u8 {
-    return std.posix.getenv("PGUSER") orelse std.posix.getenv("USER") orelse "postgres";
+    return getenv("PGUSER") orelse getenv("USER") orelse "postgres";
 }
 
 fn runPsql(allocator: std.mem.Allocator, db: []const u8, sql: []const u8) !void {
-    var child = std.process.Child.init(
-        &.{ "psql", "-d", db, "-c", sql },
-        allocator,
-    );
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    _ = try child.spawnAndWait();
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "psql", "-d", db, "-c", sql },
+    });
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
 }
 
 fn runPsqlCapture(allocator: std.mem.Allocator, db: []const u8, sql: []const u8) ![]u8 {
-    var child = std.process.Child.init(
-        &.{ "psql", "-d", db, "-t", "-A", "-c", sql },
-        allocator,
-    );
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    _ = try child.spawn();
+    const run_result = try std.process.run(allocator, io, .{
+        .argv = &.{ "psql", "-d", db, "-t", "-A", "-c", sql },
+    });
+    defer allocator.free(run_result.stdout);
+    allocator.free(run_result.stderr);
 
-    var stdout_buf: [4096]u8 = undefined;
-    var total: usize = 0;
-    while (total < stdout_buf.len) {
-        const n = child.stdout.?.read(stdout_buf[total..]) catch break;
-        if (n == 0) break;
-        total += n;
-    }
-    _ = try child.wait();
-
-    var end = total;
-    while (end > 0 and (stdout_buf[end - 1] == '\n' or stdout_buf[end - 1] == '\r' or stdout_buf[end - 1] == ' ')) {
-        end -= 1;
-    }
-
-    const result = try allocator.alloc(u8, end);
-    @memcpy(result, stdout_buf[0..end]);
+    const trimmed = std.mem.trimEnd(u8, run_result.stdout, "\n\r ");
+    const result = try allocator.alloc(u8, trimmed.len);
+    @memcpy(result, trimmed);
     return result;
 }
 
@@ -64,11 +57,9 @@ fn queryCount(allocator: std.mem.Allocator, db: []const u8, sql: []const u8) !u3
 }
 
 fn runCmd(allocator: std.mem.Allocator, args: []const []const u8) void {
-    var child = std.process.Child.init(args, allocator);
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    _ = child.spawnAndWait() catch {};
+    const result = std.process.run(allocator, io, .{ .argv = args }) catch return;
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
 }
 
 fn sourceConnConfig() pgzr.ConnConfig {
@@ -130,7 +121,7 @@ fn setup(allocator: std.mem.Allocator) !void {
     runPsql(allocator, SOURCE_DB, "TRUNCATE items RESTART IDENTITY") catch {};
 
     // Ensure schema exists in dest, then clean tables
-    var dest = pgzr.Connection.connect(allocator, destConnConfig()) catch |err| {
+    var dest = pgzr.Connection.connect(allocator, io, destConnConfig()) catch |err| {
         std.debug.print("Failed to connect to dest: {}\n", .{err});
         return err;
     };
@@ -145,7 +136,7 @@ fn setup(allocator: std.mem.Allocator) !void {
 }
 
 fn teardown(allocator: std.mem.Allocator) void {
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    sleepMs(200);
     runPsql(
         allocator,
         SOURCE_DB,
@@ -180,7 +171,7 @@ fn testIngestStoresBatches(allocator: std.mem.Allocator) !void {
     };
 
     // Run ingestor with end_position to stop automatically
-    var ingestor = pgzr.Ingestor.init(allocator, .{
+    var ingestor = pgzr.Ingestor.init(allocator, io, .{
         .source = .{
             .conn = sourceConnConfig(),
             .slot_name = SLOT_NAME,
@@ -235,7 +226,7 @@ fn testProcessorParsesBatches(allocator: std.mem.Allocator) !void {
     std.debug.print("  Test: processor parses batches... ", .{});
 
     // Process the batches stored by the previous test
-    var processor = pgzr.Processor.init(allocator, .{
+    var processor = pgzr.Processor.init(allocator, io, .{
         .dest = destConnConfig(),
     }) catch |err| {
         std.debug.print("FAIL (init processor: {})\n", .{err});
@@ -354,7 +345,7 @@ fn testUpdateAndDelete(allocator: std.mem.Allocator) !void {
     };
 
     // Ingest
-    var ingestor = pgzr.Ingestor.init(allocator, .{
+    var ingestor = pgzr.Ingestor.init(allocator, io, .{
         .source = .{
             .conn = sourceConnConfig(),
             .slot_name = SLOT_NAME,
@@ -378,7 +369,7 @@ fn testUpdateAndDelete(allocator: std.mem.Allocator) !void {
     };
 
     // Process
-    var processor = pgzr.Processor.init(allocator, .{
+    var processor = pgzr.Processor.init(allocator, io, .{
         .dest = destConnConfig(),
     }) catch |err| {
         std.debug.print("FAIL (init processor: {})\n", .{err});
@@ -559,7 +550,7 @@ fn testMetadataViaMessage(allocator: std.mem.Allocator) !void {
     };
 
     // Ingest with messages=true to receive pg_logical_emit_message
-    var ingestor = pgzr.Ingestor.init(allocator, .{
+    var ingestor = pgzr.Ingestor.init(allocator, io, .{
         .source = .{
             .conn = sourceConnConfig(),
             .slot_name = SLOT_NAME,
@@ -584,7 +575,7 @@ fn testMetadataViaMessage(allocator: std.mem.Allocator) !void {
     };
 
     // Process with metadata_message_prefix configured
-    var processor = pgzr.Processor.init(allocator, .{
+    var processor = pgzr.Processor.init(allocator, io, .{
         .dest = destConnConfig(),
         .metadata_message_prefix = "test_metadata",
     }) catch |err| {
@@ -687,7 +678,7 @@ fn testMetadataViaTable(allocator: std.mem.Allocator) !void {
     };
 
     // Ingest
-    var ingestor = pgzr.Ingestor.init(allocator, .{
+    var ingestor = pgzr.Ingestor.init(allocator, io, .{
         .source = .{
             .conn = sourceConnConfig(),
             .slot_name = SLOT_NAME,
@@ -711,7 +702,7 @@ fn testMetadataViaTable(allocator: std.mem.Allocator) !void {
     };
 
     // Process with metadata_table configured
-    var processor = pgzr.Processor.init(allocator, .{
+    var processor = pgzr.Processor.init(allocator, io, .{
         .dest = destConnConfig(),
         .metadata_table = "test_metadata_table",
     }) catch |err| {
@@ -810,7 +801,7 @@ fn testStreamingEvents(allocator: std.mem.Allocator) !void {
     };
 
     // Ingest with proto v2 + streaming
-    var ingestor = pgzr.Ingestor.init(allocator, .{
+    var ingestor = pgzr.Ingestor.init(allocator, io, .{
         .source = .{
             .conn = sourceConnConfig(),
             .slot_name = SLOT_NAME,
@@ -840,7 +831,7 @@ fn testStreamingEvents(allocator: std.mem.Allocator) !void {
     };
 
     // Process
-    var processor = pgzr.Processor.init(allocator, .{
+    var processor = pgzr.Processor.init(allocator, io, .{
         .dest = destConnConfig(),
     }) catch |err| {
         std.debug.print("FAIL (init processor: {})\n", .{err});
@@ -924,7 +915,7 @@ fn testStreamingMetadataViaMessage(allocator: std.mem.Allocator) !void {
     };
 
     // Ingest with proto v2 + streaming + messages
-    var ingestor = pgzr.Ingestor.init(allocator, .{
+    var ingestor = pgzr.Ingestor.init(allocator, io, .{
         .source = .{
             .conn = sourceConnConfig(),
             .slot_name = SLOT_NAME,
@@ -954,7 +945,7 @@ fn testStreamingMetadataViaMessage(allocator: std.mem.Allocator) !void {
     };
 
     // Process with metadata prefix
-    var processor = pgzr.Processor.init(allocator, .{
+    var processor = pgzr.Processor.init(allocator, io, .{
         .dest = destConnConfig(),
         .metadata_message_prefix = "test_metadata",
     }) catch |err| {
@@ -1018,6 +1009,194 @@ fn testStreamingMetadataViaMessage(allocator: std.mem.Allocator) !void {
 }
 
 // =========================================================================
+// Test: duplicate batch COPY surfaces SQLSTATE 23505 (restart-replay
+// dedupe path in the ingestor relies on this).
+// =========================================================================
+fn testDuplicateBatchCopy(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: duplicate batch COPY reports 23505... ", .{});
+
+    var conn = pgzr.Connection.connect(allocator, io, destConnConfig()) catch |err| {
+        std.debug.print("FAIL (connect: {})\n", .{err});
+        return err;
+    };
+    defer conn.close();
+
+    runPsql(allocator, DEST_DB, "DELETE FROM wal_batches WHERE source_id = '00000000-0000-0000-0000-00000000dead'") catch {};
+
+    const cmd = "COPY wal_batches (source_id, begin_lsn, start_lsn, end_lsn, data, relations, complete) FROM STDIN";
+    const row = "00000000-0000-0000-0000-00000000dead\t1\t1\t2\t\\\\x00\t\\N\tt\n";
+
+    conn.copyIn(allocator, cmd, row) catch |err| {
+        std.debug.print("FAIL (first copy: {})\n", .{err});
+        return err;
+    };
+
+    // Second copy of the same (source_id, start_lsn) must fail with a
+    // unique violation, and the connection must stay usable.
+    if (conn.copyIn(allocator, cmd, row)) |_| {
+        std.debug.print("FAIL (duplicate copy unexpectedly succeeded)\n", .{});
+        return error.ServerError;
+    } else |err| {
+        if (err != error.ServerError) {
+            std.debug.print("FAIL (duplicate copy: {})\n", .{err});
+            return err;
+        }
+        const code = conn.lastServerErrorCode() orelse {
+            std.debug.print("FAIL (no SQLSTATE recorded)\n", .{});
+            return error.ServerError;
+        };
+        if (!std.mem.eql(u8, code, "23505")) {
+            std.debug.print("FAIL (expected 23505, got {s})\n", .{code});
+            return error.ServerError;
+        }
+    }
+
+    // Connection still in sync after the failed COPY
+    const result = conn.simpleQuery("SELECT 1") catch |err| {
+        std.debug.print("FAIL (post-error query: {})\n", .{err});
+        return err;
+    };
+    if (result.column_count == 0) {
+        std.debug.print("FAIL (post-error query returned no row)\n", .{});
+        return error.ServerError;
+    }
+
+    runPsql(allocator, DEST_DB, "DELETE FROM wal_batches WHERE source_id = '00000000-0000-0000-0000-00000000dead'") catch {};
+
+    std.debug.print("OK\n", .{});
+}
+
+// =========================================================================
+// Test 9b: Interleaved streamed transactions — two concurrent large
+// transactions stream interleaved segments; each must commit with exactly
+// its own events.
+// =========================================================================
+fn testInterleavedStreams(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: interleaved streamed transactions... ", .{});
+
+    runPsql(allocator, SOURCE_DB, "ALTER SYSTEM SET logical_decoding_work_mem = '64kB'") catch {};
+    runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+    defer {
+        runPsql(allocator, SOURCE_DB, "ALTER SYSTEM RESET logical_decoding_work_mem") catch {};
+        runPsql(allocator, SOURCE_DB, "SELECT pg_reload_conf()") catch {};
+    }
+
+    runPsql(
+        allocator,
+        DEST_DB,
+        "TRUNCATE events, relation_snapshots, transactions, wal_batches CASCADE",
+    ) catch {};
+    runPsql(allocator, SOURCE_DB, "TRUNCATE items RESTART IDENTITY") catch {};
+
+    // Two concurrent sessions, each writing >64kB in two chunks with
+    // sleeps so their WAL (and thus their stream segments) interleave.
+    const Worker = struct {
+        fn run(alloc: std.mem.Allocator, script: []const u8) void {
+            runPsql(alloc, SOURCE_DB, script) catch {};
+        }
+    };
+    const script_a =
+        \\BEGIN;
+        \\INSERT INTO items (name, quantity) SELECT 'a' || repeat('x', 1000) || g, g FROM generate_series(1, 75) g;
+        \\SELECT pg_sleep(1.0);
+        \\INSERT INTO items (name, quantity) SELECT 'a' || repeat('x', 1000) || g, g FROM generate_series(76, 150) g;
+        \\COMMIT;
+    ;
+    const script_b =
+        \\BEGIN;
+        \\INSERT INTO items (name, quantity) SELECT 'b' || repeat('y', 1000) || g, g FROM generate_series(1, 75) g;
+        \\SELECT pg_sleep(1.0);
+        \\INSERT INTO items (name, quantity) SELECT 'b' || repeat('y', 1000) || g, g FROM generate_series(76, 150) g;
+        \\COMMIT;
+    ;
+    const t_a = std.Thread.spawn(.{}, Worker.run, .{ allocator, script_a }) catch |err| {
+        std.debug.print("FAIL (spawn: {})\n", .{err});
+        return err;
+    };
+    sleepMs(400);
+    const t_b = std.Thread.spawn(.{}, Worker.run, .{ allocator, script_b }) catch |err| {
+        std.debug.print("FAIL (spawn: {})\n", .{err});
+        t_a.join();
+        return err;
+    };
+    t_a.join();
+    t_b.join();
+
+    const end_lsn = getCurrentWalLsn(allocator) catch |err| {
+        std.debug.print("FAIL (get LSN: {})\n", .{err});
+        return err;
+    };
+
+    var ingestor = pgzr.Ingestor.init(allocator, io, .{
+        .source = .{
+            .conn = sourceConnConfig(),
+            .slot_name = SLOT_NAME,
+            .end_position = end_lsn,
+            .options = &.{
+                .{ "proto_version", "2" },
+                .{ "publication_names", PUB_NAME },
+                .{ "streaming", "on" },
+            },
+        },
+        .dest = destConnConfig(),
+        .source_id = SOURCE_ID,
+        .max_batch_size = 256 * 1024,
+    }) catch |err| {
+        std.debug.print("FAIL (init ingestor: {})\n", .{err});
+        return err;
+    };
+    defer ingestor.deinit();
+
+    ingestor.run() catch |err| {
+        std.debug.print("FAIL (ingestor run: {})\n", .{err});
+        return err;
+    };
+
+    var processor = pgzr.Processor.init(allocator, io, .{
+        .dest = destConnConfig(),
+    }) catch |err| {
+        std.debug.print("FAIL (init processor: {})\n", .{err});
+        return err;
+    };
+    defer processor.deinit();
+
+    var batch_count: u32 = 0;
+    while (true) {
+        const processed = processor.processOne() catch |err| {
+            std.debug.print("FAIL (processOne: {})\n", .{err});
+            return err;
+        };
+        if (!processed) break;
+        batch_count += 1;
+        if (batch_count > 100) break;
+    }
+
+    // All of this test's events captured, and each attributed to exactly
+    // its own transaction (the shared slot also carries unrelated
+    // transactions from earlier tests, so scope every check to our rows).
+    const a_events = try queryCount(allocator, DEST_DB, "SELECT count(*) FROM events WHERE type='I' AND data->>'name' LIKE 'ax%'");
+    const b_events = try queryCount(allocator, DEST_DB, "SELECT count(*) FROM events WHERE type='I' AND data->>'name' LIKE 'by%'");
+    if (a_events != 150 or b_events != 150) {
+        std.debug.print("FAIL (expected 150+150 insert events, got a={d} b={d})\n", .{ a_events, b_events });
+        return error.ServerError;
+    }
+    const a_txns = try queryCount(allocator, DEST_DB, "SELECT count(DISTINCT transaction_id) FROM events WHERE data->>'name' LIKE 'ax%'");
+    const b_txns = try queryCount(allocator, DEST_DB, "SELECT count(DISTINCT transaction_id) FROM events WHERE data->>'name' LIKE 'by%'");
+    const ab_txns = try queryCount(allocator, DEST_DB, "SELECT count(DISTINCT transaction_id) FROM events WHERE data->>'name' LIKE 'ax%' OR data->>'name' LIKE 'by%'");
+    if (a_txns != 1 or b_txns != 1 or ab_txns != 2) {
+        std.debug.print("FAIL (attribution: a={d} b={d} a+b={d})\n", .{ a_txns, b_txns, ab_txns });
+        return error.ServerError;
+    }
+    const leftover = try queryCount(allocator, DEST_DB, "SELECT count(*) FROM wal_batches");
+    if (leftover != 0) {
+        std.debug.print("FAIL ({d} unprocessed wal_batches)\n", .{leftover});
+        return error.ServerError;
+    }
+
+    std.debug.print("OK (2 txn, 300 events, {d} batch groups, correct attribution)\n", .{batch_count});
+}
+
+// =========================================================================
 // Test 10: Proto v4 — metadata via pg_logical_emit_message
 // =========================================================================
 fn testProtoV4MetadataViaMessage(allocator: std.mem.Allocator) !void {
@@ -1045,7 +1224,7 @@ fn testProtoV4MetadataViaMessage(allocator: std.mem.Allocator) !void {
     };
 
     // Ingest with proto v4 + messages
-    var ingestor = pgzr.Ingestor.init(allocator, .{
+    var ingestor = pgzr.Ingestor.init(allocator, io, .{
         .source = .{
             .conn = sourceConnConfig(),
             .slot_name = SLOT_NAME,
@@ -1070,7 +1249,7 @@ fn testProtoV4MetadataViaMessage(allocator: std.mem.Allocator) !void {
     };
 
     // Process with metadata prefix
-    var processor = pgzr.Processor.init(allocator, .{
+    var processor = pgzr.Processor.init(allocator, io, .{
         .dest = destConnConfig(),
         .metadata_message_prefix = "test_metadata",
     }) catch |err| {
@@ -1150,7 +1329,7 @@ fn testConcurrentProcessors(allocator: std.mem.Allocator) !void {
     };
 
     // Ingest all batches
-    var ingestor = pgzr.Ingestor.init(allocator, .{
+    var ingestor = pgzr.Ingestor.init(allocator, io, .{
         .source = .{
             .conn = sourceConnConfig(),
             .slot_name = SLOT_NAME,
@@ -1191,7 +1370,7 @@ fn testConcurrentProcessors(allocator: std.mem.Allocator) !void {
 
     const worker = struct {
         fn run(result: *SharedResult, alloc: std.mem.Allocator) void {
-            var processor = pgzr.Processor.init(alloc, .{
+            var processor = pgzr.Processor.init(alloc, io, .{
                 .dest = destConnConfig(),
             }) catch {
                 _ = result.errors.fetchAdd(1, .monotonic);
@@ -1284,15 +1463,9 @@ fn testConcurrentProcessors(allocator: std.mem.Allocator) !void {
 // =========================================================================
 // Main
 // =========================================================================
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        if (gpa.deinit() == .leak) {
-            std.debug.print("\nMemory leak detected!\n", .{});
-            std.process.exit(1);
-        }
-    }
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    io = init.io;
 
     std.debug.print("PGZR Pipeline Integration Tests\n", .{});
     std.debug.print("================================\n", .{});
@@ -1343,6 +1516,14 @@ pub fn main() !void {
     };
 
     testProtoV4MetadataViaMessage(allocator) catch {
+        failures += 1;
+    };
+
+    testInterleavedStreams(allocator) catch {
+        failures += 1;
+    };
+
+    testDuplicateBatchCopy(allocator) catch {
         failures += 1;
     };
 

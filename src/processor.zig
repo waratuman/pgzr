@@ -12,6 +12,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const Processor = struct {
     dest: Connection,
     allocator: std.mem.Allocator,
+    io: std.Io,
     config: types.ProcessorConfig,
 
     // Relation cache (rebuilt from binary messages in each batch)
@@ -48,6 +49,15 @@ pub const Processor = struct {
     // flush_threshold to bound memory for large transactions).
     pending_events: std.ArrayListUnmanaged([]u8),
 
+    // Per-transaction buffers for streamed (proto v2+) transactions,
+    // keyed by top-level xid. Streamed transactions may interleave, so
+    // their events and metadata cannot share the non-streamed buffers;
+    // they are adopted into the shared flush path at stream_commit. Each
+    // item is tagged with the (sub)xid that produced it so a
+    // subtransaction abort can discard exactly its changes.
+    stream_events: std.AutoHashMap(u32, std.ArrayListUnmanaged(StreamItem)),
+    stream_metadata: std.AutoHashMap(u32, std.ArrayListUnmanaged(StreamItem)),
+
     // Reusable COPY stream buffer for flushPendingEvents.
     copy_buf: std.ArrayListUnmanaged(u8),
 
@@ -56,6 +66,11 @@ pub const Processor = struct {
 
     // Maximum number of buffered events before an intermediate flush.
     const flush_threshold: usize = 1000;
+
+    const StreamItem = struct {
+        sub_xid: u32,
+        data: []u8,
+    };
 
     const OwnedRelation = struct {
         oid: u32,
@@ -84,10 +99,10 @@ pub const Processor = struct {
 
     pub const InitError = Connection.ConnectError || Connection.QueryError || std.mem.Allocator.Error;
 
-    pub fn init(allocator: std.mem.Allocator, config: types.ProcessorConfig) InitError!Processor {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: types.ProcessorConfig) InitError!Processor {
         var dest_config = config.dest;
         dest_config.replication = false;
-        var dest = try Connection.connect(allocator, dest_config);
+        var dest = try Connection.connect(allocator, io, dest_config);
         errdefer dest.close();
 
         try schema_mod.ensureSchema(&dest);
@@ -95,6 +110,7 @@ pub const Processor = struct {
         return Processor{
             .dest = dest,
             .allocator = allocator,
+            .io = io,
             .config = config,
             .relations = std.AutoHashMap(u32, OwnedRelation).init(allocator),
             .col_buf = undefined,
@@ -107,12 +123,14 @@ pub const Processor = struct {
             .current_txn_id = null,
             .in_transaction = false,
             .current_stream_xid = null,
-            .pending_data = .{},
-            .pending_batch_ids = .{},
-            .metadata_chunks = .{},
+            .pending_data = .empty,
+            .pending_batch_ids = .empty,
+            .metadata_chunks = .empty,
             .metadata_table_oid = null,
-            .pending_events = .{},
-            .copy_buf = .{},
+            .pending_events = .empty,
+            .stream_events = std.AutoHashMap(u32, std.ArrayListUnmanaged(StreamItem)).init(allocator),
+            .stream_metadata = std.AutoHashMap(u32, std.ArrayListUnmanaged(StreamItem)).init(allocator),
+            .copy_buf = .empty,
             .stop_flag = std.atomic.Value(bool).init(false),
         };
     }
@@ -126,6 +144,15 @@ pub const Processor = struct {
     /// source_id + begin_lsn). Partial batches are fetched alongside their
     /// completing batch and processed as one logical unit.
     pub fn processOne(self: *Processor) ProcessError!bool {
+        // Cheap existence probe first: an idle poll costs one round trip
+        // instead of three (BEGIN + claim + COMMIT). The claim re-checks
+        // under lock, so a stale probe result is harmless — a miss is
+        // caught next poll, a false hit yields an empty claim.
+        const probe = try self.dest.simpleQuery(
+            "SELECT 1 FROM wal_batches WHERE state='pending' AND complete=true LIMIT 1",
+        );
+        if (probe.column_count == 0) return false;
+
         // Run the whole claim/decode/insert/delete cycle inside one transaction
         // so the claim's row lock (FOR UPDATE) is held until the work commits.
         //
@@ -139,14 +166,19 @@ pub const Processor = struct {
         _ = try self.dest.simpleQuery("BEGIN");
 
         const claimed = self.claimAndProcess() catch |err| {
-            // Roll back the claim and all inserts, then park the claimed
-            // batch(es) in 'error' state so a poison batch is not retried
-            // forever. Both are best-effort: a dead connection makes them
-            // no-ops. markBatchesError runs post-rollback (autocommit) so it
-            // is not undone by the rollback.
+            // Roll back the claim and all inserts. Park the claimed
+            // batch(es) in 'error' state only for poison failures (decode
+            // errors, non-retryable SQLSTATEs) that would repeat forever;
+            // transient failures (connection loss, deadlock, timeout,
+            // resource exhaustion) leave the rows 'pending' for retry.
+            // Classify before ROLLBACK: it clears the stored SQLSTATE.
+            // Both statements are best-effort: a dead connection makes
+            // them no-ops. markBatchesError runs post-rollback
+            // (autocommit) so it is not undone by the rollback.
+            const park = self.shouldParkBatches(err);
             _ = self.dest.simpleQuery("ROLLBACK") catch {};
-            self.markBatchesError();
-            self.clearPending();
+            if (park) self.markBatchesError();
+            self.resetBatchState();
             return err;
         };
 
@@ -155,9 +187,55 @@ pub const Processor = struct {
             return false;
         }
 
-        _ = try self.dest.simpleQuery("COMMIT");
+        _ = self.dest.simpleQuery("COMMIT") catch |err| {
+            // The transaction rolled back server-side (or the connection
+            // died), reverting the claimed rows to 'pending'. The batch data
+            // is intact, so don't park it — just discard all local state so
+            // the next cycle starts clean instead of replaying stale
+            // pending_data/pending_events against a new claim.
+            self.resetBatchState();
+            return err;
+        };
         self.clearPending();
         return true;
+    }
+
+    /// Decide whether a claimAndProcess failure should park the claimed
+    /// batches in 'error' state (poison: retrying would fail forever) or
+    /// leave them 'pending' for retry (transient). Nothing requeues
+    /// 'error' rows automatically, so parking must be reserved for
+    /// failures caused by the batch data itself.
+    fn shouldParkBatches(self: *Processor, err: ProcessError) bool {
+        return switch (err) {
+            // Client-side or connection trouble: the batch data is intact.
+            error.OutOfMemory,
+            error.ConnectionClosed,
+            error.ReadFailed,
+            error.WriteFailed,
+            error.Canceled,
+            error.ProtocolError,
+            => false,
+            // Server rejected a statement: consult the SQLSTATE.
+            error.ServerError => blk: {
+                const code = self.dest.lastServerErrorCode() orelse break :blk true;
+                break :blk !isRetryableSqlState(code);
+            },
+            // Decode/validation failures are inherent to the batch data.
+            else => true,
+        };
+    }
+
+    /// Discard all per-batch state after a failed cycle: claimed ids,
+    /// assembled batch data, buffered events, metadata chunks, and any
+    /// mid-transaction decode state.
+    fn resetBatchState(self: *Processor) void {
+        self.clearPending();
+        self.clearPendingEvents();
+        self.clearMetadataChunks();
+        self.clearStreamBuffers();
+        self.in_transaction = false;
+        self.current_txn_id = null;
+        self.current_stream_xid = null;
     }
 
     /// One row captured by the group claim, owned copies of the data the
@@ -177,14 +255,14 @@ pub const Processor = struct {
     };
 
     /// Callback context for the group claim query. queryRows callbacks cannot
-    /// return errors, so allocation failures are recorded in `err` and
-    /// re-raised after the query completes.
+    /// return errors, so failures (allocation, corrupt stored bytea) are
+    /// recorded in `err` and re-raised after the query completes.
     const ClaimContext = struct {
         proc: *Processor,
-        rows: std.ArrayListUnmanaged(ClaimedRow) = .{},
+        rows: std.ArrayListUnmanaged(ClaimedRow) = .empty,
         source_id: ?[]u8 = null,
         relations_json: ?[]u8 = null,
-        err: ?std.mem.Allocator.Error = null,
+        err: ?Processor.ProcessError = null,
 
         fn onRow(self: *ClaimContext, cols: []const Connection.QueryColumn) void {
             if (self.err != null) return;
@@ -197,22 +275,29 @@ pub const Processor = struct {
             const proc = self.proc;
             if (cols.len < 6) return;
 
-            // Track the claimed id for deleteBatches/markBatchesError
+            // Track the claimed id for deleteBatches/markBatchesError.
+            // The errdefer is scoped to the block: once append succeeds the
+            // list owns id_copy, and clearPending must be the only freer.
             const id_copy = try proc.allocator.alloc(u8, cols[0].data.len);
             @memcpy(id_copy, cols[0].data);
-            errdefer proc.allocator.free(id_copy);
-            try proc.pending_batch_ids.append(proc.allocator, id_copy);
+            {
+                errdefer proc.allocator.free(id_copy);
+                try proc.pending_batch_ids.append(proc.allocator, id_copy);
+            }
 
             const start_lsn = std.fmt.parseInt(u64, cols[2].data, 10) catch 0;
             const complete = cols[3].data.len > 0 and cols[3].data[0] == 't';
 
+            // Same scoping: after append, rows (freed via ctx.deinit) owns data.
             const data = try proc.decodeBytea(cols[4].data);
-            errdefer proc.allocator.free(data);
-            try self.rows.append(proc.allocator, .{
-                .start_lsn = start_lsn,
-                .complete = complete,
-                .data = data,
-            });
+            {
+                errdefer proc.allocator.free(data);
+                try self.rows.append(proc.allocator, .{
+                    .start_lsn = start_lsn,
+                    .complete = complete,
+                    .data = data,
+                });
+            }
 
             // source_id and relations snapshot come from the complete batch
             if (complete) {
@@ -322,7 +407,7 @@ pub const Processor = struct {
     fn markBatchesError(self: *Processor) void {
         if (self.pending_batch_ids.items.len == 0) return;
 
-        var sql: std.ArrayListUnmanaged(u8) = .{};
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
         defer sql.deinit(self.allocator);
 
         sql.appendSlice(self.allocator, "UPDATE wal_batches SET state='error' WHERE ") catch return;
@@ -333,7 +418,7 @@ pub const Processor = struct {
     fn deleteBatches(self: *Processor) !void {
         if (self.pending_batch_ids.items.len == 0) return;
 
-        var sql: std.ArrayListUnmanaged(u8) = .{};
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
         defer sql.deinit(self.allocator);
 
         try sql.appendSlice(self.allocator, "DELETE FROM wal_batches WHERE ");
@@ -375,6 +460,7 @@ pub const Processor = struct {
                     self.current_txn_timestamp = begin.timestamp;
                     self.in_transaction = true;
                     self.clearMetadataChunks();
+                    self.clearPendingEvents();
                     self.current_txn_id = try self.insertTransaction(begin.final_lsn);
                 },
                 .commit => {
@@ -394,25 +480,33 @@ pub const Processor = struct {
                 },
                 .insert => |ins| {
                     if (self.isMetadataTable(ins.relation_oid)) {
-                        try self.extractMetadataFromTuple(ins.relation_oid, ins.new_tuple);
+                        try self.extractMetadataFromTuple(ins.relation_oid, ins.new_tuple, ins.xid);
                     } else {
-                        try self.bufferEvent(ins.relation_oid, 'I', ins.new_tuple, null);
+                        try self.bufferEvent(ins.relation_oid, 'I', ins.new_tuple, null, ins.xid);
                     }
                 },
                 .update => |upd| {
                     if (self.isMetadataTable(upd.relation_oid)) {
-                        try self.extractMetadataFromTuple(upd.relation_oid, upd.new_tuple);
+                        try self.extractMetadataFromTuple(upd.relation_oid, upd.new_tuple, upd.xid);
                     } else {
-                        try self.bufferEvent(upd.relation_oid, 'U', upd.new_tuple, upd.old_tuple);
+                        try self.bufferEvent(upd.relation_oid, 'U', upd.new_tuple, upd.old_tuple, upd.xid);
                     }
                 },
                 .delete => |del| {
                     if (!self.isMetadataTable(del.relation_oid)) {
-                        try self.bufferEvent(del.relation_oid, 'D', null, del.old_tuple);
+                        try self.bufferEvent(del.relation_oid, 'D', null, del.old_tuple, del.xid);
                     }
                 },
-                .truncate => {
-                    try self.bufferEvent(0, 'T', null, null);
+                .truncate => |trunc| {
+                    // One event per truncated relation so the audit trail
+                    // records which tables were truncated.
+                    var i: u32 = 0;
+                    while (i < trunc.relation_count) : (i += 1) {
+                        const oid = try trunc.relationOid(i);
+                        if (!self.isMetadataTable(oid)) {
+                            try self.bufferEvent(oid, 'T', null, null, trunc.xid);
+                        }
+                    }
                 },
                 // Proto v2: streaming — events and metadata are buffered
                 // during stream chunks and flushed at commit time when
@@ -420,10 +514,10 @@ pub const Processor = struct {
                 .stream_start => |ss| {
                     self.current_stream_xid = ss.xid;
                     if (ss.first_segment) {
-                        self.current_txn_xid = ss.xid;
-                        self.in_transaction = true;
-                        self.clearMetadataChunks();
-                        self.clearPendingEvents();
+                        // Fresh start of this transaction's stream: drop
+                        // any stale buffered state for this xid (e.g. a
+                        // batch replayed after a crash).
+                        self.dropStreamTxn(ss.xid);
                     }
                 },
                 .stream_stop => {
@@ -431,20 +525,26 @@ pub const Processor = struct {
                 },
                 .stream_commit => |sc| {
                     self.current_txn_lsn = sc.lsn;
+                    self.current_txn_xid = sc.xid;
                     self.current_txn_timestamp = sc.timestamp;
                     self.current_txn_id = try self.insertTransaction(sc.lsn);
+                    try self.adoptStreamBuffers(sc.xid);
                     try self.flushPendingEvents();
                     try self.flushMetadata();
                     self.current_stream_xid = null;
-                    self.in_transaction = false;
                     self.current_txn_id = null;
                 },
-                .stream_abort => {
-                    self.clearMetadataChunks();
-                    self.clearPendingEvents();
+                .stream_abort => |sa| {
+                    // A top-level abort discards the whole transaction; a
+                    // subtransaction abort discards only the changes tagged
+                    // with that sub_xid. Other interleaved transactions are
+                    // untouched.
+                    if (sa.sub_xid == sa.xid) {
+                        self.dropStreamTxn(sa.xid);
+                    } else {
+                        self.dropStreamSubxact(sa.xid, sa.sub_xid);
+                    }
                     self.current_stream_xid = null;
-                    self.in_transaction = false;
-                    self.current_txn_id = null;
                 },
                 // Proto v3: two-phase commit
                 .begin_prepare => |bp| {
@@ -473,9 +573,19 @@ pub const Processor = struct {
                     // Prepared within streaming — keep txn state
                 },
                 .message => |logical_msg| {
+                    // Only transactional messages (flags bit 0) carry
+                    // metadata for the surrounding transaction; a
+                    // non-transactional message has no transaction and
+                    // would otherwise be mis-attributed to the next one.
                     if (self.config.metadata_message_prefix) |prefix| {
-                        if (std.mem.eql(u8, logical_msg.prefix, prefix)) {
-                            try self.addMetadataChunk(logical_msg.content);
+                        if ((logical_msg.flags & 1) != 0 and
+                            std.mem.eql(u8, logical_msg.prefix, prefix))
+                        {
+                            if (self.current_stream_xid) |top| {
+                                try self.addStreamMetadata(top, logical_msg.xid orelse top, logical_msg.content);
+                            } else {
+                                try self.addMetadataChunk(logical_msg.content);
+                            }
                         }
                     }
                 },
@@ -485,7 +595,7 @@ pub const Processor = struct {
     }
 
     fn insertTransaction(self: *Processor, lsn: u64) !?i64 {
-        var sql: std.ArrayListUnmanaged(u8) = .{};
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
         defer sql.deinit(self.allocator);
 
         try sql.appendSlice(self.allocator, "INSERT INTO transactions (source_id, lsn, xid, committed_at) VALUES (");
@@ -516,7 +626,7 @@ pub const Processor = struct {
             }
         }
 
-        var sql: std.ArrayListUnmanaged(u8) = .{};
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
         defer sql.deinit(self.allocator);
 
         try sql.appendSlice(
@@ -570,9 +680,10 @@ pub const Processor = struct {
         }
     }
 
-    /// Append a pgoutput tuple as a COPY text-format JSONB field
-    /// ({"col":"val",...}) or \N if the tuple has no data.
-    fn appendTupleAsJsonbCopy(
+    /// Append a pgoutput tuple as a COPY binary JSONB field
+    /// (length + version byte + {"col":"val",...}) or a NULL field if the
+    /// tuple has no data.
+    fn appendTupleAsJsonbField(
         self: *Processor,
         frag: *std.ArrayListUnmanaged(u8),
         rel: OwnedRelation,
@@ -592,10 +703,14 @@ pub const Processor = struct {
         }
 
         if (!has_any) {
-            try frag.appendSlice(self.allocator, query_mod.copy_null);
+            try frag.appendSlice(self.allocator, query_mod.copy_binary_null);
             return;
         }
 
+        // Field length is patched once the JSON is built.
+        const len_offset = frag.items.len;
+        try query_mod.appendBinU32(frag, self.allocator, 0);
+        try frag.append(self.allocator, 1); // JSONB version
         try frag.append(self.allocator, '{');
         var first = true;
         for (rel.columns, 0..) |col, i| {
@@ -605,27 +720,30 @@ pub const Processor = struct {
                 .text => |t| {
                     if (!first) try frag.append(self.allocator, ',');
                     first = false;
-                    try appendJsonStringCopy(frag, self.allocator, col.name);
+                    try appendJsonStringPlain(frag, self.allocator, col.name);
                     try frag.append(self.allocator, ':');
-                    try appendJsonStringCopy(frag, self.allocator, t);
+                    try appendJsonStringPlain(frag, self.allocator, t);
                 },
                 .binary => |b| {
                     if (!first) try frag.append(self.allocator, ',');
                     first = false;
-                    try appendJsonStringCopy(frag, self.allocator, col.name);
+                    try appendJsonStringPlain(frag, self.allocator, col.name);
                     try frag.append(self.allocator, ':');
-                    try appendJsonStringCopy(frag, self.allocator, b);
+                    try appendJsonStringPlain(frag, self.allocator, b);
                 },
                 .null_value => {
                     if (!first) try frag.append(self.allocator, ',');
                     first = false;
-                    try appendJsonStringCopy(frag, self.allocator, col.name);
+                    try appendJsonStringPlain(frag, self.allocator, col.name);
                     try frag.appendSlice(self.allocator, ":null");
                 },
                 .unchanged => {},
             }
         }
         try frag.append(self.allocator, '}');
+
+        const field_len: u32 = @intCast(frag.items.len - len_offset - 4);
+        std.mem.writeInt(u32, frag.items[len_offset..][0..4], field_len, .big);
     }
 
     fn computeIdentityDigest(self: *Processor, rel: OwnedRelation, tuple: []const pgoutput.ColumnData) !?[]u8 {
@@ -712,7 +830,7 @@ pub const Processor = struct {
                 else => continue,
             };
             const replica_identity: u8 = switch (ri_val) {
-                .integer => |i| @intCast(i),
+                .integer => |i| std.math.cast(u8, i) orelse continue,
                 else => continue,
             };
             const cols_arr = switch (cols_val) {
@@ -759,17 +877,17 @@ pub const Processor = struct {
                 @memcpy(col_name, col_name_str);
 
                 const flags: u8 = if (col_obj.get("flags")) |f| switch (f) {
-                    .integer => |i| @intCast(i),
+                    .integer => |i| std.math.cast(u8, i) orelse 0,
                     else => 0,
                 } else 0;
 
                 const type_oid: u32 = if (col_obj.get("oid")) |o| switch (o) {
-                    .integer => |i| @intCast(i),
+                    .integer => |i| std.math.cast(u32, i) orelse 0,
                     else => 0,
                 } else 0;
 
                 const type_modifier: i32 = if (col_obj.get("typmod")) |t| switch (t) {
-                    .integer => |i| @intCast(i),
+                    .integer => |i| std.math.cast(i32, i) orelse -1,
                     else => -1,
                 } else -1;
 
@@ -840,21 +958,117 @@ pub const Processor = struct {
         try self.metadata_chunks.append(self.allocator, copy);
     }
 
-    fn extractMetadataFromTuple(self: *Processor, relation_oid: u32, tuple: ?[]const pgoutput.ColumnData) !void {
+    fn addStreamMetadata(self: *Processor, xid: u32, sub_xid: u32, content: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, content);
+        errdefer self.allocator.free(copy);
+        const gop = try self.stream_metadata.getOrPut(xid);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(self.allocator, .{ .sub_xid = sub_xid, .data = copy });
+    }
+
+    fn extractMetadataFromTuple(self: *Processor, relation_oid: u32, tuple: ?[]const pgoutput.ColumnData, sub_xid: ?u32) !void {
         const t = tuple orelse return;
         const rel = self.relations.get(relation_oid) orelse return;
 
         // Find the "data" column and extract its value
         for (rel.columns, 0..) |col, i| {
             if (std.mem.eql(u8, col.name, "data") and i < t.len) {
-                switch (t[i]) {
-                    .text => |v| try self.addMetadataChunk(v),
-                    .binary => |v| try self.addMetadataChunk(v),
-                    else => {},
+                const value: []const u8 = switch (t[i]) {
+                    .text => |v| v,
+                    .binary => |v| v,
+                    else => return,
+                };
+                if (self.current_stream_xid) |top| {
+                    try self.addStreamMetadata(top, sub_xid orelse top, value);
+                } else {
+                    try self.addMetadataChunk(value);
                 }
                 return;
             }
         }
+    }
+
+    /// Move a committed streamed transaction's buffered events and
+    /// metadata into the shared (non-streamed) buffers for flushing.
+    /// Ownership of each item's bytes transfers to the shared lists.
+    fn adoptStreamBuffers(self: *Processor, xid: u32) !void {
+        if (self.stream_events.fetchRemove(xid)) |entry| {
+            var list = entry.value;
+            defer list.deinit(self.allocator);
+            for (list.items, 0..) |item, i| {
+                self.pending_events.append(self.allocator, item.data) catch |err| {
+                    for (list.items[i..]) |rest| self.allocator.free(rest.data);
+                    return err;
+                };
+            }
+        }
+        if (self.stream_metadata.fetchRemove(xid)) |entry| {
+            var list = entry.value;
+            defer list.deinit(self.allocator);
+            for (list.items, 0..) |item, i| {
+                self.metadata_chunks.append(self.allocator, item.data) catch |err| {
+                    for (list.items[i..]) |rest| self.allocator.free(rest.data);
+                    return err;
+                };
+            }
+        }
+    }
+
+    /// Discard all buffered state for a streamed transaction.
+    fn dropStreamTxn(self: *Processor, xid: u32) void {
+        if (self.stream_events.fetchRemove(xid)) |entry| {
+            var list = entry.value;
+            for (list.items) |item| self.allocator.free(item.data);
+            list.deinit(self.allocator);
+        }
+        if (self.stream_metadata.fetchRemove(xid)) |entry| {
+            var list = entry.value;
+            for (list.items) |item| self.allocator.free(item.data);
+            list.deinit(self.allocator);
+        }
+    }
+
+    /// Discard the buffered changes of one aborted subtransaction,
+    /// keeping the rest of the transaction's buffer intact.
+    fn dropStreamSubxact(self: *Processor, xid: u32, sub_xid: u32) void {
+        if (self.stream_events.getPtr(xid)) |list| {
+            var i: usize = 0;
+            while (i < list.items.len) {
+                if (list.items[i].sub_xid == sub_xid) {
+                    self.allocator.free(list.items[i].data);
+                    _ = list.orderedRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        if (self.stream_metadata.getPtr(xid)) |list| {
+            var i: usize = 0;
+            while (i < list.items.len) {
+                if (list.items[i].sub_xid == sub_xid) {
+                    self.allocator.free(list.items[i].data);
+                    _ = list.orderedRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Discard all per-xid streamed transaction buffers.
+    fn clearStreamBuffers(self: *Processor) void {
+        var ev_it = self.stream_events.iterator();
+        while (ev_it.next()) |entry| {
+            for (entry.value_ptr.items) |item| self.allocator.free(item.data);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.stream_events.clearRetainingCapacity();
+        var md_it = self.stream_metadata.iterator();
+        while (md_it.next()) |entry| {
+            for (entry.value_ptr.items) |item| self.allocator.free(item.data);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.stream_metadata.clearRetainingCapacity();
     }
 
     fn clearMetadataChunks(self: *Processor) void {
@@ -867,7 +1081,7 @@ pub const Processor = struct {
     fn flushMetadata(self: *Processor) !void {
         if (self.metadata_chunks.items.len == 0) return;
 
-        var sql: std.ArrayListUnmanaged(u8) = .{};
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
         defer sql.deinit(self.allocator);
 
         try sql.appendSlice(self.allocator, "UPDATE transactions SET metadata = ");
@@ -907,6 +1121,7 @@ pub const Processor = struct {
         event_type: u8,
         tuple: ?[]const pgoutput.ColumnData,
         old_tuple: ?[]const pgoutput.ColumnData,
+        sub_xid: ?u32,
     ) !void {
         const rel = if (relation_oid != 0) self.relations.get(relation_oid) else null;
 
@@ -929,45 +1144,53 @@ pub const Processor = struct {
         } else null;
         defer if (prev_identity_digest) |d| self.allocator.free(d);
 
-        // Build a COPY text-format fragment: tab-separated fields for
-        // rel_oid, type, identity_digest, previous_identity_digest, data,
-        // old_data. transaction_id and committed_at are prepended at flush.
-        var frag: std.ArrayListUnmanaged(u8) = .{};
+        // Build the COPY binary fields for rel_oid, type, identity_digest,
+        // previous_identity_digest, data, old_data. transaction_id and
+        // committed_at are prepended at flush.
+        var frag: std.ArrayListUnmanaged(u8) = .empty;
         errdefer frag.deinit(self.allocator);
 
-        // rel_oid
-        try query_mod.appendIntValue(&frag, self.allocator, relation_oid);
-        try frag.append(self.allocator, '\t');
+        // rel_oid (int4; OID bits carried through as-is)
+        try query_mod.appendBinU32(&frag, self.allocator, 4);
+        try query_mod.appendBinU32(&frag, self.allocator, relation_oid);
 
-        // type (single char I/U/D/T — no escaping needed)
+        // type (CHAR(1): the character's byte)
+        try query_mod.appendBinU32(&frag, self.allocator, 1);
         try frag.append(self.allocator, event_type);
-        try frag.append(self.allocator, '\t');
 
-        // identity_digest
-        try query_mod.appendCopyByteaOrNull(&frag, self.allocator, identity_digest);
-        try frag.append(self.allocator, '\t');
-
-        // previous_identity_digest
-        try query_mod.appendCopyByteaOrNull(&frag, self.allocator, prev_identity_digest);
-        try frag.append(self.allocator, '\t');
+        // identity digests (bytea: raw bytes, no hex)
+        try query_mod.appendBinByteaField(&frag, self.allocator, identity_digest);
+        try query_mod.appendBinByteaField(&frag, self.allocator, prev_identity_digest);
 
         // data JSONB
         if (rel != null and tuple != null) {
-            try self.appendTupleAsJsonbCopy(&frag, rel.?, tuple.?);
+            try self.appendTupleAsJsonbField(&frag, rel.?, tuple.?);
         } else {
-            try frag.appendSlice(self.allocator, query_mod.copy_null);
+            try frag.appendSlice(self.allocator, query_mod.copy_binary_null);
         }
-        try frag.append(self.allocator, '\t');
 
         // old_data JSONB
         if (rel != null and old_tuple != null) {
-            try self.appendTupleAsJsonbCopy(&frag, rel.?, old_tuple.?);
+            try self.appendTupleAsJsonbField(&frag, rel.?, old_tuple.?);
         } else {
-            try frag.appendSlice(self.allocator, query_mod.copy_null);
+            try frag.appendSlice(self.allocator, query_mod.copy_binary_null);
         }
 
         const owned = try frag.toOwnedSlice(self.allocator);
-        try self.pending_events.append(self.allocator, owned);
+
+        if (self.current_stream_xid) |top| {
+            // Streamed transaction: buffer per-xid until its stream_commit.
+            errdefer self.allocator.free(owned);
+            const gop = try self.stream_events.getOrPut(top);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(self.allocator, .{ .sub_xid = sub_xid orelse top, .data = owned });
+            return;
+        }
+
+        {
+            errdefer self.allocator.free(owned);
+            try self.pending_events.append(self.allocator, owned);
+        }
 
         // Flush in chunks to bound memory for large transactions.
         // Only possible when current_txn_id is known (non-streaming path).
@@ -979,40 +1202,64 @@ pub const Processor = struct {
     /// Insert all buffered events via COPY with the transaction_id and
     /// committed_at timestamp. COPY skips SQL lexing/parsing/planning on
     /// the server, which dominates the cost of large multi-row INSERTs.
+    /// Rows are streamed through copy-in mode in ~64 KiB chunks, so peak
+    /// memory stays at one chunk instead of a full concatenated copy of
+    /// the batch.
     fn flushPendingEvents(self: *Processor) !void {
         if (self.pending_events.items.len == 0) return;
 
         const txn_id = self.current_txn_id orelse try self.lookupTransactionId();
 
-        var txn_id_buf: [20]u8 = undefined;
-        const txn_id_text = std.fmt.bufPrint(&txn_id_buf, "{d}", .{txn_id}) catch unreachable;
-        var ts_buf: [40]u8 = undefined;
-        const ts_text = query_mod.writeTimestampText(&ts_buf, self.current_txn_timestamp);
+        // Binary timestamptz is microseconds since 2000-01-01 UTC — exactly
+        // the pgoutput commit timestamp. Clamp to the Unix epoch to match
+        // the text path used by insertTransaction (writeTimestampText), so
+        // events.committed_at always equals the parent transaction row's.
+        const min_pg_usec: i64 = -946_684_800 * 1_000_000;
+        const ts_usec = @max(self.current_txn_timestamp, min_pg_usec);
 
-        self.copy_buf.clearRetainingCapacity();
-        for (self.pending_events.items) |frag| {
-            try self.copy_buf.appendSlice(self.allocator, txn_id_text);
-            try self.copy_buf.append(self.allocator, '\t');
-            try self.copy_buf.appendSlice(self.allocator, ts_text);
-            try self.copy_buf.append(self.allocator, '\t');
-            try self.copy_buf.appendSlice(self.allocator, frag);
-            try self.copy_buf.append(self.allocator, '\n');
-        }
-
-        try self.dest.copyIn(
+        try self.dest.copyInBegin(
             self.allocator,
             "COPY events (transaction_id, committed_at, rel_oid, type, " ++
-                "identity_digest, previous_identity_digest, data, old_data) FROM STDIN",
-            self.copy_buf.items,
+                "identity_digest, previous_identity_digest, data, old_data) " ++
+                "FROM STDIN WITH (FORMAT binary)",
         );
+        self.streamEventRows(txn_id, ts_usec) catch |err| {
+            // Leave copy mode so the connection is usable for ROLLBACK.
+            self.dest.copyInFail("pgzr: client-side failure while streaming events");
+            return err;
+        };
+        try self.dest.copyInEnd();
         self.clearPendingEvents();
+    }
+
+    /// Accumulate event rows into copy_buf and ship each ~64 KiB chunk.
+    const copy_chunk_target: usize = 64 * 1024;
+
+    fn streamEventRows(self: *Processor, txn_id: i64, ts_usec: i64) !void {
+        self.copy_buf.clearRetainingCapacity();
+        try self.copy_buf.appendSlice(self.allocator, query_mod.copy_binary_header);
+        for (self.pending_events.items) |frag| {
+            // Tuple: field count, transaction_id, committed_at, then the
+            // pre-encoded fields 3..8 from the fragment.
+            try query_mod.appendBinU16(&self.copy_buf, self.allocator, 8);
+            try query_mod.appendBinI64Field(&self.copy_buf, self.allocator, txn_id);
+            try query_mod.appendBinI64Field(&self.copy_buf, self.allocator, ts_usec);
+            try self.copy_buf.appendSlice(self.allocator, frag);
+            if (self.copy_buf.items.len >= copy_chunk_target) {
+                try self.dest.copyInWrite(self.copy_buf.items);
+                self.copy_buf.clearRetainingCapacity();
+            }
+        }
+        try self.copy_buf.appendSlice(self.allocator, query_mod.copy_binary_trailer);
+        try self.dest.copyInWrite(self.copy_buf.items);
+        self.copy_buf.clearRetainingCapacity();
     }
 
     /// Resolve the current transaction's id when insertTransaction did not
     /// return one. Preserves the pre-COPY fallback (a per-row subquery in
     /// the INSERT); with COPY the id must be resolved client-side.
     fn lookupTransactionId(self: *Processor) !i64 {
-        var sql: std.ArrayListUnmanaged(u8) = .{};
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
         defer sql.deinit(self.allocator);
 
         try sql.appendSlice(self.allocator, "SELECT id FROM transactions WHERE source_id=");
@@ -1037,42 +1284,7 @@ pub const Processor = struct {
     }
 
     fn decodeBytea(self: *Processor, hex_data: []const u8) ![]u8 {
-        if (hex_data.len < 2 or hex_data[0] != '\\' or hex_data[1] != 'x') {
-            const copy = try self.allocator.alloc(u8, hex_data.len);
-            @memcpy(copy, hex_data);
-            return copy;
-        }
-
-        const hex = hex_data[2..];
-        if (hex.len % 2 != 0) {
-            return try self.allocator.alloc(u8, 0);
-        }
-
-        const out_len = hex.len / 2;
-        const out = try self.allocator.alloc(u8, out_len);
-
-        for (0..out_len) |i| {
-            const hi = hexDigit(hex[i * 2]) orelse {
-                self.allocator.free(out);
-                return error.OutOfMemory;
-            };
-            const lo = hexDigit(hex[i * 2 + 1]) orelse {
-                self.allocator.free(out);
-                return error.OutOfMemory;
-            };
-            out[i] = (hi << 4) | lo;
-        }
-
-        return out;
-    }
-
-    fn hexDigit(c: u8) ?u8 {
-        return switch (c) {
-            '0'...'9' => c - '0',
-            'a'...'f' => c - 'a' + 10,
-            'A'...'F' => c - 'A' + 10,
-            else => null,
-        };
+        return decodeByteaAlloc(self.allocator, hex_data);
     }
 
     /// Main processing loop. Processes pending batches until stopped.
@@ -1081,7 +1293,7 @@ pub const Processor = struct {
         while (!self.stop_flag.load(.acquire)) {
             const processed = try self.processOne();
             if (!processed) {
-                std.Thread.sleep(self.config.poll_interval_ms * std.time.ns_per_ms);
+                self.io.sleep(.fromMilliseconds(@intCast(self.config.poll_interval_ms)), .awake) catch {};
             }
         }
     }
@@ -1106,26 +1318,145 @@ pub const Processor = struct {
         self.metadata_chunks.deinit(self.allocator);
         self.clearPendingEvents();
         self.pending_events.deinit(self.allocator);
+        self.clearStreamBuffers();
+        self.stream_events.deinit();
+        self.stream_metadata.deinit();
         self.copy_buf.deinit(self.allocator);
         self.dest.close();
     }
 };
 
-/// Append a JSON-escaped string (with surrounding double quotes) in COPY
-/// text format. Each JSON escape's backslash is doubled so it survives COPY
-/// unescaping (\\" on the wire → \" after COPY → escaped quote in JSON).
-/// Unlike the SQL-literal variant, single quotes need no escaping. Runs of
-/// characters that need no escaping are copied in bulk.
-fn appendJsonStringCopy(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+/// Decode a bytea value from PostgreSQL text output. Hex format
+/// (\x-prefixed) is decoded; anything else is returned as-is (escape
+/// format is not produced by servers since 9.0 defaults, but raw
+/// pass-through keeps older data readable). Corrupt hex (odd length or
+/// a non-hex digit) is an error — truncating or dropping WAL data here
+/// would silently lose events downstream.
+fn decodeByteaAlloc(allocator: std.mem.Allocator, hex_data: []const u8) ![]u8 {
+    if (hex_data.len < 2 or hex_data[0] != '\\' or hex_data[1] != 'x') {
+        return allocator.dupe(u8, hex_data);
+    }
+
+    const hex = hex_data[2..];
+    if (hex.len % 2 != 0) return error.InvalidMessage;
+
+    const out_len = hex.len / 2;
+    const out = try allocator.alloc(u8, out_len);
+    errdefer allocator.free(out);
+
+    for (0..out_len) |i| {
+        const hi = hex_decode_table[hex[i * 2]];
+        const lo = hex_decode_table[hex[i * 2 + 1]];
+        // 0xff marks an invalid digit; surviving values are 0..15.
+        if ((hi | lo) == 0xff) return error.InvalidMessage;
+        out[i] = (hi << 4) | lo;
+    }
+
+    return out;
+}
+
+/// Table-driven hex digit decode (0xff = invalid). The branchy
+/// switch-based decode ran at ~0.2 GB/s and dominated client CPU when
+/// decoding megabyte-scale batch rows; the table runs at multi-GB/s.
+const hex_decode_table = blk: {
+    var t: [256]u8 = @splat(0xff);
+    for ('0'..'9' + 1) |c| t[c] = @intCast(c - '0');
+    for ('a'..'f' + 1) |c| t[c] = @intCast(c - 'a' + 10);
+    for ('A'..'F' + 1) |c| t[c] = @intCast(c - 'A' + 10);
+    break :blk t;
+};
+
+test "decodeByteaAlloc: valid hex" {
+    const out = try decodeByteaAlloc(std.testing.allocator, "\\xdeadBEEF");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xde, 0xad, 0xbe, 0xef }, out);
+}
+
+test "decodeByteaAlloc: empty hex" {
+    const out = try decodeByteaAlloc(std.testing.allocator, "\\x");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
+test "decodeByteaAlloc: odd-length hex is an error, not empty data" {
+    try std.testing.expectError(error.InvalidMessage, decodeByteaAlloc(std.testing.allocator, "\\xabc"));
+}
+
+test "decodeByteaAlloc: invalid hex digit is an error" {
+    try std.testing.expectError(error.InvalidMessage, decodeByteaAlloc(std.testing.allocator, "\\xzz"));
+}
+
+test "decodeByteaAlloc: non-hex input passes through" {
+    const out = try decodeByteaAlloc(std.testing.allocator, "raw");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("raw", out);
+}
+
+/// SQLSTATE classes whose errors are expected to succeed on retry:
+///   08 — connection exception
+///   40 — transaction rollback (deadlock_detected, serialization_failure)
+///   53 — insufficient resources (memory, disk, connection slots)
+///   55 — object not in prerequisite state (lock_not_available)
+///   57 — operator intervention (query_canceled, shutdown)
+/// Everything else (22 data, 23 integrity, 42 syntax/access, ...) is
+/// treated as a property of the statement and therefore of the batch.
+fn isRetryableSqlState(code: []const u8) bool {
+    if (code.len < 2) return false;
+    const class = code[0..2];
+    return std.mem.eql(u8, class, "08") or
+        std.mem.eql(u8, class, "40") or
+        std.mem.eql(u8, class, "53") or
+        std.mem.eql(u8, class, "55") or
+        std.mem.eql(u8, class, "57");
+}
+
+test "isRetryableSqlState: transient classes retry" {
+    try std.testing.expect(isRetryableSqlState("40P01")); // deadlock_detected
+    try std.testing.expect(isRetryableSqlState("40001")); // serialization_failure
+    try std.testing.expect(isRetryableSqlState("57014")); // query_canceled
+    try std.testing.expect(isRetryableSqlState("53200")); // out_of_memory
+    try std.testing.expect(isRetryableSqlState("55P03")); // lock_not_available
+    try std.testing.expect(isRetryableSqlState("08006")); // connection_failure
+}
+
+test "isRetryableSqlState: data/constraint/syntax errors park" {
+    try std.testing.expect(!isRetryableSqlState("22021")); // invalid byte sequence
+    try std.testing.expect(!isRetryableSqlState("23502")); // not_null_violation
+    try std.testing.expect(!isRetryableSqlState("42601")); // syntax_error
+    try std.testing.expect(!isRetryableSqlState("22P02")); // invalid_text_representation
+    try std.testing.expect(!isRetryableSqlState(""));
+    try std.testing.expect(!isRetryableSqlState("4"));
+}
+
+/// Append a plain JSON-escaped string (with surrounding double quotes).
+/// Used inside COPY binary JSONB fields, which carry raw JSON text — no
+/// COPY text-format escaping layer. Runs of characters that need no
+/// escaping are skipped 16 bytes at a time.
+fn appendJsonStringPlain(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: []const u8) !void {
     try list.append(allocator, '"');
     var start: usize = 0;
-    for (value, 0..) |c, i| {
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        // Vectorized fast path: skip 16-byte blocks containing no byte
+        // that needs escaping (control chars, '"', '\\'). Typical column
+        // values are clean text, so this is the common case.
+        const V = @Vector(16, u8);
+        while (i + 16 <= value.len) {
+            const v: V = value[i..][0..16].*;
+            const needs = (v < @as(V, @splat(0x20))) |
+                (v == @as(V, @splat('"'))) |
+                (v == @as(V, @splat('\\')));
+            if (@reduce(.Or, needs)) break;
+            i += 16;
+        }
+        if (i >= value.len) break;
+        const c = value[i];
         const esc: []const u8 = switch (c) {
-            '"' => "\\\\\"",
-            '\\' => "\\\\\\\\",
-            '\n' => "\\\\n",
-            '\r' => "\\\\r",
-            '\t' => "\\\\t",
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
             // Control characters: \u-escaped below
             0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => "",
             else => continue,
@@ -1135,7 +1466,7 @@ fn appendJsonStringCopy(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Al
             try list.appendSlice(allocator, esc);
         } else {
             var buf: [8]u8 = undefined;
-            const u = std.fmt.bufPrint(&buf, "\\\\u{x:0>4}", .{c}) catch unreachable;
+            const u = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
             try list.appendSlice(allocator, u);
         }
         start = i + 1;
@@ -1144,33 +1475,41 @@ fn appendJsonStringCopy(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Al
     try list.append(allocator, '"');
 }
 
-test "appendJsonStringCopy: plain" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+test "appendJsonStringPlain: plain" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
-    try appendJsonStringCopy(&list, std.testing.allocator, "hello");
+    try appendJsonStringPlain(&list, std.testing.allocator, "hello");
     try std.testing.expectEqualStrings("\"hello\"", list.items);
 }
 
-test "appendJsonStringCopy: quote and backslash double for COPY" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+test "appendJsonStringPlain: quote and backslash" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
-    try appendJsonStringCopy(&list, std.testing.allocator, "a\"b\\c");
-    // JSON: a\"b\\c — each escape backslash doubled for COPY
-    try std.testing.expectEqualStrings("\"a\\\\\"b\\\\\\\\c\"", list.items);
+    try appendJsonStringPlain(&list, std.testing.allocator, "a\"b\\c");
+    try std.testing.expectEqualStrings("\"a\\\"b\\\\c\"", list.items);
 }
 
-test "appendJsonStringCopy: single quote passes through" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+test "appendJsonStringPlain: single quote passes through" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
-    try appendJsonStringCopy(&list, std.testing.allocator, "it's");
+    try appendJsonStringPlain(&list, std.testing.allocator, "it's");
     try std.testing.expectEqualStrings("\"it's\"", list.items);
 }
 
-test "appendJsonStringCopy: newline tab control" {
-    var list: std.ArrayListUnmanaged(u8) = .{};
+test "appendJsonStringPlain: newline tab control" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(std.testing.allocator);
-    try appendJsonStringCopy(&list, std.testing.allocator, "a\nb\tc\x07d");
-    try std.testing.expectEqualStrings("\"a\\\\nb\\\\tc\\\\u0007d\"", list.items);
+    try appendJsonStringPlain(&list, std.testing.allocator, "a\nb\tc\x07d");
+    try std.testing.expectEqualStrings("\"a\\nb\\tc\\u0007d\"", list.items);
+}
+
+test "appendJsonStringPlain: long clean value uses vector fast path" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    const unit = "abcdefghijklmnopqrstuvwxyz0123456789";
+    const value = unit ++ unit ++ unit ++ unit;
+    try appendJsonStringPlain(&list, std.testing.allocator, value);
+    try std.testing.expectEqualStrings("\"" ++ value ++ "\"", list.items);
 }
 
 /// Append a JSON-escaped string (with surrounding double quotes) to the list.

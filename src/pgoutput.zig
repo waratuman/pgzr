@@ -200,9 +200,12 @@ pub const DecodeError = error{
 /// The caller must provide scratch buffers for columns and tuple data.
 ///
 /// `stream_xid`: when non-null, indicates we are inside a streaming context
-/// (between StreamStart and StreamStop). In proto_version 2+, DML messages
+/// (between StreamStart and StreamStop). In proto_version 2+, messages
 /// within a stream have an extra Int32 xid prepended before their normal
-/// fields. The caller manages stream state and passes the xid from StreamStart.
+/// fields: the xid of the (sub)transaction that produced the change, equal
+/// to the stream's top-level xid when not inside a subtransaction. The
+/// caller manages stream state and passes the xid from StreamStart; the
+/// decoded message's `xid` field carries the per-message (sub)xid.
 pub fn decode(
     data: []const u8,
     col_buf: []Column,
@@ -212,46 +215,52 @@ pub fn decode(
 ) DecodeError!PgoutputMessage {
     if (data.len == 0) return error.InvalidMessage;
 
-    // For streamed DML messages, skip the leading Int32 xid
-    const xid_offset: usize = if (stream_xid != null) 4 else 0;
+    const in_stream = stream_xid != null;
 
     return switch (data[0]) {
         'B' => .{ .begin = try decodeBegin(data[1..]) },
         'C' => .{ .commit = try decodeCommit(data[1..]) },
         'R' => blk: {
-            var rel = try decodeRelation(data[1 + xid_offset ..], col_buf);
-            rel.xid = stream_xid;
+            const pfx = try streamedPrefix(data, in_stream);
+            var rel = try decodeRelation(pfx.body, col_buf);
+            rel.xid = pfx.xid;
             break :blk .{ .relation = rel };
         },
         'I' => blk: {
-            var ins = try decodeInsert(data[1 + xid_offset ..], tuple_buf);
-            ins.xid = stream_xid;
+            const pfx = try streamedPrefix(data, in_stream);
+            var ins = try decodeInsert(pfx.body, tuple_buf);
+            ins.xid = pfx.xid;
             break :blk .{ .insert = ins };
         },
         'U' => blk: {
-            var upd = try decodeUpdate(data[1 + xid_offset ..], tuple_buf, tuple_buf2);
-            upd.xid = stream_xid;
+            const pfx = try streamedPrefix(data, in_stream);
+            var upd = try decodeUpdate(pfx.body, tuple_buf, tuple_buf2);
+            upd.xid = pfx.xid;
             break :blk .{ .update = upd };
         },
         'D' => blk: {
-            var del = try decodeDelete(data[1 + xid_offset ..], tuple_buf);
-            del.xid = stream_xid;
+            const pfx = try streamedPrefix(data, in_stream);
+            var del = try decodeDelete(pfx.body, tuple_buf);
+            del.xid = pfx.xid;
             break :blk .{ .delete = del };
         },
         'T' => blk: {
-            var trunc = try decodeTruncate(data[1 + xid_offset ..]);
-            trunc.xid = stream_xid;
+            const pfx = try streamedPrefix(data, in_stream);
+            var trunc = try decodeTruncate(pfx.body);
+            trunc.xid = pfx.xid;
             break :blk .{ .truncate = trunc };
         },
         'Y' => blk: {
-            var ti = try decodeTypeInfo(data[1 + xid_offset ..]);
-            ti.xid = stream_xid;
+            const pfx = try streamedPrefix(data, in_stream);
+            var ti = try decodeTypeInfo(pfx.body);
+            ti.xid = pfx.xid;
             break :blk .{ .type_info = ti };
         },
         'O' => .{ .origin = try decodeOrigin(data[1..]) },
         'M' => blk: {
-            var msg = try decodeLogicalMessage(data[1 + xid_offset ..]);
-            msg.xid = stream_xid;
+            const pfx = try streamedPrefix(data, in_stream);
+            var msg = try decodeLogicalMessage(pfx.body);
+            msg.xid = pfx.xid;
             break :blk .{ .message = msg };
         },
         // Proto v2: streaming
@@ -266,6 +275,22 @@ pub fn decode(
         'r' => .{ .rollback_prepared = try decodeRollbackPrepared(data[1..]) },
         'p' => .{ .stream_prepare = try decodeStreamPrepare(data[1..]) },
         else => error.UnknownMessageType,
+    };
+}
+
+const StreamedPrefix = struct {
+    body: []const u8,
+    xid: ?u32,
+};
+
+/// Split off a streamed message's leading Int32 (sub)xid. Outside a
+/// stream the body starts right after the type byte and the xid is null.
+fn streamedPrefix(data: []const u8, in_stream: bool) DecodeError!StreamedPrefix {
+    if (!in_stream) return .{ .body = data[1..], .xid = null };
+    if (data.len < 5) return error.UnexpectedEnd;
+    return .{
+        .body = data[5..],
+        .xid = std.mem.readInt(u32, data[1..5], .big),
     };
 }
 
@@ -385,13 +410,15 @@ fn decodeTupleData(data: []const u8, pos: *usize, buf: []ColumnData) DecodeError
             'n' => buf[i] = .null_value,
             'u' => buf[i] = .unchanged,
             't' => {
-                const len: usize = @intCast(try readI32(data, pos));
-                const val = try readBytes(data, pos, len);
+                const raw_len = try readI32(data, pos);
+                if (raw_len < 0) return error.InvalidMessage;
+                const val = try readBytes(data, pos, @intCast(raw_len));
                 buf[i] = .{ .text = val };
             },
             'b' => {
-                const len: usize = @intCast(try readI32(data, pos));
-                const val = try readBytes(data, pos, len);
+                const raw_len = try readI32(data, pos);
+                if (raw_len < 0) return error.InvalidMessage;
+                const val = try readBytes(data, pos, @intCast(raw_len));
                 buf[i] = .{ .binary = val };
             },
             else => return error.InvalidMessage,
@@ -443,7 +470,7 @@ fn decodeTruncate(data: []const u8) DecodeError!Truncate {
     const rel_count = try readU32(data, &pos);
     const options = try readU8(data, &pos);
     const oids_start = pos;
-    const oids_byte_len = rel_count * 4;
+    const oids_byte_len = @as(usize, rel_count) * 4;
     if (pos + oids_byte_len > data.len) return error.UnexpectedEnd;
     return .{
         .options = options,
@@ -969,6 +996,35 @@ test "decode streamed Insert with xid" {
     try std.testing.expectEqualStrings("hi", ins.new_tuple[0].text);
 }
 
+test "decode streamed Insert carries the embedded (sub)xid" {
+    // Streamed Insert inside stream of top xid 99, produced by subxact 123:
+    // 'I' + Int32(xid=123) + Int32(oid=1) + 'N' + TupleData(1 col: text "x")
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 'I';
+    pos += 1;
+    std.mem.writeInt(u32, buf[pos..][0..4], 123, .big);
+    pos += 4;
+    std.mem.writeInt(u32, buf[pos..][0..4], 1, .big);
+    pos += 4;
+    buf[pos] = 'N';
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], 1, .big);
+    pos += 2;
+    buf[pos] = 't';
+    pos += 1;
+    std.mem.writeInt(i32, buf[pos..][0..4], 1, .big);
+    pos += 4;
+    buf[pos] = 'x';
+    pos += 1;
+
+    var col_buf: [16]Column = undefined;
+    var tuple_buf: [16]ColumnData = undefined;
+    var tuple_buf2: [16]ColumnData = undefined;
+    const msg = try decode(buf[0..pos], &col_buf, &tuple_buf, &tuple_buf2, 99);
+    try std.testing.expectEqual(@as(u32, 123), msg.insert.xid.?);
+}
+
 test "decode non-streamed Insert has null xid" {
     var buf: [128]u8 = undefined;
     var pos: usize = 0;
@@ -994,4 +1050,46 @@ test "decode non-streamed Insert has null xid" {
     const ins = msg.insert;
     try std.testing.expectEqual(@as(u32, 16384), ins.relation_oid);
     try std.testing.expect(ins.xid == null);
+}
+
+test "decode Insert with negative tuple length is InvalidMessage" {
+    // 'I' + Int32(oid=1) + 'N' + Int16(1 col) + 't' + Int32(-5)
+    var buf: [16]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 'I';
+    pos += 1;
+    std.mem.writeInt(u32, buf[pos..][0..4], 1, .big);
+    pos += 4;
+    buf[pos] = 'N';
+    pos += 1;
+    std.mem.writeInt(u16, buf[pos..][0..2], 1, .big);
+    pos += 2;
+    buf[pos] = 't';
+    pos += 1;
+    std.mem.writeInt(i32, buf[pos..][0..4], -5, .big);
+    pos += 4;
+
+    var col_buf: [4]Column = undefined;
+    var tuple_buf: [4]ColumnData = undefined;
+    var tuple_buf2: [4]ColumnData = undefined;
+    try std.testing.expectError(
+        error.InvalidMessage,
+        decode(buf[0..pos], &col_buf, &tuple_buf, &tuple_buf2, null),
+    );
+}
+
+test "decode Truncate with huge relation count is UnexpectedEnd, not overflow" {
+    // 'T' + Int32(rel_count=0xFFFFFFFF) + Int8(options) + no oid data
+    var buf: [6]u8 = undefined;
+    buf[0] = 'T';
+    std.mem.writeInt(u32, buf[1..5], 0xFFFF_FFFF, .big);
+    buf[5] = 0;
+
+    var col_buf: [0]Column = undefined;
+    var tuple_buf: [0]ColumnData = undefined;
+    var tuple_buf2: [0]ColumnData = undefined;
+    try std.testing.expectError(
+        error.UnexpectedEnd,
+        decode(&buf, &col_buf, &tuple_buf, &tuple_buf2, null),
+    );
 }

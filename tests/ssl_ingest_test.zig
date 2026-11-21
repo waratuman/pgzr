@@ -1,24 +1,23 @@
 const std = @import("std");
 const pgzr = @import("pgzr");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        if (gpa.deinit() == .leak) {
-            std.debug.print("\nMemory leak detected!\n", .{});
-            std.process.exit(1);
-        }
-    }
-    const allocator = gpa.allocator();
+fn getenv(name: [*:0]const u8) ?[]const u8 {
+    const p = std.c.getenv(name) orelse return null;
+    return std.mem.span(p);
+}
 
-    const user = std.posix.getenv("PGUSER") orelse std.posix.getenv("USER") orelse "postgres";
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+
+    const user = getenv("PGUSER") orelse getenv("USER") orelse "postgres";
 
     std.debug.print("SSL Ingest Test: 50k rows (~17MB) with TLS require\n", .{});
     std.debug.print("==================================================\n\n", .{});
 
-    var timer = std.time.Timer.start() catch unreachable;
+    const start_ts = std.Io.Clock.awake.now(io);
 
-    var ingestor = pgzr.Ingestor.init(allocator, .{
+    var ingestor = pgzr.Ingestor.init(allocator, io, .{
         .source = .{
             .conn = .{
                 .host = "127.0.0.1",
@@ -56,7 +55,7 @@ pub fn main() !void {
         return err;
     };
 
-    const elapsed_ns = timer.read();
+    const elapsed_ns: u64 = @intCast(start_ts.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
     std.debug.print("\nDone in {d:.1}ms\n", .{elapsed_ms});
 }

@@ -76,12 +76,11 @@ Stream raw WAL messages from a logical replication slot:
 const std = @import("std");
 const pgzr = @import("pgzr");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    var repl = try pgzr.Replicator.init(allocator, .{
+    var repl = try pgzr.Replicator.init(allocator, io, .{
         .conn = .{
             .host = "127.0.0.1",
             .port = 5432,
@@ -109,7 +108,7 @@ Stream WAL from a source database and store packed batches in a destination
 database for later processing:
 
 ```zig
-var ingestor = try pgzr.Ingestor.init(allocator, .{
+var ingestor = try pgzr.Ingestor.init(allocator, io, .{
     .source = .{
         .conn = .{
             .host = "127.0.0.1",
@@ -143,7 +142,7 @@ try ingestor.run();
 Process stored WAL batches into structured transactions and events:
 
 ```zig
-var processor = try pgzr.Processor.init(allocator, .{
+var processor = try pgzr.Processor.init(allocator, io, .{
     .dest = .{
         .host = "127.0.0.1",
         .port = 5432,
@@ -226,9 +225,14 @@ Connections support four TLS modes via the `tls` field on `ConnConfig`:
 For the C ABI, the `tls_mode` integer maps as: 0 = disable, 1 = prefer,
 2 = require, 3 = verify-full.
 
+All init functions take a `std.Io` instance. Inside `main(init:
+std.process.Init)` use `init.io`; elsewhere create one with
+`var io_threaded: std.Io.Threaded = .init(allocator, .{});` and pass
+`io_threaded.io()`.
+
 ## Prerequisites
 
-- Zig 0.15.2+
+- Zig 0.17.1+
 - PostgreSQL with `wal_level = logical`
 - A logical replication slot (e.g. created with `test_decoding` or `pgoutput`)
 
@@ -257,12 +261,12 @@ ls zig-out/lib/libpgzr.*
 Exported functions:
 
 ```
-pgzr_ingestor_new(config)   → *Ingestor or NULL
+pgzr_ingestor_new(config)   → opaque handle or NULL
 pgzr_ingestor_run(ptr)      → 0 on success, -1 on error
 pgzr_ingestor_stop(ptr)     → void (thread-safe)
 pgzr_ingestor_free(ptr)     → void
 
-pgzr_processor_new(config)       → *Processor or NULL
+pgzr_processor_new(config)       → opaque handle or NULL
 pgzr_processor_run(ptr)          → 0 on success, -1 on error
 pgzr_processor_process_one(ptr)  → 1 if batch processed, 0 if none, -1 on error
 pgzr_processor_stop(ptr)         → void (thread-safe)
@@ -270,6 +274,9 @@ pgzr_processor_free(ptr)         → void
 
 pgzr_last_error(out_len)    → pointer to error message
 ```
+
+The config structs and every string they point to are copied during
+`pgzr_*_new`; the caller may free them as soon as the call returns.
 
 The `PgzrIngestConfig` struct accepts an optional `on_flush` callback
 (`void (*)(void *context, uint64_t start_lsn, uint64_t end_lsn, size_t msg_count, bool is_complete)`)
@@ -341,14 +348,12 @@ benchmark/
 - **UUIDv7 transaction IDs** — Replace `transactions.id` (BIGSERIAL) with a
   client-generated UUIDv7. This eliminates the `INSERT RETURNING id`
   round-trip when creating a transaction, since the ID is known before the
-  INSERT. The transaction INSERT can then be combined with the events
-  multi-row INSERT into a single SQL statement, reducing the per-transaction
-  round-trips from 2 to 1. Requires a schema migration:
+  INSERT. Requires a schema migration:
   `transactions.id` from `BIGSERIAL` to `UUID`, `events.transaction_id` from
   `BIGINT` to `UUID`, and updating the composite foreign key and primary keys.
   UUIDv7's time-ordered prefix preserves index locality on the partitioned
   tables. Zig's `std.crypto.random` provides the entropy source; the
-  timestamp prefix comes from `std.time.milliTimestamp()`.
+  timestamp prefix comes from the `Io` real-time clock.
 
 - **Extended query protocol** — The processor currently uses the simple query
   protocol. PostgreSQL's extended query protocol (Parse/Bind/Execute/Sync)
@@ -356,8 +361,8 @@ benchmark/
   further reducing round-trips. Requires implementing Parse, Bind, Execute,
   Describe, and Sync message encoding in `protocol.zig`, a new pipelined
   execution path in `connection.zig`, and response handling that matches
-  multiple result sequences to their corresponding requests. Event INSERTs
-  are already batched into a single multi-row INSERT per transaction.
+  multiple result sequences to their corresponding requests. Events and
+  batch rows are already inserted via `COPY ... FROM STDIN (FORMAT binary)`.
 
 - **io_uring / kqueue** — The transport layer currently uses blocking I/O.
   Using io_uring (Linux) or kqueue (macOS) would allow non-blocking,

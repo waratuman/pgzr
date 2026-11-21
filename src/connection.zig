@@ -1,4 +1,6 @@
 const std = @import("std");
+const Io = std.Io;
+const net = std.Io.net;
 const protocol = @import("protocol.zig");
 const auth_mod = @import("auth.zig");
 const Lsn = @import("lsn.zig").Lsn;
@@ -13,45 +15,63 @@ pub const default_recv_buf_size: usize = 1024 * 1024;
 pub const Connection = struct {
     transport: Transport,
     allocator: std.mem.Allocator,
+    io: Io,
     backend_pid: u32 = 0,
     backend_key: u32 = 0,
     recv_buf: []u8,
     /// Reusable send buffer for execLarge/execLargeWithResult.
-    send_buf: std.ArrayListUnmanaged(u8) = .{},
+    send_buf: std.ArrayListUnmanaged(u8) = .empty,
     /// Heap-allocated transport state (PlainState or TlsState).
     plain_state: ?*PlainState = null,
     tls_state: ?*TlsState = null,
+    /// SQLSTATE of the most recent server ErrorResponse within the current
+    /// command (cleared at the start of each query). Lets callers classify
+    /// error.ServerError (e.g. retryable deadlock vs. poison data).
+    last_error_code: [5]u8 = undefined,
+    last_error_code_len: u8 = 0,
 
-    pub const TcpConnectError = @typeInfo(@typeInfo(@TypeOf(std.net.tcpConnectToHost)).@"fn".return_type.?).error_union.error_set;
-    pub const UnixConnectError = @typeInfo(@typeInfo(@TypeOf(std.net.connectUnixSocket)).@"fn".return_type.?).error_union.error_set;
-    pub const ConnectError = auth_mod.AuthError || std.mem.Allocator.Error || TcpConnectError || UnixConnectError || Transport.WriteError || TlsState.UpgradeError || error{
+    pub const ConnectError = auth_mod.AuthError || std.mem.Allocator.Error ||
+        Transport.ReadError || Transport.WriteError || TlsState.UpgradeError ||
+        net.IpAddress.ConnectError || net.HostName.ConnectError ||
+        net.UnixAddress.ConnectError || net.UnixAddress.InitError ||
+        net.HostName.ValidateError || error{
         ServerError,
         TlsNotSupported,
     };
 
-    pub fn connect(allocator: std.mem.Allocator, config: types.ConnConfig) ConnectError!Connection {
+    pub fn connect(allocator: std.mem.Allocator, io: Io, config: types.ConnConfig) ConnectError!Connection {
         const stream = if (config.socket_path) |path| blk: {
             // Build socket path: if it doesn't end with a port suffix,
             // append "/.s.PGSQL.<port>"
             if (std.mem.endsWith(u8, path, ".s.PGSQL.5432") or
                 std.mem.indexOf(u8, path, ".s.PGSQL.") != null)
             {
-                break :blk try std.net.connectUnixSocket(path);
+                const ua = try net.UnixAddress.init(path);
+                break :blk try ua.connect(io);
             } else {
                 var path_buf: [256]u8 = undefined;
                 const full_path = std.fmt.bufPrint(&path_buf, "{s}/.s.PGSQL.{d}", .{
                     path,
                     config.port,
-                }) catch return error.OutOfMemory;
-                break :blk try std.net.connectUnixSocket(full_path);
+                }) catch return error.NameTooLong;
+                const ua = try net.UnixAddress.init(full_path);
+                break :blk try ua.connect(io);
             }
-        } else try std.net.tcpConnectToHost(allocator, config.host, config.port);
-        errdefer stream.close();
+        } else blk: {
+            // IP literal first, then DNS via HostName.
+            if (net.IpAddress.parse(config.host, config.port)) |addr| {
+                break :blk try addr.connect(io, .{ .mode = .stream });
+            } else |_| {
+                const hn = try net.HostName.init(config.host);
+                break :blk try hn.connect(io, config.port, .{ .mode = .stream });
+            }
+        };
+        errdefer stream.close(io);
 
         // Set up transport (plain initially, may upgrade to TLS)
         var plain_state: ?*PlainState = try allocator.create(PlainState);
         errdefer if (plain_state) |ps| allocator.destroy(ps);
-        plain_state.?.* = .{ .stream = stream };
+        plain_state.?.* = .{ .io = io, .stream = stream };
         var transport = Transport.plain(plain_state.?);
 
         var tls_state: ?*TlsState = null;
@@ -62,16 +82,19 @@ pub const Connection = struct {
             var ssl_buf: [8]u8 = undefined;
             std.mem.writeInt(u32, ssl_buf[0..4], 8, .big);
             std.mem.writeInt(u32, ssl_buf[4..8], 80877103, .big);
-            stream.writeAll(&ssl_buf) catch return error.WriteFailed;
+            try transport.writeAll(&ssl_buf);
 
-            // Read 1-byte response
+            // Read 1-byte response. Safe with the buffered plain transport:
+            // the server sends exactly one byte and then waits for the
+            // client (TLS ClientHello), so the refill cannot slurp bytes
+            // that belong to the TLS stream.
             var resp: [1]u8 = undefined;
-            const n = stream.read(&resp) catch return error.ConnectionClosed;
+            const n = try transport.read(&resp);
             if (n == 0) return error.ConnectionClosed;
 
             if (resp[0] == 'S') {
                 // Server accepts TLS — perform handshake
-                const ts = try TlsState.upgrade(allocator, stream, config.host, config.tls == .verify_full);
+                const ts = try TlsState.upgrade(allocator, io, stream, config.host, config.tls == .verify_full);
                 tls_state = ts;
                 errdefer if (tls_state) |ts2| allocator.destroy(ts2);
                 transport = Transport.tlsClient(ts);
@@ -92,7 +115,7 @@ pub const Connection = struct {
         try transport.writeAll(startup);
 
         // Authenticate
-        try auth_mod.authenticate(transport, config.user, config.password);
+        try auth_mod.authenticate(transport, io, config.user, config.password);
 
         const recv_buf = try allocator.alloc(u8, default_recv_buf_size);
         errdefer allocator.free(recv_buf);
@@ -100,6 +123,7 @@ pub const Connection = struct {
         var conn = Connection{
             .transport = transport,
             .allocator = allocator,
+            .io = io,
             .recv_buf = recv_buf,
             .plain_state = if (tls_state == null) plain_state else null,
             .tls_state = tls_state,
@@ -131,6 +155,27 @@ pub const Connection = struct {
         if (self.allocator.resize(self.recv_buf, default_recv_buf_size)) {
             self.recv_buf.len = default_recv_buf_size;
         }
+    }
+
+    /// Per-command setup: shrink recv_buf and clear the stored SQLSTATE.
+    fn beginCommand(self: *Connection) void {
+        self.resetRecvBuf();
+        self.last_error_code_len = 0;
+    }
+
+    /// Record the SQLSTATE from a server ErrorResponse so callers can
+    /// classify error.ServerError after the call returns.
+    fn noteServerError(self: *Connection, info: protocol.ErrorInfo) void {
+        const n: u8 = @intCast(@min(info.code.len, self.last_error_code.len));
+        @memcpy(self.last_error_code[0..n], info.code[0..n]);
+        self.last_error_code_len = n;
+    }
+
+    /// SQLSTATE of the server error raised by the most recent command, or
+    /// null if the command did not produce a server error.
+    pub fn lastServerErrorCode(self: *const Connection) ?[]const u8 {
+        if (self.last_error_code_len == 0) return null;
+        return self.last_error_code[0..self.last_error_code_len];
     }
 
     fn processPostAuth(self: *Connection) ConnectError!void {
@@ -188,10 +233,15 @@ pub const Connection = struct {
     /// survives subsequent protocol reads within this call.
     /// For CopyBothResponse (START_REPLICATION), returns with in_copy_mode=true.
     pub fn simpleQuery(self: *Connection, query: []const u8) QueryError!QueryResult {
-        self.resetRecvBuf();
+        self.beginCommand();
 
-        var send_buf: [4096]u8 = undefined;
-        const msg = protocol.encodeQuery(&send_buf, query);
+        // Query message: 'Q' (1) + int32 len (4) + query + '\0' (1).
+        // Uses the reusable growable send buffer: queries can exceed any
+        // fixed stack buffer (e.g. START_REPLICATION with many options).
+        const msg_len = 1 + 4 + query.len + 1;
+        self.send_buf.clearRetainingCapacity();
+        self.send_buf.ensureTotalCapacity(self.allocator, msg_len) catch return error.OutOfMemory;
+        const msg = protocol.encodeQuery(self.send_buf.allocatedSlice()[0..msg_len], query);
         try self.transport.writeAll(msg);
 
         var result = QueryResult{
@@ -259,6 +309,7 @@ pub const Connection = struct {
                     const body = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
+                    self.noteServerError(err);
                     server_error = true;
                 },
                 protocol.MSG_COPY_BOTH => {
@@ -280,7 +331,7 @@ pub const Connection = struct {
     /// Uses a reusable send buffer to avoid per-call allocations.
     /// Does not return result rows — use for INSERT/UPDATE/DELETE/DDL.
     pub fn execLarge(self: *Connection, allocator: std.mem.Allocator, sql: []const u8) QueryError!void {
-        self.resetRecvBuf();
+        self.beginCommand();
 
         // Query message: 'Q' (1) + int32 len (4) + query + '\0' (1)
         const msg_len = 1 + 4 + sql.len + 1;
@@ -319,6 +370,7 @@ pub const Connection = struct {
                     const body = try self.readBodyGrowing(header);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
+                    self.noteServerError(err);
                     server_error = true;
                 },
                 else => {
@@ -333,7 +385,7 @@ pub const Connection = struct {
     /// Column data is copied into the second half of recv_buf so it
     /// survives subsequent protocol reads.
     pub fn execLargeWithResult(self: *Connection, allocator: std.mem.Allocator, query: []const u8) QueryError!QueryResult {
-        self.resetRecvBuf();
+        self.beginCommand();
 
         const msg_len = 1 + 4 + query.len + 1;
         self.send_buf.clearRetainingCapacity();
@@ -405,6 +457,7 @@ pub const Connection = struct {
                     const body = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
+                    self.noteServerError(err);
                     server_error = true;
                 },
                 protocol.MSG_NOTICE => {
@@ -424,25 +477,33 @@ pub const Connection = struct {
     /// loads. Returns error.ServerError if the command is rejected or any
     /// row fails; the connection is drained to ReadyForQuery either way.
     pub fn copyIn(self: *Connection, allocator: std.mem.Allocator, command: []const u8, data: []const u8) QueryError!void {
-        self.resetRecvBuf();
+        try self.copyInBegin(allocator, command);
+        try self.copyInWrite(data);
+        try self.copyInEnd();
+    }
 
-        // Send the COPY command
+    /// Start a COPY ... FROM STDIN command. On success the connection is
+    /// in copy-in mode: send rows with copyInWrite, then finish with
+    /// copyInEnd — or, if row production fails mid-stream, abort with
+    /// copyInFail so the connection leaves copy mode. Returns
+    /// error.ServerError (connection drained) if the command is rejected.
+    pub fn copyInBegin(self: *Connection, allocator: std.mem.Allocator, command: []const u8) QueryError!void {
+        self.beginCommand();
+
         const msg_len = 1 + 4 + command.len + 1;
         self.send_buf.clearRetainingCapacity();
         self.send_buf.ensureTotalCapacity(allocator, msg_len) catch return error.OutOfMemory;
-        const buf = self.send_buf.allocatedSlice()[0..msg_len];
-        const msg = protocol.encodeQuery(buf, command);
+        const msg = protocol.encodeQuery(self.send_buf.allocatedSlice()[0..msg_len], command);
         try self.transport.writeAll(msg);
 
         // Wait for CopyInResponse. If the command is rejected the server
         // sends ErrorResponse + ReadyForQuery without entering copy mode.
-        var server_error = false;
-        copy_wait: while (true) {
+        while (true) {
             const header = try protocol.readHeader(self.transport);
             switch (header.msg_type) {
                 protocol.MSG_COPY_IN => {
                     _ = try self.readBodyGrowing(header);
-                    break :copy_wait;
+                    return;
                 },
                 protocol.MSG_READY => {
                     _ = try protocol.readBody(self.transport, header, self.recv_buf);
@@ -452,17 +513,19 @@ pub const Connection = struct {
                     const body = try self.readBodyGrowing(header);
                     const err = protocol.parseError(body);
                     std.log.err("Copy error: {s}: {s}", .{ err.code, err.message });
-                    server_error = true;
+                    self.noteServerError(err);
                 },
                 else => {
                     _ = try self.readBodyGrowing(header);
                 },
             }
         }
+    }
 
-        // Stream the data as CopyData messages. If the server errors
-        // mid-copy it discards further CopyData until CopyDone, so writing
-        // everything before reading cannot deadlock.
+    /// Send one chunk of copy data while in copy-in mode. If the server
+    /// errors mid-copy it discards further CopyData until CopyDone, so
+    /// writing without reading cannot deadlock.
+    pub fn copyInWrite(self: *Connection, data: []const u8) QueryError!void {
         var hdr: [5]u8 = undefined;
         const chunk_size: usize = 64 * 1024;
         var pos: usize = 0;
@@ -474,13 +537,34 @@ pub const Connection = struct {
             try self.transport.writeAll(data[pos .. pos + n]);
             pos += n;
         }
+    }
 
-        // CopyDone
+    /// Finish copy-in mode: send CopyDone and drain to ReadyForQuery.
+    pub fn copyInEnd(self: *Connection) QueryError!void {
+        var hdr: [5]u8 = undefined;
         hdr[0] = protocol.MSG_COPY_DONE;
         std.mem.writeInt(u32, hdr[1..5], 4, .big);
         try self.transport.writeAll(&hdr);
+        try self.drainCopyResult();
+    }
 
-        // Drain to ReadyForQuery
+    /// Abort copy-in mode: send CopyFail and drain to ReadyForQuery. The
+    /// server responds with an ErrorResponse, so errors are swallowed —
+    /// this is a cleanup path for client-side failures mid-stream.
+    pub fn copyInFail(self: *Connection, message: []const u8) void {
+        var buf: [128]u8 = undefined;
+        var w = protocol.MsgWriter{ .buf = &buf };
+        w.writeByte(protocol.MSG_COPY_FAIL);
+        const len_offset = w.pos;
+        w.writeInt32(0);
+        w.writeString(message[0..@min(message.len, buf.len - 7)]);
+        w.patchLength(len_offset);
+        self.transport.writeAll(w.getWritten()) catch return;
+        self.drainCopyResult() catch {};
+    }
+
+    fn drainCopyResult(self: *Connection) QueryError!void {
+        var server_error = false;
         while (true) {
             const header = try protocol.readHeader(self.transport);
             switch (header.msg_type) {
@@ -493,6 +577,7 @@ pub const Connection = struct {
                     const body = try self.readBodyGrowing(header);
                     const err = protocol.parseError(body);
                     std.log.err("Copy error: {s}: {s}", .{ err.code, err.message });
+                    self.noteServerError(err);
                     server_error = true;
                 },
                 else => {
@@ -512,10 +597,15 @@ pub const Connection = struct {
         context: anytype,
         callback: fn (@TypeOf(context), []const QueryColumn) void,
     ) QueryError!usize {
-        self.resetRecvBuf();
+        self.beginCommand();
 
-        var send_buf: [4096]u8 = undefined;
-        const msg = protocol.encodeQuery(&send_buf, query);
+        // Query message: 'Q' (1) + int32 len (4) + query + '\0' (1).
+        // Uses the reusable growable send buffer: queries can exceed any
+        // fixed stack buffer (e.g. START_REPLICATION with many options).
+        const msg_len = 1 + 4 + query.len + 1;
+        self.send_buf.clearRetainingCapacity();
+        self.send_buf.ensureTotalCapacity(self.allocator, msg_len) catch return error.OutOfMemory;
+        const msg = protocol.encodeQuery(self.send_buf.allocatedSlice()[0..msg_len], query);
         try self.transport.writeAll(msg);
 
         var row_count: usize = 0;
@@ -532,8 +622,10 @@ pub const Connection = struct {
                 },
                 protocol.MSG_DATA_ROW => {
                     const body = try self.readBodyGrowing(header);
-                    const col_count = std.mem.readInt(u16, body[0..2], .big);
+                    const raw_col_count = std.mem.readInt(u16, body[0..2], .big);
                     var cols: [16]QueryColumn = undefined;
+                    // Clamp to the local array; extra columns are dropped.
+                    const col_count = @min(raw_col_count, cols.len);
                     var pos: usize = 2;
                     for (0..col_count) |i| {
                         const col_len_raw = std.mem.readInt(i32, body[pos..][0..4], .big);
@@ -561,6 +653,7 @@ pub const Connection = struct {
                     const body = try self.readBodyGrowing(header);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
+                    self.noteServerError(err);
                     server_error = true;
                 },
                 protocol.MSG_NOTICE => {
@@ -575,8 +668,8 @@ pub const Connection = struct {
 
     /// Return the underlying socket file descriptor.
     pub fn getStreamHandle(self: *const Connection) std.posix.fd_t {
-        if (self.tls_state) |ts| return ts.stream.handle;
-        if (self.plain_state) |ps| return ps.stream.handle;
+        if (self.tls_state) |ts| return ts.stream.socket.handle;
+        if (self.plain_state) |ps| return ps.stream.socket.handle;
         unreachable;
     }
 
