@@ -9,6 +9,8 @@ dependencies.
 - TCP, Unix socket, and TLS connections (require, verify-full)
 - SCRAM-SHA-256, MD5, and cleartext authentication
 - pgoutput protocol versions 1-4 (streaming, two-phase commit)
+- Extended query protocol: server-side prepared statements and pipelined
+  execution (multiple statements per round trip)
 - WAL ingest and processing pipeline (store and replay WAL as an audit trail)
 - Batch splitting for large transactions
 - Auto-reconnection with exponential backoff
@@ -354,15 +356,6 @@ benchmark/
   UUIDv7's time-ordered prefix preserves index locality on the partitioned
   tables. Zig's `std.crypto.random` provides the entropy source; the
   timestamp prefix comes from the `Io` real-time clock.
-
-- **Extended query protocol** — The processor currently uses the simple query
-  protocol. PostgreSQL's extended query protocol (Parse/Bind/Execute/Sync)
-  enables parameterized queries with plan caching and pipeline mode for
-  further reducing round-trips. Requires implementing Parse, Bind, Execute,
-  Describe, and Sync message encoding in `protocol.zig`, a new pipelined
-  execution path in `connection.zig`, and response handling that matches
-  multiple result sequences to their corresponding requests. Events and
-  batch rows are already inserted via `COPY ... FROM STDIN (FORMAT binary)`.
 
 - **io_uring / kqueue** — The transport layer currently uses blocking I/O.
   Using io_uring (Linux) or kqueue (macOS) would allow non-blocking,

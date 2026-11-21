@@ -31,7 +31,6 @@ pub const Processor = struct {
     current_txn_xid: u32,
     current_txn_timestamp: i64,
     current_txn_id: ?i64,
-    in_transaction: bool,
 
     // Streaming context (proto v2+)
     current_stream_xid: ?u32,
@@ -61,11 +60,47 @@ pub const Processor = struct {
     // Reusable COPY stream buffer for flushPendingEvents.
     copy_buf: std.ArrayListUnmanaged(u8),
 
+    // Whether processOne should run the cheap existence probe before
+    // claiming. True when idle (the probe saves two round trips on an
+    // empty poll); false right after a successful claim, when more work
+    // is likely pending and the probe would just add a round trip.
+    probe_before_claim: bool,
+
     // Stop flag for graceful shutdown
     stop_flag: std.atomic.Value(bool),
 
     // Maximum number of buffered events before an intermediate flush.
     const flush_threshold: usize = 1000;
+
+    // Named server-side prepared statements (created in init). Extended
+    // query protocol: plan caching across calls, parameter binding
+    // instead of SQL escaping on the hot path.
+    const stmt_probe = "pgzr_probe";
+    const stmt_claim = "pgzr_claim";
+    const stmt_insert_txn = "pgzr_insert_txn";
+    const stmt_insert_rel_snapshot = "pgzr_insert_rel_snapshot";
+    const stmt_delete_batches = "pgzr_delete_batches";
+
+    // Claim the whole batch group (one complete batch + its partials) in a
+    // single statement. The group selector uses SKIP LOCKED so concurrent
+    // workers pick different groups; member rows use plain FOR UPDATE so
+    // an external reaper's UPDATE blocks on rows this worker holds
+    // (issue #14).
+    const claim_group_sql =
+        "WITH grp AS (" ++
+        " SELECT id, source_id, begin_lsn FROM wal_batches" ++
+        " WHERE state='pending' AND complete=true" ++
+        " ORDER BY created_at LIMIT 1" ++
+        " FOR UPDATE SKIP LOCKED" ++
+        "), members AS (" ++
+        " SELECT w.id FROM wal_batches w, grp" ++
+        " WHERE w.source_id=grp.source_id AND w.begin_lsn=grp.begin_lsn" ++
+        " AND w.state='pending' AND w.complete=false" ++
+        " FOR UPDATE OF w" ++
+        ")" ++
+        " UPDATE wal_batches SET state='processing'" ++
+        " WHERE id IN (SELECT id FROM grp UNION ALL SELECT id FROM members)" ++
+        " RETURNING id, source_id, start_lsn, complete, data, relations";
 
     const StreamItem = struct {
         sub_xid: u32,
@@ -107,6 +142,23 @@ pub const Processor = struct {
 
         try schema_mod.ensureSchema(&dest);
 
+        // All five statements are prepared in one pipelined round trip.
+        var prep = dest.pipeline();
+        try prep.prepare(stmt_probe, "SELECT 1 FROM wal_batches WHERE state='pending' AND complete=true LIMIT 1");
+        try prep.prepare(stmt_claim, claim_group_sql);
+        try prep.prepare(stmt_insert_txn, "INSERT INTO transactions (source_id, lsn, xid, committed_at)" ++
+            " VALUES ($1::uuid, $2::bigint, $3::integer, $4::timestamptz)" ++
+            // DO UPDATE (a no-op overwrite of xid) instead of DO NOTHING so
+            // RETURNING always yields the row's id — on conflict included —
+            // avoiding a fallback SELECT round trip.
+            " ON CONFLICT (source_id, lsn, committed_at) DO UPDATE SET xid = EXCLUDED.xid RETURNING id");
+        try prep.prepare(stmt_insert_rel_snapshot, "INSERT INTO relation_snapshots" ++
+            " (source_id, lsn, rel_oid, schema_name, table_name, replica_identity, columns)" ++
+            " VALUES ($1::uuid, $2::bigint, $3::integer, $4, $5, $6::smallint, $7::jsonb)" ++
+            " ON CONFLICT (source_id, rel_oid, lsn) DO NOTHING");
+        try prep.prepare(stmt_delete_batches, "DELETE FROM wal_batches WHERE id = ANY($1::bigint[])");
+        try prep.syncDiscard();
+
         return Processor{
             .dest = dest,
             .allocator = allocator,
@@ -121,7 +173,6 @@ pub const Processor = struct {
             .current_txn_xid = 0,
             .current_txn_timestamp = 0,
             .current_txn_id = null,
-            .in_transaction = false,
             .current_stream_xid = null,
             .pending_data = .empty,
             .pending_batch_ids = .empty,
@@ -131,6 +182,7 @@ pub const Processor = struct {
             .stream_events = std.AutoHashMap(u32, std.ArrayListUnmanaged(StreamItem)).init(allocator),
             .stream_metadata = std.AutoHashMap(u32, std.ArrayListUnmanaged(StreamItem)).init(allocator),
             .copy_buf = .empty,
+            .probe_before_claim = true,
             .stop_flag = std.atomic.Value(bool).init(false),
         };
     }
@@ -144,17 +196,22 @@ pub const Processor = struct {
     /// source_id + begin_lsn). Partial batches are fetched alongside their
     /// completing batch and processed as one logical unit.
     pub fn processOne(self: *Processor) ProcessError!bool {
-        // Cheap existence probe first: an idle poll costs one round trip
-        // instead of three (BEGIN + claim + COMMIT). The claim re-checks
-        // under lock, so a stale probe result is harmless — a miss is
-        // caught next poll, a false hit yields an empty claim.
-        const probe = try self.dest.simpleQuery(
-            "SELECT 1 FROM wal_batches WHERE state='pending' AND complete=true LIMIT 1",
-        );
-        if (probe.column_count == 0) return false;
+        // Cheap existence probe: an idle poll costs one round trip instead
+        // of three (BEGIN + claim + COMMIT). Skipped right after a
+        // successful claim — more work is likely pending then, and the
+        // probe would tax every batch on the busy path with an extra round
+        // trip. The claim re-checks under lock, so a stale probe result is
+        // harmless — a miss is caught next poll, a false hit yields an
+        // empty claim.
+        if (self.probe_before_claim) {
+            const probe = try self.dest.execPreparedWithResult(stmt_probe, &.{});
+            if (probe.column_count == 0) return false;
+        }
 
-        // Run the whole claim/decode/insert/delete cycle inside one transaction
-        // so the claim's row lock (FOR UPDATE) is held until the work commits.
+        // The whole claim/decode/insert/delete cycle runs inside one
+        // transaction (BEGIN is pipelined with the claim by claimAndProcess,
+        // COMMIT with the batch delete below) so the claim's row lock
+        // (FOR UPDATE) is held until the work commits.
         //
         // This makes the processor idempotent under concurrent zombie recovery
         // (issue #14): an external reaper that requeues stuck 'processing'
@@ -163,8 +220,6 @@ pub const Processor = struct {
         // rolls back, reverting state='processing' to 'pending' and releasing
         // the lock, so the batch is retried automatically with no duplicate
         // events and no reaper required.
-        _ = try self.dest.simpleQuery("BEGIN");
-
         const claimed = self.claimAndProcess() catch |err| {
             // Roll back the claim and all inserts. Park the claimed
             // batch(es) in 'error' state only for poison failures (decode
@@ -183,16 +238,21 @@ pub const Processor = struct {
         };
 
         if (!claimed) {
+            // End the (empty) claim transaction.
             _ = self.dest.simpleQuery("COMMIT") catch {};
+            self.probe_before_claim = true;
             return false;
         }
+        self.probe_before_claim = false;
 
-        _ = self.dest.simpleQuery("COMMIT") catch |err| {
+        self.deleteBatchesAndCommit() catch |err| {
             // The transaction rolled back server-side (or the connection
-            // died), reverting the claimed rows to 'pending'. The batch data
-            // is intact, so don't park it — just discard all local state so
-            // the next cycle starts clean instead of replaying stale
-            // pending_data/pending_events against a new claim.
+            // died), reverting the claimed rows to 'pending'. The batch
+            // data is intact, so never park it — discard all local state
+            // so the next cycle starts clean instead of replaying stale
+            // pending_data/pending_events against a new claim. The
+            // ROLLBACK is a no-op if the transaction already ended.
+            _ = self.dest.simpleQuery("ROLLBACK") catch {};
             self.resetBatchState();
             return err;
         };
@@ -233,7 +293,6 @@ pub const Processor = struct {
         self.clearPendingEvents();
         self.clearMetadataChunks();
         self.clearStreamBuffers();
-        self.in_transaction = false;
         self.current_txn_id = null;
         self.current_stream_xid = null;
     }
@@ -254,9 +313,9 @@ pub const Processor = struct {
         }
     };
 
-    /// Callback context for the group claim query. queryRows callbacks cannot
-    /// return errors, so failures (allocation, corrupt stored bytea) are
-    /// recorded in `err` and re-raised after the query completes.
+    /// Callback context for the group claim query. Pipeline row callbacks
+    /// cannot return errors, so failures (allocation, corrupt stored bytea)
+    /// are recorded in `err` and re-raised after the query completes.
     const ClaimContext = struct {
         proc: *Processor,
         rows: std.ArrayListUnmanaged(ClaimedRow) = .empty,
@@ -264,7 +323,9 @@ pub const Processor = struct {
         relations_json: ?[]u8 = null,
         err: ?Processor.ProcessError = null,
 
-        fn onRow(self: *ClaimContext, cols: []const Connection.QueryColumn) void {
+        fn onRow(self: *ClaimContext, stmt_index: usize, cols: []const Connection.QueryColumn) void {
+            // Rows come from the claim statement (pipelined after BEGIN).
+            if (stmt_index != 1) return;
             if (self.err != null) return;
             self.onRowInner(cols) catch |e| {
                 self.err = e;
@@ -275,7 +336,7 @@ pub const Processor = struct {
             const proc = self.proc;
             if (cols.len < 6) return;
 
-            // Track the claimed id for deleteBatches/markBatchesError.
+            // Track the claimed id for deleteBatchesAndCommit/markBatchesError.
             // The errdefer is scoped to the block: once append succeeds the
             // list owns id_copy, and clearPending must be the only freer.
             const id_copy = try proc.allocator.alloc(u8, cols[0].data.len);
@@ -324,36 +385,21 @@ pub const Processor = struct {
         }
     };
 
-    /// Claim a pending batch group and process it, inserting all decoded rows
-    /// and deleting the claimed batches. Must run inside a transaction opened
-    /// by the caller (processOne) so the claim's row lock is held throughout.
+    /// Claim a pending batch group and process it, inserting all decoded
+    /// rows. Opens the claim transaction itself (BEGIN pipelined with the
+    /// claim) so the claim's row lock is held throughout; the caller
+    /// (processOne) deletes the batches and commits on success, or rolls
+    /// back on error.
     /// Returns true if a batch was claimed, false if none were pending.
     fn claimAndProcess(self: *Processor) ProcessError!bool {
-        // Claim the whole batch group (one complete batch + its partials) in a
-        // single statement. The group selector uses SKIP LOCKED so concurrent
-        // workers pick different groups; member rows use plain FOR UPDATE so
-        // an external reaper's UPDATE blocks on rows this worker holds
-        // (issue #14).
-        const claim_group =
-            "WITH grp AS (" ++
-            " SELECT id, source_id, begin_lsn FROM wal_batches" ++
-            " WHERE state='pending' AND complete=true" ++
-            " ORDER BY created_at LIMIT 1" ++
-            " FOR UPDATE SKIP LOCKED" ++
-            "), members AS (" ++
-            " SELECT w.id FROM wal_batches w, grp" ++
-            " WHERE w.source_id=grp.source_id AND w.begin_lsn=grp.begin_lsn" ++
-            " AND w.state='pending' AND w.complete=false" ++
-            " FOR UPDATE OF w" ++
-            ")" ++
-            " UPDATE wal_batches SET state='processing'" ++
-            " WHERE id IN (SELECT id FROM grp UNION ALL SELECT id FROM members)" ++
-            " RETURNING id, source_id, start_lsn, complete, data, relations";
-
         var ctx = ClaimContext{ .proc = self };
         defer ctx.deinit(self.allocator);
 
-        _ = try self.dest.queryRows(claim_group, &ctx, ClaimContext.onRow);
+        // BEGIN and the claim share one round trip.
+        var claim_pipe = self.dest.pipeline();
+        try claim_pipe.exec("BEGIN", &.{});
+        try claim_pipe.execPrepared(stmt_claim, &.{});
+        try claim_pipe.sync(&ctx, ClaimContext.onRow);
         if (ctx.err) |e| return e;
         if (ctx.rows.items.len == 0) return false;
 
@@ -385,11 +431,10 @@ pub const Processor = struct {
         // batches in 'error' state.
         try self.processBatch(self.pending_data.items);
 
-        // Step 4: Delete all claimed batches. Inside the claim's transaction, so
-        // a delete failure rolls back the inserts too — the batch returns to
-        // 'pending' rather than being processed without being removed.
-        try self.deleteBatches();
-
+        // The caller deletes the claimed batches and commits (pipelined
+        // into one round trip). Still inside the claim's transaction, so
+        // a delete failure rolls back the inserts too — the batch returns
+        // to 'pending' rather than being processed without being removed.
         return true;
     }
 
@@ -415,15 +460,25 @@ pub const Processor = struct {
         self.dest.execLarge(self.allocator, sql.items) catch {};
     }
 
-    fn deleteBatches(self: *Processor) !void {
-        if (self.pending_batch_ids.items.len == 0) return;
+    /// Delete all claimed batches and COMMIT the claim transaction in a
+    /// single pipelined round trip. The ids come from RETURNING id on a
+    /// BIGSERIAL column (numeric text), so they are safe to embed in a
+    /// bigint[] array literal unquoted.
+    fn deleteBatchesAndCommit(self: *Processor) !void {
+        var ids: std.ArrayListUnmanaged(u8) = .empty;
+        defer ids.deinit(self.allocator);
 
-        var sql: std.ArrayListUnmanaged(u8) = .empty;
-        defer sql.deinit(self.allocator);
+        try ids.append(self.allocator, '{');
+        for (self.pending_batch_ids.items, 0..) |bid, i| {
+            if (i > 0) try ids.append(self.allocator, ',');
+            try ids.appendSlice(self.allocator, bid);
+        }
+        try ids.append(self.allocator, '}');
 
-        try sql.appendSlice(self.allocator, "DELETE FROM wal_batches WHERE ");
-        try self.appendBatchIdList(&sql);
-        try self.dest.execLarge(self.allocator, sql.items);
+        var p = self.dest.pipeline();
+        try p.execPrepared(stmt_delete_batches, &.{ids.items});
+        try p.exec("COMMIT", &.{});
+        try p.syncDiscard();
     }
 
     fn clearPending(self: *Processor) void {
@@ -458,7 +513,6 @@ pub const Processor = struct {
                     self.current_txn_lsn = begin.final_lsn;
                     self.current_txn_xid = begin.xid;
                     self.current_txn_timestamp = begin.timestamp;
-                    self.in_transaction = true;
                     self.clearMetadataChunks();
                     self.clearPendingEvents();
                     self.current_txn_id = try self.insertTransaction(begin.final_lsn);
@@ -466,7 +520,6 @@ pub const Processor = struct {
                 .commit => {
                     try self.flushPendingEvents();
                     try self.flushMetadata();
-                    self.in_transaction = false;
                     self.current_txn_id = null;
                 },
                 .relation => |rel| {
@@ -551,7 +604,6 @@ pub const Processor = struct {
                     self.current_txn_lsn = bp.lsn;
                     self.current_txn_xid = bp.xid;
                     self.current_txn_timestamp = bp.timestamp;
-                    self.in_transaction = true;
                     self.clearMetadataChunks();
                     self.current_txn_id = try self.insertTransaction(bp.lsn);
                 },
@@ -561,12 +613,10 @@ pub const Processor = struct {
                 .commit_prepared => {
                     try self.flushPendingEvents();
                     try self.flushMetadata();
-                    self.in_transaction = false;
                     self.current_txn_id = null;
                 },
                 .rollback_prepared => {
                     self.clearPendingEvents();
-                    self.in_transaction = false;
                     self.current_txn_id = null;
                 },
                 .stream_prepare => {
@@ -595,23 +645,17 @@ pub const Processor = struct {
     }
 
     fn insertTransaction(self: *Processor, lsn: u64) !?i64 {
-        var sql: std.ArrayListUnmanaged(u8) = .empty;
-        defer sql.deinit(self.allocator);
+        var lsn_buf: [20]u8 = undefined;
+        var xid_buf: [10]u8 = undefined;
+        var ts_buf: [40]u8 = undefined;
+        const params = [_]?[]const u8{
+            self.sourceId(),
+            std.fmt.bufPrint(&lsn_buf, "{d}", .{lsn}) catch unreachable,
+            std.fmt.bufPrint(&xid_buf, "{d}", .{self.current_txn_xid}) catch unreachable,
+            query_mod.writeTimestampText(&ts_buf, self.current_txn_timestamp),
+        };
 
-        try sql.appendSlice(self.allocator, "INSERT INTO transactions (source_id, lsn, xid, committed_at) VALUES (");
-        try query_mod.appendEscapedUuid(&sql, self.allocator, self.sourceId());
-        try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendIntValue(&sql, self.allocator, lsn);
-        try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_xid);
-        try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendTimestamp(&sql, self.allocator, self.current_txn_timestamp);
-        // DO UPDATE (a no-op overwrite of xid) instead of DO NOTHING so
-        // RETURNING always yields the row's id — on conflict included —
-        // avoiding a fallback SELECT round trip.
-        try sql.appendSlice(self.allocator, ") ON CONFLICT (source_id, lsn, committed_at) DO UPDATE SET xid = EXCLUDED.xid RETURNING id");
-
-        const result = try self.dest.execLargeWithResult(self.allocator, sql.items);
+        const result = try self.dest.execPreparedWithResult(stmt_insert_txn, &params);
         if (result.column_count > 0 and result.columns[0].data.len > 0) {
             return std.fmt.parseInt(i64, result.columns[0].data, 10) catch null;
         }
@@ -626,53 +670,48 @@ pub const Processor = struct {
             }
         }
 
-        var sql: std.ArrayListUnmanaged(u8) = .empty;
-        defer sql.deinit(self.allocator);
+        // Build the JSONB columns array as plain JSON (bound as a
+        // parameter, so no SQL-literal escaping layer).
+        var cols_json: std.ArrayListUnmanaged(u8) = .empty;
+        defer cols_json.deinit(self.allocator);
 
-        try sql.appendSlice(
-            self.allocator,
-            "INSERT INTO relation_snapshots (source_id, lsn, rel_oid, schema_name, table_name, replica_identity, columns) VALUES (",
-        );
-        try query_mod.appendEscapedUuid(&sql, self.allocator, self.sourceId());
-        try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendIntValue(&sql, self.allocator, self.current_txn_lsn);
-        try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendIntValue(&sql, self.allocator, rel.oid);
-        try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendEscapedString(&sql, self.allocator, rel.namespace);
-        try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendEscapedString(&sql, self.allocator, rel.name);
-        try sql.appendSlice(self.allocator, ", ");
-        try query_mod.appendIntValue(&sql, self.allocator, rel.replica_identity);
-        try sql.appendSlice(self.allocator, ", '");
-
-        // Build JSONB columns array
-        try sql.appendSlice(self.allocator, "[");
+        try cols_json.append(self.allocator, '[');
         for (rel.columns, 0..) |col, i| {
-            if (i > 0) try sql.appendSlice(self.allocator, ",");
-            try sql.appendSlice(self.allocator, "{\"name\":");
-            try appendJsonString(&sql, self.allocator, col.name);
-            try sql.appendSlice(self.allocator, ",\"oid\":");
-            try query_mod.appendIntValue(&sql, self.allocator, col.type_oid);
-            try sql.appendSlice(self.allocator, ",\"type\":");
+            if (i > 0) try cols_json.append(self.allocator, ',');
+            try cols_json.appendSlice(self.allocator, "{\"name\":");
+            try appendJsonStringPlain(&cols_json, self.allocator, col.name);
+            try cols_json.appendSlice(self.allocator, ",\"oid\":");
+            try query_mod.appendIntValue(&cols_json, self.allocator, col.type_oid);
+            try cols_json.appendSlice(self.allocator, ",\"type\":");
             var type_name_buf: [32]u8 = undefined;
             const type_name = pg_types.oidToName(col.type_oid, &type_name_buf);
-            try appendJsonString(&sql, self.allocator, type_name);
-            try sql.appendSlice(self.allocator, ",\"identity\":");
+            try appendJsonStringPlain(&cols_json, self.allocator, type_name);
+            try cols_json.appendSlice(self.allocator, ",\"identity\":");
             if ((col.flags & 1) != 0) {
-                try sql.appendSlice(self.allocator, "true");
+                try cols_json.appendSlice(self.allocator, "true");
             } else {
-                try sql.appendSlice(self.allocator, "false");
+                try cols_json.appendSlice(self.allocator, "false");
             }
-            try sql.appendSlice(self.allocator, ",\"ordinal\":");
-            try query_mod.appendIntValue(&sql, self.allocator, i);
-            try sql.append(self.allocator, '}');
+            try cols_json.appendSlice(self.allocator, ",\"ordinal\":");
+            try query_mod.appendIntValue(&cols_json, self.allocator, i);
+            try cols_json.append(self.allocator, '}');
         }
-        try sql.appendSlice(self.allocator, "]");
+        try cols_json.append(self.allocator, ']');
 
-        try sql.appendSlice(self.allocator, "') ON CONFLICT (source_id, rel_oid, lsn) DO NOTHING");
+        var lsn_buf: [20]u8 = undefined;
+        var oid_buf: [10]u8 = undefined;
+        var ri_buf: [3]u8 = undefined;
+        const params = [_]?[]const u8{
+            self.sourceId(),
+            std.fmt.bufPrint(&lsn_buf, "{d}", .{self.current_txn_lsn}) catch unreachable,
+            std.fmt.bufPrint(&oid_buf, "{d}", .{rel.oid}) catch unreachable,
+            rel.namespace,
+            rel.name,
+            std.fmt.bufPrint(&ri_buf, "{d}", .{rel.replica_identity}) catch unreachable,
+            cols_json.items,
+        };
 
-        try self.dest.execLarge(self.allocator, sql.items);
+        try self.dest.execPrepared(stmt_insert_rel_snapshot, &params);
 
         // Update snapshot_lsn in cache
         if (self.relations.getPtr(rel.oid)) |owned| {
@@ -1032,27 +1071,26 @@ pub const Processor = struct {
     /// keeping the rest of the transaction's buffer intact.
     fn dropStreamSubxact(self: *Processor, xid: u32, sub_xid: u32) void {
         if (self.stream_events.getPtr(xid)) |list| {
-            var i: usize = 0;
-            while (i < list.items.len) {
-                if (list.items[i].sub_xid == sub_xid) {
-                    self.allocator.free(list.items[i].data);
-                    _ = list.orderedRemove(i);
-                } else {
-                    i += 1;
-                }
-            }
+            self.compactStreamItems(list, sub_xid);
         }
         if (self.stream_metadata.getPtr(xid)) |list| {
-            var i: usize = 0;
-            while (i < list.items.len) {
-                if (list.items[i].sub_xid == sub_xid) {
-                    self.allocator.free(list.items[i].data);
-                    _ = list.orderedRemove(i);
-                } else {
-                    i += 1;
-                }
+            self.compactStreamItems(list, sub_xid);
+        }
+    }
+
+    /// Remove (and free) all items tagged with sub_xid in one O(n)
+    /// compaction pass, preserving the order of the survivors.
+    fn compactStreamItems(self: *Processor, list: *std.ArrayListUnmanaged(StreamItem), sub_xid: u32) void {
+        var keep: usize = 0;
+        for (list.items) |item| {
+            if (item.sub_xid == sub_xid) {
+                self.allocator.free(item.data);
+            } else {
+                list.items[keep] = item;
+                keep += 1;
             }
         }
+        list.shrinkRetainingCapacity(keep);
     }
 
     /// Discard all per-xid streamed transaction buffers.
@@ -1510,35 +1548,4 @@ test "appendJsonStringPlain: long clean value uses vector fast path" {
     const value = unit ++ unit ++ unit ++ unit;
     try appendJsonStringPlain(&list, std.testing.allocator, value);
     try std.testing.expectEqualStrings("\"" ++ value ++ "\"", list.items);
-}
-
-/// Append a JSON-escaped string (with surrounding double quotes) to the list.
-/// Runs of characters that need no escaping are copied in bulk.
-fn appendJsonString(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: []const u8) !void {
-    try list.append(allocator, '"');
-    var start: usize = 0;
-    for (value, 0..) |c, i| {
-        const esc: []const u8 = switch (c) {
-            '"' => "\\\"",
-            '\'' => "''",
-            '\\' => "\\\\",
-            '\n' => "\\n",
-            '\r' => "\\r",
-            '\t' => "\\t",
-            // Control characters: \u-escaped below
-            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => "",
-            else => continue,
-        };
-        try list.appendSlice(allocator, value[start..i]);
-        if (esc.len > 0) {
-            try list.appendSlice(allocator, esc);
-        } else {
-            var buf: [6]u8 = undefined;
-            _ = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
-            try list.appendSlice(allocator, &buf);
-        }
-        start = i + 1;
-    }
-    try list.appendSlice(allocator, value[start..]);
-    try list.append(allocator, '"');
 }

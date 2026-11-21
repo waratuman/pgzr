@@ -19,8 +19,14 @@ pub const Connection = struct {
     backend_pid: u32 = 0,
     backend_key: u32 = 0,
     recv_buf: []u8,
-    /// Reusable send buffer for execLarge/execLargeWithResult.
+    /// Reusable send buffer for simple queries, COPY commands, and
+    /// extended-protocol pipelines.
     send_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// Side buffer holding the row returned by simpleQuery and
+    /// execPreparedWithResult. Separate from recv_buf so later protocol
+    /// reads (which may overwrite or realloc recv_buf) cannot corrupt or
+    /// dangle the returned column slices. Grows to fit the captured row.
+    result_buf: std.ArrayListUnmanaged(u8) = .empty,
     /// Heap-allocated transport state (PlainState or TlsState).
     plain_state: ?*PlainState = null,
     tls_state: ?*TlsState = null,
@@ -74,7 +80,16 @@ pub const Connection = struct {
         plain_state.?.* = .{ .io = io, .stream = stream };
         var transport = Transport.plain(plain_state.?);
 
+        // Function-scoped errdefer: a TLS upgrade may succeed and a later
+        // step (startup, auth, post-auth) still fail, so the state must be
+        // freed from any error path, not just within the TLS branch.
         var tls_state: ?*TlsState = null;
+        errdefer if (tls_state) |ts| {
+            // The CA bundle (loaded for verify-full) is otherwise freed
+            // only by TlsState.closeFn, which error paths never reach.
+            ts.ca_bundle.deinit(allocator);
+            allocator.destroy(ts);
+        };
 
         // TLS negotiation (only for TCP connections, not Unix sockets)
         if (config.tls != .disable and config.socket_path == null) {
@@ -96,7 +111,6 @@ pub const Connection = struct {
                 // Server accepts TLS — perform handshake
                 const ts = try TlsState.upgrade(allocator, io, stream, config.host, config.tls == .verify_full);
                 tls_state = ts;
-                errdefer if (tls_state) |ts2| allocator.destroy(ts2);
                 transport = Transport.tlsClient(ts);
                 // Free the plain state since we're now using TLS
                 allocator.destroy(plain_state.?);
@@ -135,10 +149,8 @@ pub const Connection = struct {
         return conn;
     }
 
-    /// Read a message body, growing recv_buf if the body exceeds current capacity.
-    /// Allocates 2x the body size to preserve the split-buffer strategy used by
-    /// simpleQuery and execLargeWithResult (first half for reads, second half
-    /// for stable column data copies).
+    /// Read a message body, growing recv_buf if the body exceeds current
+    /// capacity. Allocates 2x the body size as growth headroom.
     pub fn readBodyGrowing(self: *Connection, header: protocol.MessageHeader) ![]u8 {
         const body_len = header.bodyLen();
         if (body_len > self.recv_buf.len) {
@@ -229,8 +241,11 @@ pub const Connection = struct {
     };
 
     /// Execute a simple query and return the first DataRow result.
-    /// Column data is copied into the second half of recv_buf so it
-    /// survives subsequent protocol reads within this call.
+    /// Column data is copied into result_buf — a side buffer separate
+    /// from recv_buf — so it cannot be overwritten or left dangling by
+    /// later protocol reads (which may overwrite or realloc recv_buf).
+    /// The result is valid until the next row-returning command on this
+    /// connection.
     /// For CopyBothResponse (START_REPLICATION), returns with in_copy_mode=true.
     pub fn simpleQuery(self: *Connection, query: []const u8) QueryError!QueryResult {
         self.beginCommand();
@@ -244,16 +259,7 @@ pub const Connection = struct {
         const msg = protocol.encodeQuery(self.send_buf.allocatedSlice()[0..msg_len], query);
         try self.transport.writeAll(msg);
 
-        var result = QueryResult{
-            .columns = undefined,
-            .column_count = 0,
-            .in_copy_mode = false,
-        };
-
-        // Reserve second half of recv_buf for stable column data copies.
-        // Recomputed after readBodyGrowing since the buffer may grow.
-        var stable_base = self.recv_buf.len / 2;
-        var stable_pos: usize = 0;
+        var cap = FirstRowCapture{ .conn = self };
         // On ErrorResponse the server still sends a trailing ReadyForQuery; we
         // must read through it before returning so the connection stays in sync
         // for subsequent queries (e.g. a ROLLBACK after a failed statement).
@@ -263,50 +269,18 @@ pub const Connection = struct {
             const header = try protocol.readHeader(self.transport);
 
             switch (header.msg_type) {
-                protocol.MSG_ROW_DESC => {
-                    _ = try self.readBodyGrowing(header);
-                },
                 protocol.MSG_DATA_ROW => {
                     const body = try self.readBodyGrowing(header);
-                    // Recompute stable_base in case the buffer grew
-                    stable_base = self.recv_buf.len / 2;
-                    if (result.column_count == 0) {
-                        const raw_col_count = std.mem.readInt(u16, body[0..2], .big);
-                        const col_count = @min(raw_col_count, result.columns.len);
-                        var pos: usize = 2;
-                        for (0..col_count) |i| {
-                            const col_len_raw = std.mem.readInt(i32, body[pos..][0..4], .big);
-                            pos += 4;
-                            if (col_len_raw < 0) {
-                                result.columns[i] = .{ .data = "", .is_null = true };
-                            } else {
-                                const col_len: usize = @intCast(col_len_raw);
-                                if (stable_pos + col_len > stable_base) {
-                                    // Column data exceeds stable region — skip remaining columns
-                                    result.column_count = i;
-                                    break;
-                                }
-                                const src = body[pos .. pos + col_len];
-                                const dest = self.recv_buf[stable_base + stable_pos ..][0..col_len];
-                                @memcpy(dest, src);
-                                result.columns[i] = .{ .data = dest, .is_null = false };
-                                stable_pos += col_len;
-                                pos += col_len;
-                            }
-                        }
-                        if (result.column_count == 0) result.column_count = col_count;
-                    }
-                },
-                protocol.MSG_CMD_COMPLETE => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
+                    var cols: [16]QueryColumn = undefined;
+                    cap.onRow(0, parseDataRow(body, &cols));
                 },
                 protocol.MSG_READY => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
                     if (server_error) return error.ServerError;
-                    return result;
+                    return cap.result;
                 },
                 protocol.MSG_ERROR => {
-                    const body = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
+                    const body = try self.readBodyGrowing(header);
                     const err = protocol.parseError(body);
                     std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
                     self.noteServerError(err);
@@ -314,14 +288,12 @@ pub const Connection = struct {
                 },
                 protocol.MSG_COPY_BOTH => {
                     _ = try self.readBodyGrowing(header);
-                    result.in_copy_mode = true;
-                    return result;
-                },
-                protocol.MSG_NOTICE => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
+                    cap.result.in_copy_mode = true;
+                    return cap.result;
                 },
                 else => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
+                    // RowDescription, CommandComplete, NoticeResponse, ...
+                    _ = try self.readBodyGrowing(header);
                 },
             }
         }
@@ -375,96 +347,6 @@ pub const Connection = struct {
                 },
                 else => {
                     _ = try self.readBodyGrowing(header);
-                },
-            }
-        }
-    }
-
-    /// Execute a large query and return the first DataRow result.
-    /// Like execLarge but captures the first row (for RETURNING clauses).
-    /// Column data is copied into the second half of recv_buf so it
-    /// survives subsequent protocol reads.
-    pub fn execLargeWithResult(self: *Connection, allocator: std.mem.Allocator, query: []const u8) QueryError!QueryResult {
-        self.beginCommand();
-
-        const msg_len = 1 + 4 + query.len + 1;
-        self.send_buf.clearRetainingCapacity();
-        self.send_buf.ensureTotalCapacity(allocator, msg_len) catch return error.OutOfMemory;
-        const buf = self.send_buf.allocatedSlice()[0..msg_len];
-
-        const msg = protocol.encodeQuery(buf, query);
-        try self.transport.writeAll(msg);
-
-        var result = QueryResult{
-            .columns = undefined,
-            .column_count = 0,
-            .in_copy_mode = false,
-        };
-
-        // Reserve second half of recv_buf for stable column data copies.
-        // Recomputed after readBodyGrowing since the buffer may grow.
-        var stable_base = self.recv_buf.len / 2;
-        var stable_pos: usize = 0;
-        // On ErrorResponse the server still sends a trailing ReadyForQuery; read
-        // through it before returning so the connection stays in sync.
-        var server_error = false;
-
-        while (true) {
-            const header = try protocol.readHeader(self.transport);
-
-            switch (header.msg_type) {
-                protocol.MSG_ROW_DESC => {
-                    _ = try self.readBodyGrowing(header);
-                },
-                protocol.MSG_DATA_ROW => {
-                    const body = try self.readBodyGrowing(header);
-                    stable_base = self.recv_buf.len / 2;
-                    if (result.column_count == 0) {
-                        const raw_col_count = std.mem.readInt(u16, body[0..2], .big);
-                        const col_count = @min(raw_col_count, result.columns.len);
-                        var pos: usize = 2;
-                        for (0..col_count) |i| {
-                            const col_len_raw = std.mem.readInt(i32, body[pos..][0..4], .big);
-                            pos += 4;
-                            if (col_len_raw < 0) {
-                                result.columns[i] = .{ .data = "", .is_null = true };
-                            } else {
-                                const col_len: usize = @intCast(col_len_raw);
-                                if (stable_pos + col_len > stable_base) {
-                                    result.column_count = i;
-                                    break;
-                                }
-                                const src = body[pos .. pos + col_len];
-                                const dest = self.recv_buf[stable_base + stable_pos ..][0..col_len];
-                                @memcpy(dest, src);
-                                result.columns[i] = .{ .data = dest, .is_null = false };
-                                stable_pos += col_len;
-                                pos += col_len;
-                            }
-                        }
-                        if (result.column_count == 0) result.column_count = col_count;
-                    }
-                },
-                protocol.MSG_CMD_COMPLETE => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
-                },
-                protocol.MSG_READY => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
-                    if (server_error) return error.ServerError;
-                    return result;
-                },
-                protocol.MSG_ERROR => {
-                    const body = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
-                    const err = protocol.parseError(body);
-                    std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
-                    self.noteServerError(err);
-                    server_error = true;
-                },
-                protocol.MSG_NOTICE => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
-                },
-                else => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..stable_base]);
                 },
             }
         }
@@ -587,79 +469,235 @@ pub const Connection = struct {
         }
     }
 
-    /// Execute a simple query and invoke a callback for each DataRow.
-    /// The callback receives the column data slice (borrowed from recv_buf)
-    /// and must copy any data it needs before returning.
-    /// Returns the number of rows yielded.
-    pub fn queryRows(
-        self: *Connection,
-        query: []const u8,
-        context: anytype,
-        callback: fn (@TypeOf(context), []const QueryColumn) void,
-    ) QueryError!usize {
+    // ── Extended query protocol (Parse/Bind/Execute/Sync) ─────────────
+
+    /// Parse and save a named server-side prepared statement (Parse +
+    /// Sync, one round trip). The statement lives for the session and is
+    /// executed with execPrepared/execPreparedWithResult or queued in a
+    /// Pipeline, giving plan caching and parameter binding without SQL
+    /// escaping. To prepare several statements in one round trip, use
+    /// Pipeline.prepare instead.
+    pub fn prepare(self: *Connection, name: []const u8, sql: []const u8) QueryError!void {
+        var p = self.pipeline();
+        try p.prepare(name, sql);
+        try p.syncDiscard();
+    }
+
+    /// Extended-protocol pipeline: queue several statements, send them in
+    /// one network flush, and read all their responses after a single
+    /// Sync — one round trip for the whole batch. Between pipeline() and
+    /// sync() no other command may run on the connection.
+    pub const Pipeline = struct {
+        conn: *Connection,
+
+        /// Queue one parameterized statement via the unnamed prepared
+        /// statement (parsed fresh server-side). Params are text format;
+        /// null entries bind SQL NULL.
+        pub fn exec(self: *Pipeline, sql: []const u8, params: []const ?[]const u8) QueryError!void {
+            protocol.appendParse(&self.conn.send_buf, self.conn.allocator, "", sql) catch
+                return error.OutOfMemory;
+            try self.bindExec("", params);
+        }
+
+        /// Queue execution of a statement previously created with
+        /// Connection.prepare or Pipeline.prepare.
+        pub fn execPrepared(self: *Pipeline, name: []const u8, params: []const ?[]const u8) QueryError!void {
+            try self.bindExec(name, params);
+        }
+
+        /// Queue a Parse for a named prepared statement without executing
+        /// it — several statements can be prepared in one round trip.
+        /// Parse produces no CommandComplete, so prepares do not count
+        /// toward the statement indexes passed to sync's callback.
+        pub fn prepare(self: *Pipeline, name: []const u8, sql: []const u8) QueryError!void {
+            protocol.appendParse(&self.conn.send_buf, self.conn.allocator, name, sql) catch
+                return error.OutOfMemory;
+        }
+
+        fn bindExec(self: *Pipeline, stmt_name: []const u8, params: []const ?[]const u8) QueryError!void {
+            const c = self.conn;
+            protocol.appendBind(&c.send_buf, c.allocator, "", stmt_name, params) catch
+                return error.OutOfMemory;
+            protocol.appendExecute(&c.send_buf, c.allocator, "", 0) catch
+                return error.OutOfMemory;
+        }
+
+        /// Send all queued messages plus Sync and read responses through
+        /// ReadyForQuery. Each DataRow is passed to `callback` with the
+        /// 0-based index of the queued statement that produced it; column
+        /// data is borrowed from recv_buf and must be copied if kept.
+        /// If any statement fails, the server skips the pipeline's
+        /// remaining statements and error.ServerError is returned after
+        /// draining (the SQLSTATE of the first failure is stored).
+        pub fn sync(
+            self: *Pipeline,
+            context: anytype,
+            callback: fn (@TypeOf(context), usize, []const QueryColumn) void,
+        ) QueryError!void {
+            const c = self.conn;
+            protocol.appendSync(&c.send_buf, c.allocator) catch return error.OutOfMemory;
+            try c.transport.writeAll(c.send_buf.items);
+            c.send_buf.clearRetainingCapacity();
+            try c.drainExtended(context, callback);
+        }
+
+        /// sync() for pipelines whose statements return no rows.
+        pub fn syncDiscard(self: *Pipeline) QueryError!void {
+            try self.sync({}, discardExtendedRow);
+        }
+    };
+
+    /// Start an extended-protocol pipeline. Queue statements with exec /
+    /// execPrepared, then call sync (or syncDiscard) to flush and collect
+    /// the results.
+    pub fn pipeline(self: *Connection) Pipeline {
         self.beginCommand();
-
-        // Query message: 'Q' (1) + int32 len (4) + query + '\0' (1).
-        // Uses the reusable growable send buffer: queries can exceed any
-        // fixed stack buffer (e.g. START_REPLICATION with many options).
-        const msg_len = 1 + 4 + query.len + 1;
         self.send_buf.clearRetainingCapacity();
-        self.send_buf.ensureTotalCapacity(self.allocator, msg_len) catch return error.OutOfMemory;
-        const msg = protocol.encodeQuery(self.send_buf.allocatedSlice()[0..msg_len], query);
-        try self.transport.writeAll(msg);
+        return .{ .conn = self };
+    }
 
-        var row_count: usize = 0;
-        // On ErrorResponse the server still sends a trailing ReadyForQuery; read
-        // through it before returning so the connection stays in sync.
+    /// Execute a prepared statement in one round trip, discarding any
+    /// result rows.
+    pub fn execPrepared(self: *Connection, name: []const u8, params: []const ?[]const u8) QueryError!void {
+        var p = self.pipeline();
+        try p.execPrepared(name, params);
+        try p.syncDiscard();
+    }
+
+    /// Execute a prepared statement in one round trip and return the
+    /// first result row. Column data is copied into result_buf — a side
+    /// buffer separate from recv_buf — so it cannot be overwritten or
+    /// left dangling by later protocol reads (which may overwrite or
+    /// realloc recv_buf). The result is valid until the next
+    /// row-returning command on this connection.
+    pub fn execPreparedWithResult(self: *Connection, name: []const u8, params: []const ?[]const u8) QueryError!QueryResult {
+        var p = self.pipeline();
+        try p.execPrepared(name, params);
+        var cap = FirstRowCapture{ .conn = self };
+        try p.sync(&cap, FirstRowCapture.onRow);
+        return cap.result;
+    }
+
+    fn discardExtendedRow(_: void, _: usize, _: []const QueryColumn) void {}
+
+    /// Parse a DataRow body into caller-provided column slots. Column
+    /// data is borrowed from `body`; a raw column count above the slot
+    /// array's size is clamped (extra columns are dropped). A truncated
+    /// or malformed body yields the columns parsed up to that point
+    /// rather than reading out of bounds.
+    fn parseDataRow(body: []const u8, cols: *[16]QueryColumn) []const QueryColumn {
+        if (body.len < 2) return cols[0..0];
+        const raw_col_count = std.mem.readInt(u16, body[0..2], .big);
+        const col_count = @min(raw_col_count, cols.len);
+        var pos: usize = 2;
+        for (0..col_count) |i| {
+            if (pos + 4 > body.len) return cols[0..i];
+            const col_len_raw = std.mem.readInt(i32, body[pos..][0..4], .big);
+            pos += 4;
+            if (col_len_raw < 0) {
+                cols[i] = .{ .data = "", .is_null = true };
+            } else {
+                const col_len: usize = @intCast(col_len_raw);
+                if (pos + col_len > body.len) return cols[0..i];
+                cols[i] = .{ .data = body[pos .. pos + col_len], .is_null = false };
+                pos += col_len;
+            }
+        }
+        return cols[0..col_count];
+    }
+
+    /// Captures the first DataRow of an extended-protocol exchange into
+    /// the connection's result_buf side buffer.
+    const FirstRowCapture = struct {
+        conn: *Connection,
+        captured: bool = false,
+        result: QueryResult = .{
+            .columns = undefined,
+            .column_count = 0,
+            .in_copy_mode = false,
+        },
+
+        fn onRow(self: *FirstRowCapture, stmt_index: usize, cols: []const QueryColumn) void {
+            _ = stmt_index;
+            if (self.captured) return;
+            self.captured = true;
+            const conn = self.conn;
+            const col_count = @min(cols.len, self.result.columns.len);
+
+            // Reserve the whole row's capacity up front so the buffer never
+            // reallocates while column slices into it are being recorded.
+            var total: usize = 0;
+            for (cols[0..col_count]) |col| {
+                if (!col.is_null) total += col.data.len;
+            }
+            conn.result_buf.clearRetainingCapacity();
+            conn.result_buf.ensureTotalCapacity(conn.allocator, total) catch {
+                // Callbacks cannot return errors; on OOM report no columns
+                // rather than a partial row.
+                return;
+            };
+
+            for (cols[0..col_count], 0..) |col, i| {
+                if (col.is_null) {
+                    self.result.columns[i] = .{ .data = "", .is_null = true };
+                    continue;
+                }
+                const start = conn.result_buf.items.len;
+                conn.result_buf.appendSliceAssumeCapacity(col.data);
+                self.result.columns[i] = .{
+                    .data = conn.result_buf.items[start..][0..col.data.len],
+                    .is_null = false,
+                };
+            }
+            self.result.column_count = col_count;
+        }
+    };
+
+    /// Read extended-protocol responses until ReadyForQuery, dispatching
+    /// DataRows to `callback` tagged with the index of the statement that
+    /// produced them (statements are delimited by CommandComplete /
+    /// EmptyQueryResponse / PortalSuspended).
+    fn drainExtended(
+        self: *Connection,
+        context: anytype,
+        callback: fn (@TypeOf(context), usize, []const QueryColumn) void,
+    ) QueryError!void {
+        var stmt_index: usize = 0;
         var server_error = false;
 
         while (true) {
             const header = try protocol.readHeader(self.transport);
 
             switch (header.msg_type) {
-                protocol.MSG_ROW_DESC => {
-                    _ = try self.readBodyGrowing(header);
-                },
                 protocol.MSG_DATA_ROW => {
                     const body = try self.readBodyGrowing(header);
-                    const raw_col_count = std.mem.readInt(u16, body[0..2], .big);
                     var cols: [16]QueryColumn = undefined;
-                    // Clamp to the local array; extra columns are dropped.
-                    const col_count = @min(raw_col_count, cols.len);
-                    var pos: usize = 2;
-                    for (0..col_count) |i| {
-                        const col_len_raw = std.mem.readInt(i32, body[pos..][0..4], .big);
-                        pos += 4;
-                        if (col_len_raw < 0) {
-                            cols[i] = .{ .data = "", .is_null = true };
-                        } else {
-                            const col_len: usize = @intCast(col_len_raw);
-                            cols[i] = .{ .data = body[pos .. pos + col_len], .is_null = false };
-                            pos += col_len;
-                        }
-                    }
-                    callback(context, cols[0..col_count]);
-                    row_count += 1;
+                    callback(context, stmt_index, parseDataRow(body, &cols));
                 },
-                protocol.MSG_CMD_COMPLETE => {
+                protocol.MSG_CMD_COMPLETE,
+                protocol.MSG_EMPTY_QUERY,
+                protocol.MSG_PORTAL_SUSPENDED,
+                => {
                     _ = try self.readBodyGrowing(header);
+                    stmt_index += 1;
                 },
                 protocol.MSG_READY => {
-                    _ = try protocol.readBody(self.transport, header, self.recv_buf);
+                    _ = try protocol.readBody(self.transport, header, self.recv_buf[0..1]);
                     if (server_error) return error.ServerError;
-                    return row_count;
+                    return;
                 },
                 protocol.MSG_ERROR => {
                     const body = try self.readBodyGrowing(header);
                     const err = protocol.parseError(body);
-                    std.log.err("Query error: {s}: {s}", .{ err.code, err.message });
-                    self.noteServerError(err);
+                    std.log.err("Pipeline error: {s}: {s}", .{ err.code, err.message });
+                    // Keep the first failure's SQLSTATE: it's the one that
+                    // aborted the pipeline.
+                    if (!server_error) self.noteServerError(err);
                     server_error = true;
                 },
-                protocol.MSG_NOTICE => {
-                    _ = try self.readBodyGrowing(header);
-                },
                 else => {
+                    // ParseComplete, BindComplete, RowDescription, NoData,
+                    // ParameterDescription, ParameterStatus, NoticeResponse
                     _ = try self.readBodyGrowing(header);
                 },
             }
@@ -676,6 +714,7 @@ pub const Connection = struct {
     pub fn close(self: *Connection) void {
         self.transport.close();
         self.send_buf.deinit(self.allocator);
+        self.result_buf.deinit(self.allocator);
         self.allocator.free(self.recv_buf);
         if (self.tls_state) |ts| self.allocator.destroy(ts);
         if (self.plain_state) |ps| self.allocator.destroy(ps);

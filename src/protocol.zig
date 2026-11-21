@@ -23,6 +23,22 @@ pub const MSG_COPY_DATA: u8 = 'd';
 pub const MSG_COPY_DONE: u8 = 'c';
 pub const MSG_COPY_FAIL: u8 = 'f';
 
+// Extended query protocol: frontend message types
+pub const MSG_PARSE: u8 = 'P';
+pub const MSG_BIND: u8 = 'B';
+pub const MSG_DESCRIBE: u8 = 'D';
+pub const MSG_EXECUTE: u8 = 'E';
+pub const MSG_SYNC: u8 = 'S';
+
+// Extended query protocol: backend message types
+pub const MSG_PARSE_COMPLETE: u8 = '1';
+pub const MSG_BIND_COMPLETE: u8 = '2';
+pub const MSG_CLOSE_COMPLETE: u8 = '3';
+pub const MSG_NO_DATA: u8 = 'n';
+pub const MSG_PORTAL_SUSPENDED: u8 = 's';
+pub const MSG_EMPTY_QUERY: u8 = 'I';
+pub const MSG_PARAM_DESC: u8 = 't';
+
 // Auth subtypes
 pub const AUTH_OK: u32 = 0;
 pub const AUTH_CLEARTEXT: u32 = 3;
@@ -239,6 +255,112 @@ pub fn encodeSASLResponse(buf: []u8, data: []const u8) []const u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Extended query protocol encoding (append into a growable list; message
+// sizes depend on parameter data, so fixed stack buffers don't fit here)
+// ---------------------------------------------------------------------------
+
+fn appendU16Big(list: *std.ArrayListUnmanaged(u8), v: u16) void {
+    list.appendSliceAssumeCapacity(&std.mem.toBytes(std.mem.nativeTo(u16, v, .big)));
+}
+
+fn appendU32Big(list: *std.ArrayListUnmanaged(u8), v: u32) void {
+    list.appendSliceAssumeCapacity(&std.mem.toBytes(std.mem.nativeTo(u32, v, .big)));
+}
+
+fn appendCString(list: *std.ArrayListUnmanaged(u8), s: []const u8) void {
+    list.appendSliceAssumeCapacity(s);
+    list.appendAssumeCapacity(0);
+}
+
+/// Append a Parse message: name the (possibly unnamed, "") prepared
+/// statement, the SQL text, and no pre-specified parameter type OIDs —
+/// the server infers parameter types from the query.
+pub fn appendParse(
+    list: *std.ArrayListUnmanaged(u8),
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    sql: []const u8,
+) !void {
+    const body_len: u32 = @intCast(4 + name.len + 1 + sql.len + 1 + 2);
+    try list.ensureUnusedCapacity(alloc, 1 + body_len);
+    list.appendAssumeCapacity(MSG_PARSE);
+    appendU32Big(list, body_len);
+    appendCString(list, name);
+    appendCString(list, sql);
+    appendU16Big(list, 0); // parameter type OID count
+}
+
+/// Append a Bind message creating portal `portal` from prepared statement
+/// `stmt_name`. All parameters are text format (null entries bind SQL
+/// NULL) and all result columns are requested in text format.
+pub fn appendBind(
+    list: *std.ArrayListUnmanaged(u8),
+    alloc: std.mem.Allocator,
+    portal: []const u8,
+    stmt_name: []const u8,
+    params: []const ?[]const u8,
+) !void {
+    var params_len: usize = 0;
+    for (params) |p| params_len += 4 + if (p) |v| v.len else 0;
+    const body_len: u32 = @intCast(4 + portal.len + 1 + stmt_name.len + 1 + 2 + 2 + params_len + 2);
+    try list.ensureUnusedCapacity(alloc, 1 + body_len);
+    list.appendAssumeCapacity(MSG_BIND);
+    appendU32Big(list, body_len);
+    appendCString(list, portal);
+    appendCString(list, stmt_name);
+    appendU16Big(list, 0); // parameter format code count (default: all text)
+    appendU16Big(list, @intCast(params.len));
+    for (params) |p| {
+        if (p) |v| {
+            appendU32Big(list, @intCast(v.len));
+            list.appendSliceAssumeCapacity(v);
+        } else {
+            appendU32Big(list, 0xffff_ffff); // -1 length = NULL
+        }
+    }
+    appendU16Big(list, 0); // result format code count (default: all text)
+}
+
+/// Append a Describe message. `kind` is 'S' (prepared statement) or
+/// 'P' (portal).
+pub fn appendDescribe(
+    list: *std.ArrayListUnmanaged(u8),
+    alloc: std.mem.Allocator,
+    kind: u8,
+    name: []const u8,
+) !void {
+    const body_len: u32 = @intCast(4 + 1 + name.len + 1);
+    try list.ensureUnusedCapacity(alloc, 1 + body_len);
+    list.appendAssumeCapacity(MSG_DESCRIBE);
+    appendU32Big(list, body_len);
+    list.appendAssumeCapacity(kind);
+    appendCString(list, name);
+}
+
+/// Append an Execute message for portal `portal`. max_rows of 0 means
+/// no limit (run the portal to completion).
+pub fn appendExecute(
+    list: *std.ArrayListUnmanaged(u8),
+    alloc: std.mem.Allocator,
+    portal: []const u8,
+    max_rows: u32,
+) !void {
+    const body_len: u32 = @intCast(4 + portal.len + 1 + 4);
+    try list.ensureUnusedCapacity(alloc, 1 + body_len);
+    list.appendAssumeCapacity(MSG_EXECUTE);
+    appendU32Big(list, body_len);
+    appendCString(list, portal);
+    appendU32Big(list, max_rows);
+}
+
+/// Append a Sync message, ending an extended-protocol request batch.
+pub fn appendSync(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator) !void {
+    try list.ensureUnusedCapacity(alloc, 5);
+    list.appendAssumeCapacity(MSG_SYNC);
+    appendU32Big(list, 4);
+}
+
+// ---------------------------------------------------------------------------
 // Decoding helpers
 // ---------------------------------------------------------------------------
 
@@ -372,6 +494,86 @@ test "parseError" {
     try std.testing.expectEqualStrings("ERROR", info.severity);
     try std.testing.expectEqualStrings("42P01", info.code);
     try std.testing.expectEqualStrings("relation does not exist", info.message);
+}
+
+test "appendParse" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendParse(&list, std.testing.allocator, "stmt", "SELECT $1");
+
+    try std.testing.expectEqual(@as(u8, 'P'), list.items[0]);
+    const length = std.mem.readInt(u32, list.items[1..5], .big);
+    try std.testing.expectEqual(length, @as(u32, @intCast(list.items.len - 1)));
+    try std.testing.expectEqualSlices(u8, "stmt\x00SELECT $1\x00\x00\x00", list.items[5..]);
+}
+
+test "appendBind: text params with null" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    const params = [_]?[]const u8{ "42", null };
+    try appendBind(&list, std.testing.allocator, "", "stmt", &params);
+
+    try std.testing.expectEqual(@as(u8, 'B'), list.items[0]);
+    const length = std.mem.readInt(u32, list.items[1..5], .big);
+    try std.testing.expectEqual(length, @as(u32, @intCast(list.items.len - 1)));
+    try std.testing.expectEqualSlices(u8, "\x00" ++ // unnamed portal
+        "stmt\x00" ++
+        "\x00\x00" ++ // 0 param format codes (all text)
+        "\x00\x02" ++ // 2 params
+        "\x00\x00\x00\x02" ++ "42" ++ // param 1: length 2, "42"
+        "\xff\xff\xff\xff" ++ // param 2: NULL
+        "\x00\x00", // 0 result format codes (all text)
+        list.items[5..]);
+}
+
+test "appendBind: no params" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendBind(&list, std.testing.allocator, "", "", &.{});
+    // 'B' + len + portal\0 + stmt\0 + 3 x int16
+    try std.testing.expectEqual(@as(usize, 13), list.items.len);
+    const length = std.mem.readInt(u32, list.items[1..5], .big);
+    try std.testing.expectEqual(@as(u32, 12), length);
+}
+
+test "appendDescribe" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendDescribe(&list, std.testing.allocator, 'P', "");
+    try std.testing.expectEqualSlices(u8, "D\x00\x00\x00\x06P\x00", list.items);
+}
+
+test "appendExecute" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendExecute(&list, std.testing.allocator, "", 0);
+    try std.testing.expectEqualSlices(u8, "E\x00\x00\x00\x09\x00\x00\x00\x00\x00", list.items);
+}
+
+test "appendSync" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendSync(&list, std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, "S\x00\x00\x00\x04", list.items);
+}
+
+test "extended protocol messages append back to back" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try appendParse(&list, std.testing.allocator, "", "BEGIN");
+    try appendBind(&list, std.testing.allocator, "", "", &.{});
+    try appendExecute(&list, std.testing.allocator, "", 0);
+    try appendSync(&list, std.testing.allocator);
+
+    // Walk the stream verifying each message's framing.
+    const expected_types = [_]u8{ 'P', 'B', 'E', 'S' };
+    var pos: usize = 0;
+    for (expected_types) |t| {
+        try std.testing.expectEqual(t, list.items[pos]);
+        const length = std.mem.readInt(u32, list.items[pos + 1 ..][0..4], .big);
+        pos += 1 + length;
+    }
+    try std.testing.expectEqual(list.items.len, pos);
 }
 
 test "MsgWriter" {
