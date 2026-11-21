@@ -84,7 +84,12 @@ pub const Connection = struct {
         // step (startup, auth, post-auth) still fail, so the state must be
         // freed from any error path, not just within the TLS branch.
         var tls_state: ?*TlsState = null;
-        errdefer if (tls_state) |ts| allocator.destroy(ts);
+        errdefer if (tls_state) |ts| {
+            // The CA bundle (loaded for verify-full) is otherwise freed
+            // only by TlsState.closeFn, which error paths never reach.
+            ts.ca_bundle.deinit(allocator);
+            allocator.destroy(ts);
+        };
 
         // TLS negotiation (only for TCP connections, not Unix sockets)
         if (config.tls != .disable and config.socket_path == null) {

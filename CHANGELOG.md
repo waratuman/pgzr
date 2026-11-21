@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
   and send them in a single network flush, with each result row
   delivered to a callback tagged with its statement index.
 
+- `DEVELOPMENT.md` with the performance roadmap and benchmarking notes.
+
 ### Changed
 
 - **The processor hot path uses prepared statements and pipelining.**
@@ -184,10 +186,6 @@ All notable changes to this project will be documented in this file.
   "UTF8"`. The ingestor now tracks the open stream segment
   (StreamStart/StreamStop) and decodes streamed messages with the stream
   xid, matching the processor's behavior.
-
-### Added
-
-- `DEVELOPMENT.md` with the performance roadmap and benchmarking notes.
 
 ## [0.4.2] - 2026-07-08
 
