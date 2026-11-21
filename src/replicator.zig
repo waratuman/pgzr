@@ -37,15 +37,16 @@ pub const Replicator = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, io: Io, config: types.ReplicatorConfig) InitError!Replicator {
-        var conn = try Connection.connect(allocator, io, config.conn);
-        errdefer conn.close();
-
         var repl = Replicator{
-            .conn = conn,
+            .conn = try Connection.connect(allocator, io, config.conn),
             .config = config,
             .allocator = allocator,
             .io = io,
         };
+        // Close repl.conn, not a stale local copy: identifySystem and
+        // startReplication grow buffers inside repl.conn, which a copy made
+        // before those calls would not see (leaking them on error).
+        errdefer repl.conn.close();
         errdefer repl.freeIdentity();
 
         try repl.identifySystem();
