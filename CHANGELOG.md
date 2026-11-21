@@ -6,6 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **C ABI handles allocate with `std.heap.smp_allocator`** instead of
+  `page_allocator` (page-granularity, syscall per allocation) — the FFI
+  path makes per-event allocations, so this materially speeds up
+  production Ruby/Python hosts.
+
+- **Hot byte loops in the processor are table-driven/vectorized.** Hex
+  bytea decode of stored batch rows uses a 256-entry table (~0.2 GB/s →
+  ~2.9 GB/s measured); the COPY JSON string escape scan skips clean
+  16-byte blocks with `@Vector` (~1.5 GB/s → ~39 GB/s on clean text).
+  Stress-test processing (100k events, 4 workers, ReleaseFast) improved
+  ~15% (542 ms → ~459 ms).
+
 - **Batch rows are stored via `COPY ... FROM STDIN`.** The ingestor no
   longer builds a megabyte-scale INSERT statement (hex bytea inlined into
   SQL the server must lex/parse/plan); it sends one COPY text row.

@@ -191,7 +191,10 @@ export fn pgzr_ingestor_new(config: *const PgzrIngestConfig) ?*IngestorHandle {
 }
 
 fn ingestorNew(config: *const PgzrIngestConfig) !*IngestorHandle {
-    const allocator = std.heap.page_allocator;
+    // smp_allocator: thread-safe general-purpose allocator. page_allocator
+    // (used previously) is page-granularity with a syscall per allocation —
+    // ruinous for the per-event allocations the processor makes.
+    const allocator = std.heap.smp_allocator;
 
     const handle = try allocator.create(IngestorHandle);
     errdefer allocator.destroy(handle);
@@ -302,7 +305,7 @@ export fn pgzr_ingestor_free(handle: *IngestorHandle) void {
     handle.ingestor.deinit();
     handle.io_threaded.deinit();
     handle.arena.deinit();
-    std.heap.page_allocator.destroy(handle);
+    std.heap.smp_allocator.destroy(handle);
 }
 
 // ── Processor ─────────────────────────────────────────────────────────
@@ -338,7 +341,7 @@ export fn pgzr_processor_new(config: *const PgzrProcessorConfig) ?*ProcessorHand
 }
 
 fn processorNew(config: *const PgzrProcessorConfig) !*ProcessorHandle {
-    const allocator = std.heap.page_allocator;
+    const allocator = std.heap.smp_allocator;
 
     const handle = try allocator.create(ProcessorHandle);
     errdefer allocator.destroy(handle);
@@ -411,5 +414,5 @@ export fn pgzr_processor_free(handle: *ProcessorHandle) void {
     handle.processor.deinit();
     handle.io_threaded.deinit();
     handle.arena.deinit();
-    std.heap.page_allocator.destroy(handle);
+    std.heap.smp_allocator.destroy(handle);
 }
