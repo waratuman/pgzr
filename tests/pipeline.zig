@@ -1461,6 +1461,110 @@ fn testConcurrentProcessors(allocator: std.mem.Allocator) !void {
 // (stress test moved to tests/concurrent_stress.zig — run via `zig build concurrent-stress-test`)
 
 // =========================================================================
+// Extended query protocol: prepare / execPrepared / pipeline
+// =========================================================================
+fn testExtendedQueryProtocol(allocator: std.mem.Allocator) !void {
+    std.debug.print("  Test: extended query protocol... ", .{});
+
+    var conn = pgzr.Connection.connect(allocator, io, destConnConfig()) catch |err| {
+        std.debug.print("FAIL (connect: {})\n", .{err});
+        return err;
+    };
+    defer conn.close();
+
+    _ = conn.simpleQuery("DROP TABLE IF EXISTS ext_proto_test") catch {};
+    _ = try conn.simpleQuery("CREATE TABLE ext_proto_test (id bigserial PRIMARY KEY, name text, qty int)");
+    defer _ = conn.simpleQuery("DROP TABLE ext_proto_test") catch {};
+
+    // Named prepared statement with parameters, including a NULL and a
+    // value that would break a naive SQL-literal path.
+    try conn.prepare("ins_item", "INSERT INTO ext_proto_test (name, qty) VALUES ($1, $2::int) RETURNING id");
+
+    const r1 = try conn.execPreparedWithResult("ins_item", &.{ "it's \"quoted\"", "7" });
+    if (r1.column_count != 1 or r1.columns[0].data.len == 0) {
+        std.debug.print("FAIL (no RETURNING id)\n", .{});
+        return error.TestFailed;
+    }
+
+    const r2 = try conn.execPreparedWithResult("ins_item", &.{ null, "8" });
+    const id2 = std.fmt.parseInt(i64, r2.columns[0].data, 10) catch {
+        std.debug.print("FAIL (bad id: {s})\n", .{r2.columns[0].data});
+        return error.TestFailed;
+    };
+    if (id2 != 2) {
+        std.debug.print("FAIL (expected id 2, got {d})\n", .{id2});
+        return error.TestFailed;
+    }
+
+    // Pipeline: BEGIN + 2 inserts + COMMIT in one round trip.
+    var p = conn.pipeline();
+    try p.exec("BEGIN", &.{});
+    try p.execPrepared("ins_item", &.{ "third", "9" });
+    try p.execPrepared("ins_item", &.{ "fourth", "10" });
+    try p.exec("COMMIT", &.{});
+    try p.syncDiscard();
+
+    // Pipeline with a row callback: verify rows arrive tagged with the
+    // right statement index.
+    const Cap = struct {
+        count_rows: usize = 0,
+        sum_qty: i64 = 0,
+        last_stmt_index: usize = 0,
+
+        fn onRow(self: *@This(), stmt_index: usize, cols: []const pgzr.Connection.QueryColumn) void {
+            self.count_rows += 1;
+            self.last_stmt_index = stmt_index;
+            if (cols.len > 0 and !cols[0].is_null) {
+                self.sum_qty += std.fmt.parseInt(i64, cols[0].data, 10) catch 0;
+            }
+        }
+    };
+    var cap = Cap{};
+    var p2 = conn.pipeline();
+    try p2.exec("SELECT qty FROM ext_proto_test WHERE name IS NOT NULL ORDER BY id", &.{});
+    try p2.exec("SELECT count(*) FROM ext_proto_test", &.{});
+    try p2.sync(&cap, Cap.onRow);
+
+    // 3 qty rows (NULL-name row excluded) + 1 count row
+    if (cap.count_rows != 4 or cap.last_stmt_index != 1) {
+        std.debug.print("FAIL (rows {d}, last stmt {d})\n", .{ cap.count_rows, cap.last_stmt_index });
+        return error.TestFailed;
+    }
+    if (cap.sum_qty != 7 + 9 + 10 + 4) {
+        std.debug.print("FAIL (sum {d})\n", .{cap.sum_qty});
+        return error.TestFailed;
+    }
+
+    // Error recovery: a failing statement aborts the rest of the pipeline,
+    // sets the SQLSTATE, and the connection stays usable afterwards.
+    var p3 = conn.pipeline();
+    try p3.exec("SELECT no_such_column FROM ext_proto_test", &.{});
+    try p3.exec("SELECT 1", &.{});
+    if (p3.syncDiscard()) {
+        std.debug.print("FAIL (expected ServerError)\n", .{});
+        return error.TestFailed;
+    } else |err| {
+        if (err != error.ServerError) {
+            std.debug.print("FAIL (unexpected error: {})\n", .{err});
+            return err;
+        }
+        const code = conn.lastServerErrorCode() orelse "";
+        if (!std.mem.eql(u8, code, "42703")) { // undefined_column
+            std.debug.print("FAIL (SQLSTATE {s})\n", .{code});
+            return error.TestFailed;
+        }
+    }
+
+    const after = try conn.simpleQuery("SELECT count(*) FROM ext_proto_test");
+    if (after.column_count != 1 or !std.mem.eql(u8, after.columns[0].data, "4")) {
+        std.debug.print("FAIL (connection unusable after pipeline error)\n", .{});
+        return error.TestFailed;
+    }
+
+    std.debug.print("PASS\n", .{});
+}
+
+// =========================================================================
 // Main
 // =========================================================================
 pub fn main(init: std.process.Init) !void {
@@ -1477,6 +1581,10 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var failures: u32 = 0;
+
+    testExtendedQueryProtocol(allocator) catch {
+        failures += 1;
+    };
 
     // Tests run sequentially -- later tests depend on data from earlier ones
     testIngestStoresBatches(allocator) catch {

@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.17.1
       - name: Unit tests
         run: zig build test
       - name: Build shared library
@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.17.1
       - name: Configure PostgreSQL for logical replication
         run: |
           psql -h 127.0.0.1 -U postgres -c "ALTER SYSTEM SET wal_level = 'logical';"
