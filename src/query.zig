@@ -316,71 +316,6 @@ test "copy binary helpers" {
     }, list.items);
 }
 
-// ── COPY text-format helpers ──────────────────────────────────────────
-//
-// COPY text format is tab-separated fields, newline-terminated rows, with
-// backslash escapes (\t \n \r \\) and \N for NULL. No quoting layer, so
-// single quotes are literal.
-
-/// The COPY text-format NULL field: \N
-pub const copy_null = "\\N";
-
-/// Append a bytea value in COPY text format: \\x<hex>
-/// (COPY unescapes \\ to \, so the bytea input parser sees \x<hex>.)
-pub fn appendCopyBytea(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: []const u8) !void {
-    const hex = "0123456789abcdef";
-    try list.ensureUnusedCapacity(alloc, 3 + value.len * 2);
-    list.appendSliceAssumeCapacity("\\\\x");
-    const out = list.addManyAsSliceAssumeCapacity(value.len * 2);
-    for (value, 0..) |byte, i| {
-        out[i * 2] = hex[byte >> 4];
-        out[i * 2 + 1] = hex[byte & 0x0f];
-    }
-}
-
-/// Append arbitrary text as a COPY text-format field, escaping the
-/// characters COPY treats specially (backslash, tab, newline, CR).
-/// Runs of characters that need no escaping are copied in bulk.
-pub fn appendCopyText(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: []const u8) !void {
-    var start: usize = 0;
-    for (value, 0..) |c, i| {
-        const esc: []const u8 = switch (c) {
-            '\\' => "\\\\",
-            '\t' => "\\t",
-            '\n' => "\\n",
-            '\r' => "\\r",
-            else => continue,
-        };
-        try list.appendSlice(alloc, value[start..i]);
-        try list.appendSlice(alloc, esc);
-        start = i + 1;
-    }
-    try list.appendSlice(alloc, value[start..]);
-}
-
-test "appendCopyText: escapes copy specials" {
-    var list: std.ArrayListUnmanaged(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    try appendCopyText(&list, std.testing.allocator, "a\\b\tc\nd\re");
-    try std.testing.expectEqualStrings("a\\\\b\\tc\\nd\\re", list.items);
-}
-
-test "appendCopyText: plain passthrough" {
-    var list: std.ArrayListUnmanaged(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    try appendCopyText(&list, std.testing.allocator, "{\"a\":1}");
-    try std.testing.expectEqualStrings("{\"a\":1}", list.items);
-}
-
-/// Append a bytea value in COPY text format, or \N if null.
-pub fn appendCopyByteaOrNull(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: ?[]const u8) !void {
-    if (value) |v| {
-        try appendCopyBytea(list, alloc, v);
-    } else {
-        try list.appendSlice(alloc, copy_null);
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────
 
 test "escapeString: simple" {
@@ -638,20 +573,6 @@ test "writeTimestampText: no quotes" {
     var buf: [40]u8 = undefined;
     const text = writeTimestampText(&buf, 0);
     try std.testing.expectEqualStrings("2000-01-01 00:00:00.000000+00", text);
-}
-
-test "appendCopyBytea: hex with doubled backslash" {
-    var list: std.ArrayListUnmanaged(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    try appendCopyBytea(&list, std.testing.allocator, &[_]u8{ 0xde, 0xad });
-    try std.testing.expectEqualStrings("\\\\xdead", list.items);
-}
-
-test "appendCopyByteaOrNull: null" {
-    var list: std.ArrayListUnmanaged(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    try appendCopyByteaOrNull(&list, std.testing.allocator, null);
-    try std.testing.expectEqualStrings("\\N", list.items);
 }
 
 test "appendEscapedString: matches escapeString" {

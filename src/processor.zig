@@ -31,7 +31,6 @@ pub const Processor = struct {
     current_txn_xid: u32,
     current_txn_timestamp: i64,
     current_txn_id: ?i64,
-    in_transaction: bool,
 
     // Streaming context (proto v2+)
     current_stream_xid: ?u32,
@@ -60,6 +59,12 @@ pub const Processor = struct {
 
     // Reusable COPY stream buffer for flushPendingEvents.
     copy_buf: std.ArrayListUnmanaged(u8),
+
+    // Whether processOne should run the cheap existence probe before
+    // claiming. True when idle (the probe saves two round trips on an
+    // empty poll); false right after a successful claim, when more work
+    // is likely pending and the probe would just add a round trip.
+    probe_before_claim: bool,
 
     // Stop flag for graceful shutdown
     stop_flag: std.atomic.Value(bool),
@@ -168,7 +173,6 @@ pub const Processor = struct {
             .current_txn_xid = 0,
             .current_txn_timestamp = 0,
             .current_txn_id = null,
-            .in_transaction = false,
             .current_stream_xid = null,
             .pending_data = .empty,
             .pending_batch_ids = .empty,
@@ -178,6 +182,7 @@ pub const Processor = struct {
             .stream_events = std.AutoHashMap(u32, std.ArrayListUnmanaged(StreamItem)).init(allocator),
             .stream_metadata = std.AutoHashMap(u32, std.ArrayListUnmanaged(StreamItem)).init(allocator),
             .copy_buf = .empty,
+            .probe_before_claim = true,
             .stop_flag = std.atomic.Value(bool).init(false),
         };
     }
@@ -191,12 +196,17 @@ pub const Processor = struct {
     /// source_id + begin_lsn). Partial batches are fetched alongside their
     /// completing batch and processed as one logical unit.
     pub fn processOne(self: *Processor) ProcessError!bool {
-        // Cheap existence probe first: an idle poll costs one round trip
-        // instead of three (BEGIN + claim + COMMIT). The claim re-checks
-        // under lock, so a stale probe result is harmless — a miss is
-        // caught next poll, a false hit yields an empty claim.
-        const probe = try self.dest.execPreparedWithResult(stmt_probe, &.{});
-        if (probe.column_count == 0) return false;
+        // Cheap existence probe: an idle poll costs one round trip instead
+        // of three (BEGIN + claim + COMMIT). Skipped right after a
+        // successful claim — more work is likely pending then, and the
+        // probe would tax every batch on the busy path with an extra round
+        // trip. The claim re-checks under lock, so a stale probe result is
+        // harmless — a miss is caught next poll, a false hit yields an
+        // empty claim.
+        if (self.probe_before_claim) {
+            const probe = try self.dest.execPreparedWithResult(stmt_probe, &.{});
+            if (probe.column_count == 0) return false;
+        }
 
         // The whole claim/decode/insert/delete cycle runs inside one
         // transaction (BEGIN is pipelined with the claim by claimAndProcess,
@@ -230,8 +240,10 @@ pub const Processor = struct {
         if (!claimed) {
             // End the (empty) claim transaction.
             _ = self.dest.simpleQuery("COMMIT") catch {};
+            self.probe_before_claim = true;
             return false;
         }
+        self.probe_before_claim = false;
 
         self.deleteBatchesAndCommit() catch |err| {
             // The transaction rolled back server-side (or the connection
@@ -281,7 +293,6 @@ pub const Processor = struct {
         self.clearPendingEvents();
         self.clearMetadataChunks();
         self.clearStreamBuffers();
-        self.in_transaction = false;
         self.current_txn_id = null;
         self.current_stream_xid = null;
     }
@@ -502,7 +513,6 @@ pub const Processor = struct {
                     self.current_txn_lsn = begin.final_lsn;
                     self.current_txn_xid = begin.xid;
                     self.current_txn_timestamp = begin.timestamp;
-                    self.in_transaction = true;
                     self.clearMetadataChunks();
                     self.clearPendingEvents();
                     self.current_txn_id = try self.insertTransaction(begin.final_lsn);
@@ -510,7 +520,6 @@ pub const Processor = struct {
                 .commit => {
                     try self.flushPendingEvents();
                     try self.flushMetadata();
-                    self.in_transaction = false;
                     self.current_txn_id = null;
                 },
                 .relation => |rel| {
@@ -595,7 +604,6 @@ pub const Processor = struct {
                     self.current_txn_lsn = bp.lsn;
                     self.current_txn_xid = bp.xid;
                     self.current_txn_timestamp = bp.timestamp;
-                    self.in_transaction = true;
                     self.clearMetadataChunks();
                     self.current_txn_id = try self.insertTransaction(bp.lsn);
                 },
@@ -605,12 +613,10 @@ pub const Processor = struct {
                 .commit_prepared => {
                     try self.flushPendingEvents();
                     try self.flushMetadata();
-                    self.in_transaction = false;
                     self.current_txn_id = null;
                 },
                 .rollback_prepared => {
                     self.clearPendingEvents();
-                    self.in_transaction = false;
                     self.current_txn_id = null;
                 },
                 .stream_prepare => {
@@ -1065,27 +1071,26 @@ pub const Processor = struct {
     /// keeping the rest of the transaction's buffer intact.
     fn dropStreamSubxact(self: *Processor, xid: u32, sub_xid: u32) void {
         if (self.stream_events.getPtr(xid)) |list| {
-            var i: usize = 0;
-            while (i < list.items.len) {
-                if (list.items[i].sub_xid == sub_xid) {
-                    self.allocator.free(list.items[i].data);
-                    _ = list.orderedRemove(i);
-                } else {
-                    i += 1;
-                }
-            }
+            self.compactStreamItems(list, sub_xid);
         }
         if (self.stream_metadata.getPtr(xid)) |list| {
-            var i: usize = 0;
-            while (i < list.items.len) {
-                if (list.items[i].sub_xid == sub_xid) {
-                    self.allocator.free(list.items[i].data);
-                    _ = list.orderedRemove(i);
-                } else {
-                    i += 1;
-                }
+            self.compactStreamItems(list, sub_xid);
+        }
+    }
+
+    /// Remove (and free) all items tagged with sub_xid in one O(n)
+    /// compaction pass, preserving the order of the survivors.
+    fn compactStreamItems(self: *Processor, list: *std.ArrayListUnmanaged(StreamItem), sub_xid: u32) void {
+        var keep: usize = 0;
+        for (list.items) |item| {
+            if (item.sub_xid == sub_xid) {
+                self.allocator.free(item.data);
+            } else {
+                list.items[keep] = item;
+                keep += 1;
             }
         }
+        list.shrinkRetainingCapacity(keep);
     }
 
     /// Discard all per-xid streamed transaction buffers.

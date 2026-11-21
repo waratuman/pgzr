@@ -4,7 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Extended query protocol (Parse/Bind/Execute/Sync).** `Connection`
+  gains `prepare` (named server-side prepared statements),
+  `execPrepared`/`execPreparedWithResult` (one-round-trip parameterized
+  execution), and `Pipeline` — queue several statements (or prepares)
+  and send them in a single network flush, with each result row
+  delivered to a callback tagged with its statement index.
+
 ### Changed
+
+- **The processor hot path uses prepared statements and pipelining.**
+  Its five statements are prepared once at init (in one pipelined round
+  trip); parameters are bound instead of escaped into SQL. `BEGIN` is
+  pipelined with the batch claim and `COMMIT` with the batch delete,
+  cutting round trips per batch group from 8 to 6, and the existence
+  probe is skipped right after a successful claim so the busy path pays
+  no probe round trip. The now-unused `queryRows` and
+  `execLargeWithResult` query paths are removed.
+
+- **Row-returning query results are captured in a dedicated side
+  buffer.** `simpleQuery` and `execPreparedWithResult` copy the first
+  row into a growable `result_buf` instead of the second half of
+  `recv_buf`, so later protocol reads can no longer overwrite the
+  returned columns, realloc them into dangling slices, or hit an
+  overlapping `@memcpy` on rows crossing the buffer midpoint.
 
 - **COPY now uses binary format for both `wal_batches` and `events`.**
   Batch payloads go over the wire at 1x size (no hex) and are streamed
@@ -37,9 +62,10 @@ All notable changes to this project will be documented in this file.
 
 - **Batch rows are stored via `COPY ... FROM STDIN`.** The ingestor no
   longer builds a megabyte-scale INSERT statement (hex bytea inlined into
-  SQL the server must lex/parse/plan); it sends one COPY text row.
-  Restart-replay duplicates are detected via SQLSTATE 23505 and ignored,
-  matching the previous `ON CONFLICT DO NOTHING` semantics.
+  SQL the server must lex/parse/plan); it sends one COPY row (binary
+  format — see above). Restart-replay duplicates are detected via
+  SQLSTATE 23505 and ignored, matching the previous
+  `ON CONFLICT DO NOTHING` semantics.
 
 - **Event flushes stream through copy-in mode in ~64 KiB chunks.**
   `Connection` gains `copyInBegin`/`copyInWrite`/`copyInEnd`/`copyInFail`;
@@ -60,7 +86,46 @@ All notable changes to this project will be documented in this file.
   attaches to a transaction; non-transactional messages were previously
   mis-attributed to whatever transaction committed next.
 
+- **Upgraded to Zig 0.17.** All networking, TLS, randomness, clocks, sleeps,
+  and child processes now go through the `std.Io` interface. Public init
+  functions take an `Io` parameter: `Connection.connect(allocator, io, config)`,
+  `Replicator.init(allocator, io, config)`, `Ingestor.init(allocator, io,
+  config)`, `Processor.init(allocator, io, config)`. The C ABI is unchanged
+  for callers — each handle creates its own `std.Io.Threaded` instance
+  internally. Transport read/write error sets collapse to
+  `error{ConnectionClosed, ReadFailed, Canceled}` / `error{WriteFailed,
+  Canceled}`. TLS verify-full certificate loading is handled by
+  `std.crypto.tls.Client` itself and still fails closed
+  (`error.TlsCertificateNotVerified`) when no CA bundle is available.
+
+- **Fixed TLS `verify_full` silently downgrading to no verification** when
+  the system CA bundle could not be loaded (pre-0.17 code path).
+
+- **Processor error paths no longer leak state across batches.** Claim and
+  COMMIT failures reset all per-batch state (pending data, batch ids,
+  buffered events, metadata chunks, transaction state); a COMMIT failure no
+  longer parks intact batches in `'error'`. `Begin` clears any stale
+  buffered events.
+
+- **C ABI handles own copies of all caller strings.** The FFI host may free
+  its config struct and strings as soon as `pgzr_*_new` returns.
+
+- **Events are inserted via `COPY ... FROM STDIN`** instead of multi-row
+  INSERT statements. The server no longer lexes/parses/plans megabyte-scale
+  SQL per flush, and the client emits the COPY stream directly (no SQL
+  literal quoting layer; binary format — see above). ~10% end-to-end on
+  the 100K-event stress test over a local socket; larger on remote/TLS
+  links. Adds `Connection.copyIn` and a `CopyInResponse` protocol handler.
+
 ### Fixed
+
+- **`Replicator.init` no longer leaks the connection's buffers when the
+  handshake fails after connecting** (e.g. timeline or system-id
+  mismatch): the error path closed a stale copy of the connection
+  instead of the one whose buffers had grown. A `TlsState` leak in
+  `Connection.connect` is also fixed: a failure after a successful TLS
+  upgrade (e.g. bad credentials) skipped the state's cleanup, leaking
+  per-attempt under `reconnect()` retry loops.
 
 - **Long replication commands no longer overflow fixed stack buffers.**
   `START_REPLICATION` is now built with the allocator (no 4 KB limit on
@@ -119,39 +184,6 @@ All notable changes to this project will be documented in this file.
   "UTF8"`. The ingestor now tracks the open stream segment
   (StreamStart/StreamStop) and decodes streamed messages with the stream
   xid, matching the processor's behavior.
-
-### Changed
-
-- **Upgraded to Zig 0.17.** All networking, TLS, randomness, clocks, sleeps,
-  and child processes now go through the `std.Io` interface. Public init
-  functions take an `Io` parameter: `Connection.connect(allocator, io, config)`,
-  `Replicator.init(allocator, io, config)`, `Ingestor.init(allocator, io,
-  config)`, `Processor.init(allocator, io, config)`. The C ABI is unchanged
-  for callers — each handle creates its own `std.Io.Threaded` instance
-  internally. Transport read/write error sets collapse to
-  `error{ConnectionClosed, ReadFailed, Canceled}` / `error{WriteFailed,
-  Canceled}`. TLS verify-full certificate loading is handled by
-  `std.crypto.tls.Client` itself and still fails closed
-  (`error.TlsCertificateNotVerified`) when no CA bundle is available.
-
-- **Fixed TLS `verify_full` silently downgrading to no verification** when
-  the system CA bundle could not be loaded (pre-0.17 code path).
-
-- **Processor error paths no longer leak state across batches.** Claim and
-  COMMIT failures reset all per-batch state (pending data, batch ids,
-  buffered events, metadata chunks, transaction state); a COMMIT failure no
-  longer parks intact batches in `'error'`. `Begin` clears any stale
-  buffered events.
-
-- **C ABI handles own copies of all caller strings.** The FFI host may free
-  its config struct and strings as soon as `pgzr_*_new` returns.
-
-- **Events are inserted via `COPY ... FROM STDIN`** instead of multi-row
-  INSERT statements. The server no longer lexes/parses/plans megabyte-scale
-  SQL per flush, and the client emits COPY text format directly (no SQL
-  literal quoting layer). ~10% end-to-end on the 100K-event stress test
-  over a local socket; larger on remote/TLS links. Adds
-  `Connection.copyIn` and a `CopyInResponse` protocol handler.
 
 ### Added
 

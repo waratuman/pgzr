@@ -25,8 +25,8 @@ pub const Connection = struct {
     /// Side buffer holding the row returned by simpleQuery and
     /// execPreparedWithResult. Separate from recv_buf so later protocol
     /// reads (which may overwrite or realloc recv_buf) cannot corrupt or
-    /// dangle the returned column slices.
-    result_buf: [4096]u8 = undefined,
+    /// dangle the returned column slices. Grows to fit the captured row.
+    result_buf: std.ArrayListUnmanaged(u8) = .empty,
     /// Heap-allocated transport state (PlainState or TlsState).
     plain_state: ?*PlainState = null,
     tls_state: ?*TlsState = null,
@@ -80,7 +80,11 @@ pub const Connection = struct {
         plain_state.?.* = .{ .io = io, .stream = stream };
         var transport = Transport.plain(plain_state.?);
 
+        // Function-scoped errdefer: a TLS upgrade may succeed and a later
+        // step (startup, auth, post-auth) still fail, so the state must be
+        // freed from any error path, not just within the TLS branch.
         var tls_state: ?*TlsState = null;
+        errdefer if (tls_state) |ts| allocator.destroy(ts);
 
         // TLS negotiation (only for TCP connections, not Unix sockets)
         if (config.tls != .disable and config.socket_path == null) {
@@ -102,7 +106,6 @@ pub const Connection = struct {
                 // Server accepts TLS — perform handshake
                 const ts = try TlsState.upgrade(allocator, io, stream, config.host, config.tls == .verify_full);
                 tls_state = ts;
-                errdefer if (tls_state) |ts2| allocator.destroy(ts2);
                 transport = Transport.tlsClient(ts);
                 // Free the plain state since we're now using TLS
                 allocator.destroy(plain_state.?);
@@ -236,8 +239,8 @@ pub const Connection = struct {
     /// Column data is copied into result_buf — a side buffer separate
     /// from recv_buf — so it cannot be overwritten or left dangling by
     /// later protocol reads (which may overwrite or realloc recv_buf).
-    /// Columns that don't fit in result_buf are dropped. The result is
-    /// valid until the next row-returning command on this connection.
+    /// The result is valid until the next row-returning command on this
+    /// connection.
     /// For CopyBothResponse (START_REPLICATION), returns with in_copy_mode=true.
     pub fn simpleQuery(self: *Connection, query: []const u8) QueryError!QueryResult {
         self.beginCommand();
@@ -560,9 +563,8 @@ pub const Connection = struct {
     /// first result row. Column data is copied into result_buf — a side
     /// buffer separate from recv_buf — so it cannot be overwritten or
     /// left dangling by later protocol reads (which may overwrite or
-    /// realloc recv_buf). Columns that don't fit in result_buf are
-    /// dropped. The result is valid until the next row-returning command
-    /// on this connection.
+    /// realloc recv_buf). The result is valid until the next
+    /// row-returning command on this connection.
     pub fn execPreparedWithResult(self: *Connection, name: []const u8, params: []const ?[]const u8) QueryError!QueryResult {
         var p = self.pipeline();
         try p.execPrepared(name, params);
@@ -575,18 +577,23 @@ pub const Connection = struct {
 
     /// Parse a DataRow body into caller-provided column slots. Column
     /// data is borrowed from `body`; a raw column count above the slot
-    /// array's size is clamped (extra columns are dropped).
+    /// array's size is clamped (extra columns are dropped). A truncated
+    /// or malformed body yields the columns parsed up to that point
+    /// rather than reading out of bounds.
     fn parseDataRow(body: []const u8, cols: *[16]QueryColumn) []const QueryColumn {
+        if (body.len < 2) return cols[0..0];
         const raw_col_count = std.mem.readInt(u16, body[0..2], .big);
         const col_count = @min(raw_col_count, cols.len);
         var pos: usize = 2;
         for (0..col_count) |i| {
+            if (pos + 4 > body.len) return cols[0..i];
             const col_len_raw = std.mem.readInt(i32, body[pos..][0..4], .big);
             pos += 4;
             if (col_len_raw < 0) {
                 cols[i] = .{ .data = "", .is_null = true };
             } else {
                 const col_len: usize = @intCast(col_len_raw);
+                if (pos + col_len > body.len) return cols[0..i];
                 cols[i] = .{ .data = body[pos .. pos + col_len], .is_null = false };
                 pos += col_len;
             }
@@ -598,7 +605,6 @@ pub const Connection = struct {
     /// the connection's result_buf side buffer.
     const FirstRowCapture = struct {
         conn: *Connection,
-        pos: usize = 0,
         captured: bool = false,
         result: QueryResult = .{
             .columns = undefined,
@@ -610,22 +616,33 @@ pub const Connection = struct {
             _ = stmt_index;
             if (self.captured) return;
             self.captured = true;
-            const buf = &self.conn.result_buf;
+            const conn = self.conn;
             const col_count = @min(cols.len, self.result.columns.len);
+
+            // Reserve the whole row's capacity up front so the buffer never
+            // reallocates while column slices into it are being recorded.
+            var total: usize = 0;
+            for (cols[0..col_count]) |col| {
+                if (!col.is_null) total += col.data.len;
+            }
+            conn.result_buf.clearRetainingCapacity();
+            conn.result_buf.ensureTotalCapacity(conn.allocator, total) catch {
+                // Callbacks cannot return errors; on OOM report no columns
+                // rather than a partial row.
+                return;
+            };
+
             for (cols[0..col_count], 0..) |col, i| {
                 if (col.is_null) {
                     self.result.columns[i] = .{ .data = "", .is_null = true };
                     continue;
                 }
-                if (self.pos + col.data.len > buf.len) {
-                    // Column data exceeds result_buf — drop remaining columns
-                    self.result.column_count = i;
-                    return;
-                }
-                const dest = buf[self.pos..][0..col.data.len];
-                @memcpy(dest, col.data);
-                self.result.columns[i] = .{ .data = dest, .is_null = false };
-                self.pos += col.data.len;
+                const start = conn.result_buf.items.len;
+                conn.result_buf.appendSliceAssumeCapacity(col.data);
+                self.result.columns[i] = .{
+                    .data = conn.result_buf.items[start..][0..col.data.len],
+                    .is_null = false,
+                };
             }
             self.result.column_count = col_count;
         }
@@ -692,6 +709,7 @@ pub const Connection = struct {
     pub fn close(self: *Connection) void {
         self.transport.close();
         self.send_buf.deinit(self.allocator);
+        self.result_buf.deinit(self.allocator);
         self.allocator.free(self.recv_buf);
         if (self.tls_state) |ts| self.allocator.destroy(ts);
         if (self.plain_state) |ps| self.allocator.destroy(ps);
